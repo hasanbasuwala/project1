@@ -220,7 +220,9 @@ class DownloaderEngine:
             "impersonate": ImpersonateTarget(client="chrome"),
             "progress_hooks": [prog_hook], 
             "quiet": True,
-            "compat_opts": {"allow-unsafe-ext"}  # <-- THE SECURITY OVERRIDE
+            "noprogress": True,          # <-- NEW: Kills the [download] terminal spam
+            "no_warnings": True,         # <-- NEW: Kills yellow console warnings
+            "compat_opts": {"allow-unsafe-ext"}
         }
         with yt_dlp.YoutubeDL(opts) as ydl: ydl.extract_info(url, download=True)
             async def _run_playwright(self, url: str, jid: str, dl_dir: Path):
