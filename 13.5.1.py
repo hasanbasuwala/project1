@@ -65,7 +65,7 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 JOBS_DIR, DONE_DIR = BASE_DIR / "jobs", BASE_DIR / "completed"
 for d in (JOBS_DIR, DONE_DIR): d.mkdir(parents=True, exist_ok=True)
 
-MAX_DL_WORKERS, MAX_RETRIES = 3, 3
+MAX_DL_WORKERS, MAX_RETRIES = 20, 3
 
 C_CYAN, C_YELLOW, C_RED, C_GREEN, C_RESET, C_BOLD = "\033[36m", "\033[33m", "\033[31m", "\033[32m", "\033[0m", "\033[1m"
 
