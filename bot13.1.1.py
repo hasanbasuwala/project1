@@ -217,12 +217,13 @@ class DownloaderEngine:
             "outtmpl": str(dl_dir / f"{jid}.%(ext)s"), 
             "format": fmt, 
             "http_headers": {"Referer": referer, "User-Agent": USER_AGENT},
-            "impersonate": ImpersonateTarget(client="chrome"),  # <-- THE TCP MASK
+            "impersonate": ImpersonateTarget(client="chrome"),
             "progress_hooks": [prog_hook], 
-            "quiet": True
+            "quiet": True,
+            "compat_opts": {"allow-unsafe-ext"}  # <-- THE SECURITY OVERRIDE
         }
         with yt_dlp.YoutubeDL(opts) as ydl: ydl.extract_info(url, download=True)
-    async def _run_playwright(self, url: str, jid: str, dl_dir: Path):
+            async def _run_playwright(self, url: str, jid: str, dl_dir: Path):
         from playwright.async_api import async_playwright
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
