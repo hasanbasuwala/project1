@@ -229,12 +229,19 @@ class DownloaderEngine:
                 try: 
                     total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
                     down = d.get("downloaded_bytes", 0)
-                    if total > 0:
-                        val = (down / total) * 100
-                        speed = re.sub(r"\x1b[^m]*m", "", d.get("_speed_str", "~")).strip()
-                        eta = re.sub(r"\x1b[^m]*m", "", d.get("_eta_str", "~")).strip()
-                        stage_str = f"downloading | {speed} | {eta}"
-                        asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val, stage=stage_str), loop)
+                    
+                    # Calculate percentage if possible, otherwise default to 0.0
+                    val = (down / total) * 100 if total > 0 else 0.0
+                    
+                    # Extract speed and ETA safely
+                    speed = re.sub(r"\x1b[^m]*m", "", d.get("_speed_str", "~")).strip()
+                    eta = re.sub(r"\x1b[^m]*m", "", d.get("_eta_str", "~")).strip()
+                    
+                    # Inject Speed and ETA dynamically
+                    stage_str = f"downloading | {speed} | {eta}"
+                    
+                    # ALWAYS update the database, even if val is 0.0
+                    asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val, stage=stage_str), loop)
                 except Exception: pass
         
         fmt = "bestvideo[height<=1080]+bestaudio/best"
