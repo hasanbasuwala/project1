@@ -162,12 +162,32 @@ class DownloaderEngine:
 
         if strategy == "MAGNET" or strategy == "DIRECT_MP4":
             await self._run_aria(url, jid, dl_dir)
+            
         elif strategy == "HLS_STREAM":
             self.db.log_trace(jid, "Attempting HLS extraction via yt-dlp...")
-            await asyncio.to_thread(self._run_ytdlp, url, jid, dl_dir, url, "")
-        else:
             try:
+                # Attempt direct download first
                 await asyncio.to_thread(self._run_ytdlp, url, jid, dl_dir, url, "")
+            except Exception as e:
+                # If we hit a 403 Forbidden, escalate to the Playwright interceptor
+                self.db.log_trace(jid, f"yt-dlp HLS blocked. Escalating to Playwright...")
+                await self._run_playwright(url, jid, dl_dir)
+                
+        else:
+            # 6-Stage Waterfall for Generic Links
+            actual_url = url
+            referer = url
+            cookie = ""
+            
+            try:
+                client = primp.Client(impersonate="chrome_120")
+                resp = client.get(url, headers={"User-Agent": USER_AGENT})
+                match = re.search(r"(https?://[^\"']+(?:\.m3u8|\.mp4)[^\"']*)", resp.text)
+                if match: actual_url = match.group(1).replace(r"\/", "/")
+            except Exception: pass
+
+            try:
+                await asyncio.to_thread(self._run_ytdlp, actual_url, jid, dl_dir, referer, cookie)
             except Exception as e:
                 self.db.log_trace(jid, f"yt-dlp failed, escalating to Playwright. Error: {e}")
                 await self._run_playwright(url, jid, dl_dir)
