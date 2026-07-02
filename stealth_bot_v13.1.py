@@ -164,13 +164,14 @@ class DownloaderEngine:
             await self.app.download_media(url, file_name=str(dl_dir / f"{jid}.mp4"), progress=tg_prog)
             return
 
-        if strategy == "MAGNET" or strategy == "DIRECT_MP4":
+        elif strategy == "MAGNET" or strategy == "DIRECT_MP4":
             await self._run_aria(url, jid, dl_dir)
         elif strategy == "HLS_STREAM":
-            await self._run_mediago(url, jid, dl_dir)
+            # Safely route all .m3u8 streams to yt-dlp
+            self.db.log_trace(jid, "Attempting HLS extraction via yt-dlp...")
+            await asyncio.to_thread(self._run_ytdlp, url, jid, dl_dir, url, "")
         else:
-            # 6-Stage Waterfall for Generic Links
-            actual_url, referer, cookie = url, url, ""
+            # 6-Stage Waterfall for Generic Links            actual_url, referer, cookie = url, url, ""
             try:
                 client = primp.Client(impersonate="chrome_120")
                 resp = client.get(url, headers={"User-Agent": USER_AGENT})
@@ -199,19 +200,6 @@ class DownloaderEngine:
             
         valid_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".flv"]]
         if not valid_files: raise RuntimeError("Aria2c failed: No media payloads found in output directory.")
-
-    async def _run_mediago(self, url: str, jid: str, dl_dir: Path):
-        cmd = ["mediago", "e", "-u", url, "-o", str(dl_dir / f"{jid}.mp4"), "--concurrency", "32"]
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE)
-        self.procs[jid] = proc
-        try:
-            while True:
-                chunk = await proc.stdout.readline()
-                if not chunk: break
-                m = re.search(r"(\d+(?:\.\d+)?)%", chunk.decode("utf-8", errors="ignore"))
-                if m: await self.db.update_job(jid, pct=float(m.group(1)))
-        finally:
-            await proc.wait(); self.procs.pop(jid, None)
 
     def _run_ytdlp(self, url: str, jid: str, dl_dir: Path, referer: str, cookie: str):
         def prog_hook(d):
