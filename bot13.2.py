@@ -298,7 +298,7 @@ class DownloaderEngine:
             referer = page.url
             await browser.close()
 
-                        if video_src:
+                    if video_src:
                 try:
                     # Attempt yt-dlp first
                     await asyncio.to_thread(self._run_ytdlp, video_src, jid, dl_dir, referer, cookie_str)
