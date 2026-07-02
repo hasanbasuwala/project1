@@ -169,8 +169,8 @@ class DownloaderEngine:
                 # Attempt direct download first
                 await asyncio.to_thread(self._run_ytdlp, url, jid, dl_dir, url, "")
             except Exception as e:
-                # If we hit a 403 Forbidden, escalate to the Playwright interceptor
-                self.db.log_trace(jid, f"yt-dlp HLS blocked. Escalating to Playwright...")
+                # Catch 522s, 403s, and other network failures cleanly
+                self.db.log_trace(jid, f"yt-dlp HLS failed. Escalating to Playwright...")
                 await self._run_playwright(url, jid, dl_dir)
                 
         else:
