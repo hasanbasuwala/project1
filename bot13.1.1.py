@@ -190,8 +190,12 @@ class DownloaderEngine:
                 await self._run_playwright(url, jid, dl_dir)
     async def _run_aria(self, url: str, jid: str, dl_dir: Path):
         cmd = ["aria2c", "-d", str(dl_dir), "-c", "-x", "16", "-s", "10", "--file-allocation=none", url]
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE)
-        self.procs[jid] = proc
+          proc = await asyncio.create_subprocess_exec(
+            *cmd, 
+            stdout=asyncio.subprocess.PIPE, 
+            stderr=subprocess.DEVNULL    # <-- NEW: Silences terminal bleed
+        )
+              self.procs[jid] = proc
         try:
             while True:
                 chunk = await proc.stdout.readline()
@@ -208,10 +212,13 @@ class DownloaderEngine:
         def prog_hook(d):
             if d.get("status") == "downloading":
                 try: 
-                    val = float(re.sub(r"\x1b[^m]*m", "", d.get("_percent_str", "0.0%")).replace("%", "").strip())
-                    asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val), loop)
+                    total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                    downloaded = d.get("downloaded_bytes", 0)
+                    if total > 0:
+                        val = (downloaded / total) * 100
+                        asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val), loop)
                 except Exception: pass
-        
+                          
         fmt = "bestvideo[height<=1080]+bestaudio/best"
         opts = {
             "outtmpl": str(dl_dir / f"{jid}.%(ext)s"), 
