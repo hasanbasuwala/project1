@@ -190,12 +190,12 @@ class DownloaderEngine:
                 await self._run_playwright(url, jid, dl_dir)
     async def _run_aria(self, url: str, jid: str, dl_dir: Path):
         cmd = ["aria2c", "-d", str(dl_dir), "-c", "-x", "16", "-s", "10", "--file-allocation=none", url]
-          proc = await asyncio.create_subprocess_exec(
+        proc = await asyncio.create_subprocess_exec(
             *cmd, 
-            stdout=asyncio.subprocess.PIPE, 
-            stderr=subprocess.DEVNULL    # <-- NEW: Silences terminal bleed
+            stdout=asyncio.subprocess.PIPE,
+            stderr=subprocess.DEVNULL
         )
-              self.procs[jid] = proc
+        self.procs[jid] = proc
         try:
             while True:
                 chunk = await proc.stdout.readline()
@@ -208,6 +208,23 @@ class DownloaderEngine:
         valid_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".flv"]]
         if not valid_files: raise RuntimeError("Aria2c failed: No media payloads found in output directory.")
 
+    async def _run_mediago(self, url: str, jid: str, dl_dir: Path):
+        cmd = ["mediago", "e", "-u", url, "-o", str(dl_dir / f"{jid}.mp4"), "--concurrency", "32"]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, 
+            stdout=asyncio.subprocess.PIPE,
+            stderr=subprocess.DEVNULL
+        )
+        self.procs[jid] = proc
+        try:
+            while True:
+                chunk = await proc.stdout.readline()
+                if not chunk: break
+                m = re.search(r"(\d+(?:\.\d+)?)%", chunk.decode("utf-8", errors="ignore"))
+                if m: await self.db.update_job(jid, pct=float(m.group(1)))
+        finally:
+            await proc.wait(); self.procs.pop(jid, None)
+
     def _run_ytdlp(self, url: str, jid: str, dl_dir: Path, referer: str, cookie: str):
         def prog_hook(d):
             if d.get("status") == "downloading":
@@ -218,7 +235,7 @@ class DownloaderEngine:
                         val = (downloaded / total) * 100
                         asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val), loop)
                 except Exception: pass
-                          
+        
         fmt = "bestvideo[height<=1080]+bestaudio/best"
         opts = {
             "outtmpl": str(dl_dir / f"{jid}.%(ext)s"), 
@@ -227,12 +244,12 @@ class DownloaderEngine:
             "impersonate": ImpersonateTarget(client="chrome"),
             "progress_hooks": [prog_hook], 
             "quiet": True,
-            "noprogress": True,          # <-- NEW: Kills the [download] terminal spam
-            "no_warnings": True,         # <-- NEW: Kills yellow console warnings
+            "noprogress": True,
+            "no_warnings": True,
             "compat_opts": {"allow-unsafe-ext"}
         }
-        with yt_dlp.YoutubeDL(opts) as ydl: ydl.extract_info(url, download=True)
-            async def _run_playwright(self, url: str, jid: str, dl_dir: Path):
+        with yt_dlp.YoutubeDL(opts) as ydl: ydl.extract_info(url, download=True)            
+        async def _run_playwright(self, url: str, jid: str, dl_dir: Path):
         from playwright.async_api import async_playwright
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
