@@ -553,19 +553,42 @@ async def ui_throttle_loop(app: Client, db: JobScheduler):
             await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
 
 async def terminal_loop(db: JobScheduler, pipeline: PipelineManager):
-    sys.stdout.write("\033[2J") 
+    sys.stdout.write("\033[2J") # Initial screen clear
     while True:
         await asyncio.sleep(2)
-        sys.stdout.write("\033[H") 
+        sys.stdout.write("\033[H") # Move cursor to top left
         sys.stdout.write(f"{C_CYAN}{C_BOLD}=== STEALTH MAINFRAME [LIVE] ==={C_RESET}\n")
         sys.stdout.write(f"QUEUES | DL: {pipeline.dl_q.qsize()} | ENC: {pipeline.enc_q.qsize()} | UP: {pipeline.up_q.qsize()}\n{'─' * 40}\n")
         
         jobs = await db.get_active_jobs()
-        if not jobs: sys.stdout.write(f"{C_GREEN}System Idle. Awaiting vectors.{C_RESET}\033[K\n")
-        for j in jobs[:5]:
-            col = C_YELLOW if "download" in j['stage'] else C_CYAN if "enc" in j['stage'] else C_GREEN
-            sys.stdout.write(f"{C_BOLD}[{j['title'][:15]}]{C_RESET} {col}{j['stage']}{C_RESET} | [{make_bar(j['pct'], 10)}] {j['pct']:.1f}%\033[K\n")
-        for _ in range(5): sys.stdout.write("\033[K\n")
+        if not jobs: 
+            sys.stdout.write(f"{C_GREEN}System Idle. Awaiting vectors.{C_RESET}\033[K\n")
+        else:
+            for j in jobs[:5]:
+                col = C_YELLOW if "download" in j['stage'] else C_CYAN if "enc" in j['stage'] else C_GREEN
+                
+                # Print the main progress bar line
+                sys.stdout.write(f"{C_BOLD}[{j['title'][:15]}]{C_RESET} {col}{j['stage']}{C_RESET} | [{make_bar(j['pct'], 10)}] {j['pct']:.1f}%\033[K\n")
+                
+                # Fetch the latest log entry for this specific job
+                log_path = JOBS_DIR / f"JOB_{j['id']}" / "trace.log"
+                last_log = "Initializing..."
+                if log_path.exists():
+                    try:
+                        with open(log_path, "r", encoding="utf-8") as f:
+                            # Grab all non-empty lines
+                            lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+                            if lines:
+                                # Strip the [YYYY-MM-DD HH:MM:SS] timestamp so it fits cleanly
+                                last_log = re.sub(r"^\[.*?\]\s*", "", lines[-1])
+                    except Exception: 
+                        pass
+                
+                # Print the log line slightly dimmed (\033[2m) and truncated to 70 chars so it doesn't wrap
+                sys.stdout.write(f"  └ 📄 \033[2m{last_log[:70]}\033[0m\033[K\n")
+        
+        # Clear everything below the active jobs so old text doesn't get stuck
+        sys.stdout.write("\033[J") 
         sys.stdout.flush()
 
 # ──────────────────────────── BOOTSTRAP ───────────────────────────────
