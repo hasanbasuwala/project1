@@ -262,6 +262,7 @@ class DownloaderEngine:
         opts = {
             "outtmpl": str(dl_dir / f"{jid}.%(ext)s"), 
             "format": fmt, 
+            "merge_output_format": "mp4",  # <-- NEW: Forces yt-dlp to repair HLS discontinuities
             "http_headers": {"Referer": referer, "User-Agent": USER_AGENT},
             "impersonate": ImpersonateTarget(client="chrome"),
             "progress_hooks": [prog_hook], 
@@ -324,7 +325,18 @@ class EncoderEngine:
         
         await asyncio.create_subprocess_exec("ffmpeg", "-y", "-i", str(dl_file), "-ss", "00:00:02", "-vframes", "1", str(thumb_file), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        proc = await asyncio.create_subprocess_exec("ffmpeg", "-y", "-nostdin", "-i", str(dl_file), "-c:v", "copy", "-c:a", "aac", "-movflags", "+faststart", str(enc_file), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # The ultimate FFmpeg Sandbox command for broken web streams
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-nostdin", 
+            "-fflags", "+genpts",  # <-- NEW: Regenerates broken timeline timestamps
+            "-i", str(dl_file), 
+            "-c:v", "copy", 
+            "-c:a", "aac", 
+            "-avoid_negative_ts", "make_zero",  # <-- NEW: Forces the movie to start perfectly at 0s
+            "-movflags", "+faststart", 
+            str(enc_file), 
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
         try:
             await asyncio.wait_for(proc.wait(), timeout=900)
         except asyncio.TimeoutError:
