@@ -202,16 +202,24 @@ class DownloaderEngine:
             while True:
                 chunk = await proc.stdout.readline()
                 if not chunk: break
-                chunk_str = chunk.decode("utf-8", errors="ignore")
+                chunk_str = chunk.decode("utf-8", errors="ignore").strip()
                 
-                m = re.search(r"\(([\d.]+)%\).*?DL:([^\s]+).*?ETA:([^\s\]]+)", chunk_str)
-                if m:
-                    val = float(m.group(1))
-                    stage_str = f"downloading | {m.group(2)} | {m.group(3)}"
-                    await self.db.update_job(jid, pct=val, stage=stage_str)
-                else:
-                    m2 = re.search(r"\((\d+)%\)", chunk_str)
-                    if m2: await self.db.update_job(jid, pct=float(m2.group(1)))
+                if chunk_str:
+                    # Clean ANSI codes and pump straight to terminal memory
+                    clean_str = re.sub(r"\x1b[^m]*m", "", chunk_str)
+                    if "DL:" in clean_str or "%" in clean_str:
+                        global _live_ui_text
+                        _live_ui_text[jid] = f"[aria2c] {clean_str}"
+
+                    # Regex out the DB update values
+                    m = re.search(r"\(([\d.]+)%\).*?DL:([^\s]+).*?ETA:([^\s\]]+)", chunk_str)
+                    if m:
+                        val = float(m.group(1))
+                        stage_str = f"downloading | {m.group(2)} | {m.group(3)}"
+                        await self.db.update_job(jid, pct=val, stage=stage_str)
+                    else:
+                        m2 = re.search(r"\((\d+)%\)", chunk_str)
+                        if m2: await self.db.update_job(jid, pct=float(m2.group(1)))
         finally:
             await proc.wait(); self.procs.pop(jid, None)
             
