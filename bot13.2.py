@@ -272,7 +272,7 @@ class DownloaderEngine:
             "compat_opts": {"allow-unsafe-ext"}
         }
         with yt_dlp.YoutubeDL(opts) as ydl: ydl.extract_info(url, download=True)            
-    async def _run_playwright(self, url: str, jid: str, dl_dir: Path):
+        async def _run_playwright(self, url: str, jid: str, dl_dir: Path):
         from playwright.async_api import async_playwright
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
@@ -282,7 +282,8 @@ class DownloaderEngine:
             async def block_bloat(route):
                 if route.request.resource_type in ["image", "font", "stylesheet"] or any(x in route.request.url for x in ["ads", "tracking"]):
                     await route.abort()
-                else: await route.continue_()
+                else: 
+                    await route.continue_()
 
             await page.route("**/*", block_bloat)
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -303,13 +304,18 @@ class DownloaderEngine:
                     # Attempt yt-dlp first
                     await asyncio.to_thread(self._run_ytdlp, video_src, jid, dl_dir, referer, cookie_str)
                 except Exception as e:
-                    self.db.log_trace(jid, f"yt-dlp panicked on file extension. Forcing Aria2c bypass.")
+                    self.db.log_trace(jid, "yt-dlp panicked on file extension. Forcing Aria2c bypass.")
                     # If yt-dlp refuses the file extension, bypass it entirely using Aria2c
                     await self._run_aria(video_src, jid, dl_dir, headers={"Cookie": cookie_str, "Referer": referer})
             else:
                 raise RuntimeError("Playwright headless interceptor failed to find raw video source.")
-            class EncoderEngine:
-         def __init__(self, scheduler: JobScheduler):
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW SUBSYSTEM BOUNDARY - THIS MUST TOUCH THE LEFT MARGIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EncoderEngine:
+    def __init__(self, scheduler: JobScheduler):
         self.db = scheduler
 
     async def execute(self, job_data: dict):
