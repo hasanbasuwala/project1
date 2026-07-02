@@ -249,7 +249,7 @@ class DownloaderEngine:
             "compat_opts": {"allow-unsafe-ext"}
         }
         with yt_dlp.YoutubeDL(opts) as ydl: ydl.extract_info(url, download=True)            
-        async def _run_playwright(self, url: str, jid: str, dl_dir: Path):
+    async def _run_playwright(self, url: str, jid: str, dl_dir: Path):
         from playwright.async_api import async_playwright
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
@@ -279,7 +279,6 @@ class DownloaderEngine:
                 await asyncio.to_thread(self._run_ytdlp, video_src, jid, dl_dir, referer, cookie_str)
             else:
                 raise RuntimeError("Playwright headless interceptor failed to find raw video source.")
-
 class EncoderEngine:
     def __init__(self, scheduler: JobScheduler):
         self.db = scheduler
