@@ -235,19 +235,23 @@ class DownloaderEngine:
         def prog_hook(d):
             if d.get("status") == "downloading":
                 try: 
-                    total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                    down = d.get("downloaded_bytes", 0)
-                    val = (down / total) * 100 if total > 0 else 0.0
-                    
+                    # 1. Grab yt-dlp's raw strings
+                    pct_str = re.sub(r"\x1b[^m]*m", "", d.get("_percent_str", "0.0%")).strip()
                     speed = re.sub(r"\x1b[^m]*m", "", d.get("_speed_str", "~")).strip()
                     eta = re.sub(r"\x1b[^m]*m", "", d.get("_eta_str", "~")).strip()
-                    pct_str = re.sub(r"\x1b[^m]*m", "", d.get("_percent_str", "~")).strip()
                     tot_str = re.sub(r"\x1b[^m]*m", "", d.get("_total_bytes_str", d.get("_total_bytes_estimate_str", "~"))).strip()
                     
-                    # Construct the classic yt-dlp string and pump to memory
+                    # 2. Extract just the numeric value for the database progress bar
+                    try:
+                        val = float(re.search(r"[\d.]+", pct_str).group())
+                    except Exception:
+                        val = 0.0
+                    
+                    # 3. Pump the raw string to Termux memory
                     global _live_ui_text
                     _live_ui_text[jid] = f"[yt-dlp] {pct_str} of {tot_str} at {speed} ETA {eta}"
 
+                    # 4. Pump the parsed data to the SQLite Database
                     stage_str = f"downloading | {speed} | {eta}"
                     asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val, stage=stage_str), loop)
                 except Exception: pass
