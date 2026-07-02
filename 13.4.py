@@ -419,6 +419,11 @@ class PipelineManager:
 
 _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab = 0, 0, "root"
 _last_completed = "—"
+# ──────────────────────────── UI & COMMAND ROUTER ───────────────────────
+
+_dashboard_msg_id, _dashboard_chat_id, _dashboard_tab = 0, 0, "root"
+_last_completed = "—"
+_live_ui_text = {}  # <-- NEW: In-memory bridge for raw terminal streams
 
 def _job_tracker_text(job: dict) -> str:
     bar = make_bar(job['pct'], 12)
