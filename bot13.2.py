@@ -238,7 +238,7 @@ class DownloaderEngine:
 
         def _run_ytdlp(self, url: str, jid: str, dl_dir: Path, referer: str, cookie: str):
         # The ultimate gag for yt-dlp fatal errors
-        class SilentLogger:
+            class SilentLogger:
             def debug(self, msg): pass
             def warning(self, msg): pass
             def error(self, msg): pass
