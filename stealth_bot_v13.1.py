@@ -1,4 +1,3 @@
-"""
 stealth_bot.py – v13.2 (The Complete Structured Monolith)
 ───────────────────────────────────────────────────────────────
 ARCHITECTURE:
