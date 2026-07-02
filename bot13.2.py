@@ -164,10 +164,9 @@ class DownloaderEngine:
             await self.app.download_media(url, file_name=str(dl_dir / f"{jid}.mp4"), progress=tg_prog)
             return
 
-        elif strategy == "MAGNET" or strategy == "DIRECT_MP4":
+        if strategy == "MAGNET" or strategy == "DIRECT_MP4":
             await self._run_aria(url, jid, dl_dir)
         elif strategy == "HLS_STREAM":
-            # Safely route all .m3u8 streams to yt-dlp
             self.db.log_trace(jid, "Attempting HLS extraction via yt-dlp...")
             await asyncio.to_thread(self._run_ytdlp, url, jid, dl_dir, url, "")
         else:
@@ -188,6 +187,7 @@ class DownloaderEngine:
             except Exception as e:
                 self.db.log_trace(jid, f"yt-dlp failed, escalating to Playwright. Error: {e}")
                 await self._run_playwright(url, jid, dl_dir)
+
     async def _run_aria(self, url: str, jid: str, dl_dir: Path, headers: dict = None):
         cmd = ["aria2c", "-d", str(dl_dir), "-c", "-x", "16", "-s", "10", "--file-allocation=none"]
         if headers:
@@ -204,7 +204,6 @@ class DownloaderEngine:
                 if not chunk: break
                 chunk_str = chunk.decode("utf-8", errors="ignore")
                 
-                # Regex out the percentage, speed, and ETA
                 m = re.search(r"\(([\d.]+)%\).*?DL:([^\s]+).*?ETA:([^\s\]]+)", chunk_str)
                 if m:
                     val = float(m.group(1))
@@ -219,29 +218,11 @@ class DownloaderEngine:
         valid_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".flv", ".php"]]
         if not valid_files: raise RuntimeError("Aria2c failed: No media payloads found in output directory.")
 
-    async def _run_mediago(self, url: str, jid: str, dl_dir: Path):
-        cmd = ["mediago", "e", "-u", url, "-o", str(dl_dir / f"{jid}.mp4"), "--concurrency", "32"]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, 
-            stdout=asyncio.subprocess.PIPE,
-            stderr=subprocess.DEVNULL
-        )
-        self.procs[jid] = proc
-        try:
-            while True:
-                chunk = await proc.stdout.readline()
-                if not chunk: break
-                m = re.search(r"(\d+(?:\.\d+)?)%", chunk.decode("utf-8", errors="ignore"))
-                if m: await self.db.update_job(jid, pct=float(m.group(1)))
-        finally:
-            await proc.wait(); self.procs.pop(jid, None)
-
-        def _run_ytdlp(self, url: str, jid: str, dl_dir: Path, referer: str, cookie: str):
-        # The ultimate gag for yt-dlp fatal errors
-            class SilentLogger:
-                def debug(self, msg): pass
-                def warning(self, msg): pass
-                def error(self, msg): pass
+    def _run_ytdlp(self, url: str, jid: str, dl_dir: Path, referer: str, cookie: str):
+        class SilentLogger:
+            def debug(self, msg): pass
+            def warning(self, msg): pass
+            def error(self, msg): pass
 
         def prog_hook(d):
             if d.get("status") == "downloading":
@@ -250,10 +231,8 @@ class DownloaderEngine:
                     down = d.get("downloaded_bytes", 0)
                     if total > 0:
                         val = (down / total) * 100
-                        # Clean ANSI codes from yt-dlp output
                         speed = re.sub(r"\x1b[^m]*m", "", d.get("_speed_str", "~")).strip()
                         eta = re.sub(r"\x1b[^m]*m", "", d.get("_eta_str", "~")).strip()
-                        # Inject Speed and ETA dynamically into the stage status
                         stage_str = f"downloading | {speed} | {eta}"
                         asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val, stage=stage_str), loop)
                 except Exception: pass
@@ -268,11 +247,12 @@ class DownloaderEngine:
             "quiet": True,
             "noprogress": True,
             "no_warnings": True,
-            "logger": SilentLogger(),  # <-- Enforces absolute silence
+            "logger": SilentLogger(),
             "compat_opts": {"allow-unsafe-ext"}
         }
-        with yt_dlp.YoutubeDL(opts) as ydl: ydl.extract_info(url, download=True)            
-        async def _run_playwright(self, url: str, jid: str, dl_dir: Path):
+        with yt_dlp.YoutubeDL(opts) as ydl: ydl.extract_info(url, download=True)
+
+    async def _run_playwright(self, url: str, jid: str, dl_dir: Path):
         from playwright.async_api import async_playwright
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
@@ -282,8 +262,7 @@ class DownloaderEngine:
             async def block_bloat(route):
                 if route.request.resource_type in ["image", "font", "stylesheet"] or any(x in route.request.url for x in ["ads", "tracking"]):
                     await route.abort()
-                else: 
-                    await route.continue_()
+                else: await route.continue_()
 
             await page.route("**/*", block_bloat)
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -301,18 +280,12 @@ class DownloaderEngine:
 
             if video_src:
                 try:
-                    # Attempt yt-dlp first
                     await asyncio.to_thread(self._run_ytdlp, video_src, jid, dl_dir, referer, cookie_str)
                 except Exception as e:
                     self.db.log_trace(jid, "yt-dlp panicked on file extension. Forcing Aria2c bypass.")
-                    # If yt-dlp refuses the file extension, bypass it entirely using Aria2c
                     await self._run_aria(video_src, jid, dl_dir, headers={"Cookie": cookie_str, "Referer": referer})
             else:
                 raise RuntimeError("Playwright headless interceptor failed to find raw video source.")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NEW SUBSYSTEM BOUNDARY - THIS MUST TOUCH THE LEFT MARGIN
-# ─────────────────────────────────────────────────────────────────────────────
 
 class EncoderEngine:
     def __init__(self, scheduler: JobScheduler):
@@ -322,7 +295,8 @@ class EncoderEngine:
         jid = job_data['id']
         dl_dir, enc_dir, thumb_dir = JOBS_DIR / f"JOB_{jid}" / "dl", JOBS_DIR / f"JOB_{jid}" / "enc", JOBS_DIR / f"JOB_{jid}" / "thumb"
         
-        dl_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".flv"]]
+        # Note: Added .php to valid extensions here so FFmpeg can convert the bypassed files
+        dl_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".flv", ".php"]]
         dl_file = max(dl_files, key=lambda p: p.stat().st_size)
         enc_file, thumb_file = enc_dir / f"{jid}.mp4", thumb_dir / f"{jid}.jpg"
 
