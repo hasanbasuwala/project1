@@ -176,25 +176,25 @@ class DownloaderEngine:
         playwright_data = await self._run_playwright_extraction(url, jid, dl_dir)
         
         if not playwright_data or not playwright_data.get('url'):
-            # PASS 11: Final Fail Handler
             raise RuntimeError("PASS 11 FAILED: All extraction methods exhausted. Target is highly protected.")
 
         extracted_url = playwright_data['url']
         headers = playwright_data['headers']
-        cookies = playwright_data['cookie_str']
+        raw_cookies = playwright_data['raw_cookies']
+        cookie_str = playwright_data['cookie_str']
 
         self.db.log_trace(jid, "Playwright extraction successful. Delegating authorized payload downstream...")
 
         # PASS 8: FFmpeg Direct Stream Capture
         if ".m3u8" in extracted_url:
             self.db.log_trace(jid, "PASS 8: Attempting FFmpeg direct capture with exported cookies...")
-            if await self._run_ffmpeg_capture(extracted_url, jid, dl_dir, headers, cookies):
+            if await self._run_ffmpeg_capture(extracted_url, jid, dl_dir, headers, cookie_str):
                 return
             self.db.log_trace(jid, "PASS 8 FAILED: FFmpeg direct stream capture aborted.")
 
-        # PASS 9: yt-dlp with Exported Session Cookies
-        self.db.log_trace(jid, "PASS 9: Attempting yt-dlp with exported browser cookies...")
-        if await self._run_ytdlp_with_cookies(extracted_url, jid, dl_dir, headers, cookies):
+        # PASS 9: yt-dlp with Exported Session Cookies (Netscape Format Bypass)
+        self.db.log_trace(jid, "PASS 9: Attempting yt-dlp with exported Netscape cookiefile...")
+        if await self._run_ytdlp_with_cookies(extracted_url, jid, dl_dir, headers, raw_cookies):
             return
         self.db.log_trace(jid, "PASS 9 FAILED: yt-dlp cookie authentication rejected.")
 
@@ -202,15 +202,15 @@ class DownloaderEngine:
         self.db.log_trace(jid, "PASS 10: Attempting Aria2c full header replay bypass...")
         try:
             full_headers = headers.copy()
-            if cookies:
-                full_headers["Cookie"] = cookies
+            if cookie_str:
+                full_headers["Cookie"] = cookie_str
             await self._run_aria(extracted_url, jid, dl_dir, headers=full_headers)
             return
         except Exception as e:
             self.db.log_trace(jid, f"PASS 10 FAILED: Aria2c bypass failed. Error: {e}")
             
         # PASS 11: Final Fail Handler
-        raise RuntimeError("PASS 11 FAILED: Authorized downstream clients were rejected by the host.")
+        raise RuntimeError("PASS 11 FAILED: Authorized downstream clients were rejected by the host. CDNs are blocking TLS signatures.")
 
     async def _attempt_ytdlp_variants(self, url: str, jid: str, dl_dir: Path) -> bool:
         variants = [
@@ -234,18 +234,18 @@ class DownloaderEngine:
         from playwright.async_api import async_playwright
         
         har_path = dl_dir / f"{jid}_intercept.har"
-        extracted_payload = {"url": None, "headers": {}, "cookie_str": ""}
+        extracted_payload = {"url": None, "headers": {}, "cookie_str": "", "raw_cookies": []}
         
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-            # PASS 7: HAR capture for hidden token extraction initialized here
+            # [span_1](start_span)PASS 7: HAR capture for hidden token extraction initialized here[span_1](end_span)
             context = await browser.new_context(user_agent=USER_AGENT, record_har_path=str(har_path))
             page = await context.new_page()
 
             found_urls = []
             capture_headers = {}
 
-            # PASS 6: Network Interception
+            # [span_2](start_span)PASS 6: Network Interception[span_2](end_span)
             async def handle_route(route):
                 req = route.request
                 req_url = req.url
@@ -273,7 +273,7 @@ class DownloaderEngine:
                 m3u8s = [u for u in found_urls if ".m3u8" in u]
                 extracted_payload["url"] = m3u8s[0] if m3u8s else found_urls[0]
             
-            # 2. Fallback to PASS 5 DOM extraction
+            # 2. [span_3](start_span)Fallback to PASS 5 DOM extraction[span_3](end_span)
             if not extracted_payload["url"]:
                 extracted_payload["url"] = await page.evaluate('''() => {
                     let v = document.querySelector('video'); if (v && v.src && !v.src.startsWith('blob:')) return v.src;
@@ -281,8 +281,9 @@ class DownloaderEngine:
                     return null;
                 }''')
 
-            # Export Context Identity 
+            # [span_4](start_span)Export Context Identity via export browser cookies[span_4](end_span)
             cookies = await context.cookies()
+            extracted_payload["raw_cookies"] = cookies
             extracted_payload["cookie_str"] = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             
             # Formulate strict headers
@@ -317,19 +318,33 @@ class DownloaderEngine:
             return True
         return False
 
-    async def _run_ytdlp_with_cookies(self, url: str, jid: str, dl_dir: Path, headers: dict, cookie_str: str) -> bool:
+    async def _run_ytdlp_with_cookies(self, url: str, jid: str, dl_dir: Path, headers: dict, raw_cookies: list) -> bool:
+        cookie_path = dl_dir / f"{jid}_cookies.txt"
+        
+        # Write exact Netscape format to avoid yt-dlp cookie header drops
+        with open(cookie_path, "w", encoding="utf-8") as f:
+            f.write("# Netscape HTTP Cookie File\n")
+            for c in raw_cookies:
+                domain = c.get("domain", "")
+                inc_sub = "TRUE" if domain.startswith(".") else "FALSE"
+                path = c.get("path", "/")
+                secure = "TRUE" if c.get("secure", False) else "FALSE"
+                expires = str(int(c.get("expires", 0))) if c.get("expires", -1) != -1 else "0"
+                name = c.get("name", "")
+                value = c.get("value", "")
+                f.write(f"{domain}\t{inc_sub}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
+
         opts = {
             "http_headers": headers,
-            "impersonate": ImpersonateTarget(client="chrome")
+            "impersonate": ImpersonateTarget(client="chrome"),
+            [span_5](start_span)"cookiefile": str(cookie_path) #[span_5](end_span)
         }
-        # In a real environment, you'd write a Netscape format cookiefile to disk here 
-        # and pass 'cookiefile': str(cookie_path) to opts. We are injecting via headers for speed.
-        if cookie_str: opts["http_headers"]["Cookie"] = cookie_str
             
         try:
             await asyncio.to_thread(self._execute_ytdlp, url, jid, dl_dir, opts)
             return True
-        except Exception:
+        except Exception as e:
+            self.db.log_trace(jid, f"yt-dlp cookie bypass error: {e}")
             return False
 
     def _execute_ytdlp(self, url: str, jid: str, dl_dir: Path, custom_opts: dict = None):
@@ -348,6 +363,7 @@ class DownloaderEngine:
                     
                     val = float(re.search(r"[\d.]+", pct_str).group()) if re.search(r"[\d.]+", pct_str) else 0.0
                     
+                    # TERMUX HIGH SPEED MEMORY BRIDGE
                     global _live_ui_text
                     _live_ui_text[jid] = f"[yt-dlp] {pct_str} of {tot_str} at {speed} ETA {eta}"
 
@@ -386,6 +402,8 @@ class DownloaderEngine:
                 
                 if chunk_str:
                     clean_str = re.sub(r"\x1b[^m]*m", "", chunk_str)
+                    
+                    # TERMUX HIGH SPEED MEMORY BRIDGE
                     if "DL:" in clean_str or "%" in clean_str:
                         global _live_ui_text
                         _live_ui_text[jid] = f"[aria2c] {clean_str}"
