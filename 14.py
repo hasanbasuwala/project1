@@ -384,8 +384,9 @@ class DownloaderEngine:
             
         with yt_dlp.YoutubeDL(opts) as ydl: ydl.extract_info(url, download=True)
 
-    async def _run_aria(self, url: str, jid: str, dl_dir: Path, headers: dict = None):
-        cmd = ["aria2c", "-d", str(dl_dir), "-c", "-x", "16", "-s", "10", "--file-allocation=none"]
+     async def _run_aria(self, url: str, jid: str, dl_dir: Path, headers: dict = None):
+        out_name = f"{jid}.mp4"  # Force the exact output filename
+        cmd = ["aria2c", "-d", str(dl_dir), "-o", out_name, "-c", "-x", "16", "-s", "10", "--file-allocation=none"]
         if headers:
             for k, v in headers.items(): cmd.append(f"--header={k}: {v}")
         cmd.append(url)
@@ -420,7 +421,8 @@ class DownloaderEngine:
             await proc.wait(); self.procs.pop(jid, None)
             
         valid_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".flv", ".php"]]
-        if not valid_files: raise RuntimeError("Aria2c failed: No media payloads found in output directory.")
+        if not valid_files: 
+            raise RuntimeError("Aria2c failed: No media payloads found in output directory. The link might be dead or geo-blocked.")
 
 class EncoderEngine:
     def __init__(self, scheduler: JobScheduler):
