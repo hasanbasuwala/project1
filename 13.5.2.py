@@ -597,25 +597,49 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
 
 # ──────────────────────────── EVENT LOOPS ─────────────────────────────
 
+_last_ui_stage = {}
+
 async def ui_throttle_loop(app: Client, db: JobScheduler):
+    global _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab
     while True:
-        await asyncio.sleep(3)
-        for job in await db.get_active_jobs():
-            if not job['tracker_id']: continue
-            if job['stage'] != job['last_ui_pct'] or (job['pct'] - job['last_ui_pct']) >= 10.0: 
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("📄 LOGS", callback_data=f"joblog|{job['id']}"), InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{job['id']}")]])
-                await safe_edit(app, job['chat_id'], job['tracker_id'], _job_tracker_text(job), kb)
-                await db.update_job(job['id'], last_ui_pct=job['pct'])
+        # We can safely run this every 3 seconds because the 10% lock is now bulletproof
+        await asyncio.sleep(3) 
+        
+        try:
+            for job in await db.get_active_jobs():
+                jid = job['id']
+                if not job['tracker_id']: continue
                 
-        global _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab
-        if _dashboard_msg_id and _dashboard_chat_id:
-            text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline_ref)
-            await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
+                last_stage = _last_ui_stage.get(jid, "")
+                current_stage = job['stage']
+                
+                # Fetch numbers safely
+                last_pct = float(job['last_ui_pct']) if job['last_ui_pct'] is not None else -10.0
+                current_pct = float(job['pct']) if job['pct'] is not None else 0.0
+                
+                # THE LOCK: Only edit if the stage word changes, OR progress jumps by exactly 10% or more
+                if current_stage != last_stage or (current_pct - last_pct) >= 10.0: 
+                    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📄 LOGS", callback_data=f"joblog|{jid}"), InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
+                    await safe_edit(app, job['chat_id'], job['tracker_id'], _job_tracker_text(job), kb)
+                    
+                    # Update the trackers so it waits for the next 10%
+                    await db.update_job(jid, last_ui_pct=current_pct)
+                    _last_ui_stage[jid] = current_stage
+                    
+            if _dashboard_msg_id and _dashboard_chat_id:
+                text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline_ref)
+                await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
+                
+        except FloodWait as e:
+            # If a FloodWait hits, sleep the exact penalty time silently without crashing
+            await asyncio.sleep(e.value)
+        except Exception: 
+            pass
 
 async def terminal_loop(db: JobScheduler, pipeline: PipelineManager):
     sys.stdout.write("\033[2J") 
     while True:
-        await asyncio.sleep(1)
+        await asyncio.sleep(1) # 1-second ultra-fast refresh for Termux
         sys.stdout.write("\033[H") 
         sys.stdout.write(f"{C_CYAN}{C_BOLD}=== STEALTH MAINFRAME [LIVE] ==={C_RESET}\n")
         sys.stdout.write(f"QUEUES | DL: {pipeline.dl_q.qsize()} | ENC: {pipeline.enc_q.qsize()} | UP: {pipeline.up_q.qsize()}\n{'─' * 40}\n")
@@ -641,10 +665,11 @@ async def terminal_loop(db: JobScheduler, pipeline: PipelineManager):
                     except Exception: pass
                 sys.stdout.write(f"  ├ 📄 \033[2m{last_log[:70]}\033[0m\033[K\n")
                 
-                # 3. High-Speed Raw Console Stream
+                # 3. High-Speed Raw Console Stream (Pulled from memory)
                 live_text = _live_ui_text.get(j['id'], "Awaiting data stream...")
                 sys.stdout.write(f"  └ 📡 \033[36m{live_text[:75]}\033[0m\033[K\n")
         
+        # Clear trailing lines to prevent screen glitches
         sys.stdout.write("\033[J") 
         sys.stdout.flush()
 
