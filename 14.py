@@ -224,11 +224,53 @@ class DownloaderEngine:
             self.db.log_trace(jid, f"Attempting {pass_name}...")
             try:
                 await asyncio.to_thread(self._execute_ytdlp, url, jid, dl_dir, custom_opts)
-                self.db.log_trace(jid, f"{pass_name} SUCCESS.")
-                return True
+                
+                # STRICT VALIDATION: Ensure a file was actually dropped
+                valid_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".flv", ".php"]]
+                if valid_files:
+                    self.db.log_trace(jid, f"{pass_name} SUCCESS.")
+                    return True
+                else:
+                    self.db.log_trace(jid, f"{pass_name} FAILED: yt-dlp exited cleanly but wrote no payload.")
             except Exception as e:
                 self.db.log_trace(jid, f"{pass_name} FAILED: {str(e)[:100]}")
         return False
+
+    async def _run_ytdlp_with_cookies(self, url: str, jid: str, dl_dir: Path, headers: dict, raw_cookies: list) -> bool:
+        cookie_path = dl_dir / f"{jid}_cookies.txt"
+        
+        # Write exact Netscape format to avoid yt-dlp cookie header drops
+        with open(cookie_path, "w", encoding="utf-8") as f:
+            f.write("# Netscape HTTP Cookie File\n")
+            for c in raw_cookies:
+                domain = c.get("domain", "")
+                inc_sub = "TRUE" if domain.startswith(".") else "FALSE"
+                path = c.get("path", "/")
+                secure = "TRUE" if c.get("secure", False) else "FALSE"
+                expires = str(int(c.get("expires", 0))) if c.get("expires", -1) != -1 else "0"
+                name = c.get("name", "")
+                value = c.get("value", "")
+                f.write(f"{domain}\t{inc_sub}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
+
+        opts = {
+            "http_headers": headers,
+            "impersonate": ImpersonateTarget(client="chrome"),
+            "cookiefile": str(cookie_path)
+        }
+            
+        try:
+            await asyncio.to_thread(self._execute_ytdlp, url, jid, dl_dir, opts)
+            
+            # STRICT VALIDATION: Ensure a file was actually dropped
+            valid_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".flv", ".php"]]
+            if valid_files:
+                return True
+            else:
+                self.db.log_trace(jid, "PASS 9 FAILED: yt-dlp cookie bypass exited cleanly but wrote no payload.")
+                return False
+        except Exception as e:
+            self.db.log_trace(jid, f"PASS 9 FAILED: yt-dlp cookie bypass error: {e}")
+            return False
 
     async def _run_playwright_extraction(self, url: str, jid: str, dl_dir: Path) -> dict:
         from playwright.async_api import async_playwright
