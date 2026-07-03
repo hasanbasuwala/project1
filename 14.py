@@ -337,7 +337,7 @@ class DownloaderEngine:
         opts = {
             "http_headers": headers,
             "impersonate": ImpersonateTarget(client="chrome"),
-            [span_5](start_span)"cookiefile": str(cookie_path) #[span_5](end_span)
+            "cookiefile": str(cookie_path)
         }
             
         try:
