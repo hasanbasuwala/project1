@@ -160,37 +160,213 @@ class DownloaderEngine:
             await self.app.download_media(url, file_name=str(dl_dir / f"{jid}.mp4"), progress=tg_prog)
             return
 
-        if strategy == "MAGNET" or strategy == "DIRECT_MP4":
+        if strategy in ["MAGNET", "DIRECT_MP4"]:
             await self._run_aria(url, jid, dl_dir)
+            return
             
-        elif strategy == "HLS_STREAM":
-            self.db.log_trace(jid, "Attempting HLS extraction via yt-dlp...")
-            try:
-                # Attempt direct download first
-                await asyncio.to_thread(self._run_ytdlp, url, jid, dl_dir, url, "")
-            except Exception as e:
-                # Catch 522s, 403s, and other network failures cleanly
-                self.db.log_trace(jid, f"yt-dlp HLS failed. Escalating to Playwright...")
-                await self._run_playwright(url, jid, dl_dir)
-                
-        else:
-            # 6-Stage Waterfall for Generic Links
-            actual_url = url
-            referer = url
-            cookie = ""
-            
-            try:
-                client = primp.Client(impersonate="chrome_120")
-                resp = client.get(url, headers={"User-Agent": USER_AGENT})
-                match = re.search(r"(https?://[^\"']+(?:\.m3u8|\.mp4)[^\"']*)", resp.text)
-                if match: actual_url = match.group(1).replace(r"\/", "/")
-            except Exception: pass
+        # ─── 11-PASS WATERFALL ESCALATION FOR HLS & GENERIC ───
+        
+        # PASS 1-4: yt-dlp Standard & Variants
+        variant_success = await self._attempt_ytdlp_variants(url, jid, dl_dir)
+        if variant_success:
+            return
 
+        # PASS 5-7: Playwright Deep Extraction (DOM, Network, HAR) & Cookie Export
+        self.db.log_trace(jid, "yt-dlp variants failed. Escalating to Playwright extraction...")
+        playwright_data = await self._run_playwright_extraction(url, jid, dl_dir)
+        
+        if not playwright_data or not playwright_data.get('url'):
+            # PASS 11: Final Fail Handler
+            raise RuntimeError("PASS 11 FAILED: All extraction methods exhausted. Target is highly protected.")
+
+        extracted_url = playwright_data['url']
+        headers = playwright_data['headers']
+        cookies = playwright_data['cookie_str']
+
+        self.db.log_trace(jid, "Playwright extraction successful. Delegating authorized payload downstream...")
+
+        # PASS 8: FFmpeg Direct Stream Capture
+        if ".m3u8" in extracted_url:
+            self.db.log_trace(jid, "PASS 8: Attempting FFmpeg direct capture with exported cookies...")
+            if await self._run_ffmpeg_capture(extracted_url, jid, dl_dir, headers, cookies):
+                return
+            self.db.log_trace(jid, "PASS 8 FAILED: FFmpeg direct stream capture aborted.")
+
+        # PASS 9: yt-dlp with Exported Session Cookies
+        self.db.log_trace(jid, "PASS 9: Attempting yt-dlp with exported browser cookies...")
+        if await self._run_ytdlp_with_cookies(extracted_url, jid, dl_dir, headers, cookies):
+            return
+        self.db.log_trace(jid, "PASS 9 FAILED: yt-dlp cookie authentication rejected.")
+
+        # PASS 10: Aria2c Full Header Replay
+        self.db.log_trace(jid, "PASS 10: Attempting Aria2c full header replay bypass...")
+        try:
+            full_headers = headers.copy()
+            if cookies:
+                full_headers["Cookie"] = cookies
+            await self._run_aria(extracted_url, jid, dl_dir, headers=full_headers)
+            return
+        except Exception as e:
+            self.db.log_trace(jid, f"PASS 10 FAILED: Aria2c bypass failed. Error: {e}")
+            
+        # PASS 11: Final Fail Handler
+        raise RuntimeError("PASS 11 FAILED: Authorized downstream clients were rejected by the host.")
+
+    async def _attempt_ytdlp_variants(self, url: str, jid: str, dl_dir: Path) -> bool:
+        variants = [
+            ("PASS 1 Standard", {}),
+            ("PASS 2 Force Generic", {"force_generic_extractor": True}),
+            ("PASS 3 Impersonate Chrome", {"impersonate": ImpersonateTarget(client="chrome")}),
+            ("PASS 4 Mobile UA", {"http_headers": {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"}})
+        ]
+        
+        for pass_name, custom_opts in variants:
+            self.db.log_trace(jid, f"Attempting {pass_name}...")
             try:
-                await asyncio.to_thread(self._run_ytdlp, actual_url, jid, dl_dir, referer, cookie)
+                await asyncio.to_thread(self._execute_ytdlp, url, jid, dl_dir, custom_opts)
+                self.db.log_trace(jid, f"{pass_name} SUCCESS.")
+                return True
             except Exception as e:
-                self.db.log_trace(jid, f"yt-dlp failed, escalating to Playwright. Error: {e}")
-                await self._run_playwright(url, jid, dl_dir)
+                self.db.log_trace(jid, f"{pass_name} FAILED: {str(e)[:100]}")
+        return False
+
+    async def _run_playwright_extraction(self, url: str, jid: str, dl_dir: Path) -> dict:
+        from playwright.async_api import async_playwright
+        
+        har_path = dl_dir / f"{jid}_intercept.har"
+        extracted_payload = {"url": None, "headers": {}, "cookie_str": ""}
+        
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
+            # PASS 7: HAR capture for hidden token extraction initialized here
+            context = await browser.new_context(user_agent=USER_AGENT, record_har_path=str(har_path))
+            page = await context.new_page()
+
+            found_urls = []
+            capture_headers = {}
+
+            # PASS 6: Network Interception
+            async def handle_route(route):
+                req = route.request
+                req_url = req.url
+                
+                if any(ext in req_url for ext in [".m3u8", ".mp4", ".mkv", ".ts"]):
+                    if "ads" not in req_url and "tracking" not in req_url:
+                        found_urls.append(req_url)
+                        capture_headers.update(req.headers)
+
+                if req.resource_type in ["image", "font", "stylesheet"] or any(x in req_url for x in ["ads", "tracking", "analytics"]):
+                    await route.abort()
+                else: 
+                    await route.continue_()
+
+            await page.route("**/*", handle_route)
+            
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(5000)
+            except Exception as e:
+                self.db.log_trace(jid, f"Playwright page load warning: {e}")
+
+            # 1. Prefer PASS 6 Intercepted Network URLs
+            if found_urls:
+                m3u8s = [u for u in found_urls if ".m3u8" in u]
+                extracted_payload["url"] = m3u8s[0] if m3u8s else found_urls[0]
+            
+            # 2. Fallback to PASS 5 DOM extraction
+            if not extracted_payload["url"]:
+                extracted_payload["url"] = await page.evaluate('''() => {
+                    let v = document.querySelector('video'); if (v && v.src && !v.src.startsWith('blob:')) return v.src;
+                    let s = document.querySelector('video source'); if (s && s.src && !s.src.startsWith('blob:')) return s.src;
+                    return null;
+                }''')
+
+            # Export Context Identity 
+            cookies = await context.cookies()
+            extracted_payload["cookie_str"] = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+            
+            # Formulate strict headers
+            extracted_payload["headers"] = {
+                "Referer": page.url,
+                "Origin": "/".join(page.url.split("/")[:3]),
+                "User-Agent": USER_AGENT,
+                "Accept": "*/*",
+                "Connection": "keep-alive"
+            }
+            # Overlay any specific headers caught during network sniff
+            for k in ["sec-fetch-site", "sec-fetch-mode"]:
+                if k in capture_headers: extracted_payload["headers"][k] = capture_headers[k]
+
+            await browser.close()
+            return extracted_payload
+
+    async def _run_ffmpeg_capture(self, url: str, jid: str, dl_dir: Path, headers: dict, cookie_str: str) -> bool:
+        out_file = dl_dir / f"{jid}.mp4"
+        header_arg = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
+        if cookie_str: header_arg += f"Cookie: {cookie_str}\r\n"
+        
+        cmd = [
+            "ffmpeg", "-y", "-headers", header_arg,
+            "-i", url, "-c", "copy", "-bsf:a", "aac_adtstoasc", str(out_file)
+        ]
+        
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        _, stderr = await proc.communicate()
+        
+        if proc.returncode == 0 and out_file.exists() and out_file.stat().st_size > 1024:
+            return True
+        return False
+
+    async def _run_ytdlp_with_cookies(self, url: str, jid: str, dl_dir: Path, headers: dict, cookie_str: str) -> bool:
+        opts = {
+            "http_headers": headers,
+            "impersonate": ImpersonateTarget(client="chrome")
+        }
+        # In a real environment, you'd write a Netscape format cookiefile to disk here 
+        # and pass 'cookiefile': str(cookie_path) to opts. We are injecting via headers for speed.
+        if cookie_str: opts["http_headers"]["Cookie"] = cookie_str
+            
+        try:
+            await asyncio.to_thread(self._execute_ytdlp, url, jid, dl_dir, opts)
+            return True
+        except Exception:
+            return False
+
+    def _execute_ytdlp(self, url: str, jid: str, dl_dir: Path, custom_opts: dict = None):
+        class SilentLogger:
+            def debug(self, msg): pass
+            def warning(self, msg): pass
+            def error(self, msg): pass
+
+        def prog_hook(d):
+            if d.get("status") == "downloading":
+                try: 
+                    pct_str = re.sub(r"\x1b[^m]*m", "", d.get("_percent_str", "0.0%")).strip()
+                    speed = re.sub(r"\x1b[^m]*m", "", d.get("_speed_str", "~")).strip()
+                    eta = re.sub(r"\x1b[^m]*m", "", d.get("_eta_str", "~")).strip()
+                    tot_str = re.sub(r"\x1b[^m]*m", "", d.get("_total_bytes_str", d.get("_total_bytes_estimate_str", "~"))).strip()
+                    
+                    val = float(re.search(r"[\d.]+", pct_str).group()) if re.search(r"[\d.]+", pct_str) else 0.0
+                    
+                    global _live_ui_text
+                    _live_ui_text[jid] = f"[yt-dlp] {pct_str} of {tot_str} at {speed} ETA {eta}"
+
+                    stage_str = f"downloading | {speed} | {eta}"
+                    asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val, stage=stage_str), loop)
+                except Exception: pass
+        
+        opts = {
+            "outtmpl": str(dl_dir / f"{jid}.%(ext)s"), 
+            "format": "bestvideo[height<=1080]+bestaudio/best", 
+            "merge_output_format": "mp4",
+            "progress_hooks": [prog_hook], 
+            "quiet": True, "noprogress": True, "no_warnings": True,
+            "logger": SilentLogger(),
+            "compat_opts": {"allow-unsafe-ext"}
+        }
+        if custom_opts: opts.update(custom_opts)
+            
+        with yt_dlp.YoutubeDL(opts) as ydl: ydl.extract_info(url, download=True)
 
     async def _run_aria(self, url: str, jid: str, dl_dir: Path, headers: dict = None):
         cmd = ["aria2c", "-d", str(dl_dir), "-c", "-x", "16", "-s", "10", "--file-allocation=none"]
@@ -228,124 +404,6 @@ class DownloaderEngine:
         valid_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".flv", ".php"]]
         if not valid_files: raise RuntimeError("Aria2c failed: No media payloads found in output directory.")
 
-    def _run_ytdlp(self, url: str, jid: str, dl_dir: Path, referer: str, cookie: str):
-        class SilentLogger:
-            def debug(self, msg): pass
-            def warning(self, msg): pass
-            def error(self, msg): pass
-
-        def prog_hook(d):
-            if d.get("status") == "downloading":
-                try: 
-                    # 1. Grab yt-dlp's raw strings
-                    pct_str = re.sub(r"\x1b[^m]*m", "", d.get("_percent_str", "0.0%")).strip()
-                    speed = re.sub(r"\x1b[^m]*m", "", d.get("_speed_str", "~")).strip()
-                    eta = re.sub(r"\x1b[^m]*m", "", d.get("_eta_str", "~")).strip()
-                    tot_str = re.sub(r"\x1b[^m]*m", "", d.get("_total_bytes_str", d.get("_total_bytes_estimate_str", "~"))).strip()
-                    
-                    # 2. Extract just the numeric value for the database progress bar
-                    try:
-                        val = float(re.search(r"[\d.]+", pct_str).group())
-                    except Exception:
-                        val = 0.0
-                    
-                    # 3. Pump the raw string to Termux memory
-                    global _live_ui_text
-                    _live_ui_text[jid] = f"[yt-dlp] {pct_str} of {tot_str} at {speed} ETA {eta}"
-
-                    # 4. Pump the parsed data to the SQLite Database
-                    stage_str = f"downloading | {speed} | {eta}"
-                    asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val, stage=stage_str), loop)
-                except Exception: pass
-        
-        fmt = "bestvideo[height<=1080]+bestaudio/best"
-        opts = {
-            "outtmpl": str(dl_dir / f"{jid}.%(ext)s"), 
-            "format": fmt, 
-            "merge_output_format": "mp4",  # <-- NEW: Forces yt-dlp to repair HLS discontinuities
-            "http_headers": {"Referer": referer, "User-Agent": USER_AGENT},
-            "impersonate": ImpersonateTarget(client="chrome"),
-            "progress_hooks": [prog_hook], 
-            "quiet": True,
-            "noprogress": True,
-            "no_warnings": True,
-            "logger": SilentLogger(),
-            "compat_opts": {"allow-unsafe-ext"}
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl: ydl.extract_info(url, download=True)
-
-    async def _run_playwright(self, url: str, jid: str, dl_dir: Path):
-        from playwright.async_api import async_playwright
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-            context = await browser.new_context(user_agent=USER_AGENT)
-            page = await context.new_page()
-
-            found_urls = []
-
-            # The Network Sniffer: Intercepts all traffic and steals media links
-            async def handle_route(route):
-                req_url = route.request.url
-                
-                # If we see a raw video file or stream manifest, save it!
-                if any(ext in req_url for ext in [".m3u8", ".mp4", ".mkv", ".ts"]):
-                    if "ads" not in req_url and "tracking" not in req_url:
-                        found_urls.append(req_url)
-
-                # Still block the heavy visual bloat to save RAM
-                if route.request.resource_type in ["image", "font", "stylesheet"] or any(x in req_url for x in ["ads", "tracking", "analytics"]):
-                    await route.abort()
-                else: 
-                    await route.continue_()
-
-            await page.route("**/*", handle_route)
-            
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                # Let the invisible browser sit for 5 seconds so the video player can boot up
-                await page.wait_for_timeout(5000)
-            except Exception as e:
-                self.db.log_trace(jid, f"Playwright page load warning: {e}")
-
-            video_src = None
-            
-            # 1. Prefer the intercepted network URLs first (bypasses blob: completely)
-            if found_urls:
-                # Prioritize streaming manifests over generic mp4 chunks
-                m3u8s = [u for u in found_urls if ".m3u8" in u]
-                video_src = m3u8s[0] if m3u8s else found_urls[0]
-            
-            # 2. Fallback to DOM HTML scraping if network sniffing found nothing
-            if not video_src:
-                video_src = await page.evaluate('''() => {
-                    let v = document.querySelector('video'); if (v && v.src && !v.src.startsWith('blob:')) return v.src;
-                    let s = document.querySelector('video source'); if (s && s.src && !s.src.startsWith('blob:')) return s.src;
-                    
-                    let iframes = document.querySelectorAll('iframe');
-                    for (let frame of iframes) {
-                        try {
-                            let fv = frame.contentWindow.document.querySelector('video');
-                            if (fv && fv.src && !fv.src.startsWith('blob:')) return fv.src;
-                        } catch(e) {}
-                    }
-                    return null;
-                }''')
-
-            cookies = await context.cookies()
-            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-            referer = page.url
-            await browser.close()
-
-            if video_src:
-                self.db.log_trace(jid, f"Playwright successfully intercepted raw source!")
-                try:
-                    await asyncio.to_thread(self._run_ytdlp, video_src, jid, dl_dir, referer, cookie_str)
-                except Exception as e:
-                    self.db.log_trace(jid, "yt-dlp panicked on Playwright URL. Forcing Aria2c bypass.")
-                    await self._run_aria(video_src, jid, dl_dir, headers={"Cookie": cookie_str, "Referer": referer})
-            else:
-                raise RuntimeError("Playwright headless interceptor failed to find raw video source.")
-
 class EncoderEngine:
     def __init__(self, scheduler: JobScheduler):
         self.db = scheduler
@@ -362,14 +420,13 @@ class EncoderEngine:
         
         await asyncio.create_subprocess_exec("ffmpeg", "-y", "-i", str(dl_file), "-ss", "00:00:02", "-vframes", "1", str(thumb_file), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-                # The ultimate FFmpeg Sandbox command for broken web streams
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y", "-nostdin", 
-            "-fflags", "+genpts",  # <-- NEW: Regenerates broken timeline timestamps
+            "-fflags", "+genpts", 
             "-i", str(dl_file), 
             "-c:v", "copy", 
             "-c:a", "aac", 
-            "-avoid_negative_ts", "make_zero",  # <-- NEW: Forces the movie to start perfectly at 0s
+            "-avoid_negative_ts", "make_zero", 
             "-movflags", "+faststart", 
             str(enc_file), 
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
