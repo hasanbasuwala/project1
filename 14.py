@@ -210,7 +210,7 @@ class DownloaderEngine:
             self.db.log_trace(jid, f"PASS 10 FAILED: Aria2c bypass failed. Error: {e}")
             
         # PASS 11: Final Fail Handler
-        raise RuntimeError("PASS 11 FAILED: Authorized downstream clients were rejected by the host. CDNs are blocking TLS signatures.")
+        raise RuntimeError("PASS 11 FAILED: CDNs are blocking TLS signatures on all vectors.")
 
     async def _attempt_ytdlp_variants(self, url: str, jid: str, dl_dir: Path) -> bool:
         variants = [
@@ -225,7 +225,6 @@ class DownloaderEngine:
             try:
                 await asyncio.to_thread(self._execute_ytdlp, url, jid, dl_dir, custom_opts)
                 
-                # STRICT VALIDATION: Ensure a file was actually dropped
                 valid_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".flv", ".php"]]
                 if valid_files:
                     self.db.log_trace(jid, f"{pass_name} SUCCESS.")
@@ -236,42 +235,6 @@ class DownloaderEngine:
                 self.db.log_trace(jid, f"{pass_name} FAILED: {str(e)[:100]}")
         return False
 
-    async def _run_ytdlp_with_cookies(self, url: str, jid: str, dl_dir: Path, headers: dict, raw_cookies: list) -> bool:
-        cookie_path = dl_dir / f"{jid}_cookies.txt"
-        
-        # Write exact Netscape format to avoid yt-dlp cookie header drops
-        with open(cookie_path, "w", encoding="utf-8") as f:
-            f.write("# Netscape HTTP Cookie File\n")
-            for c in raw_cookies:
-                domain = c.get("domain", "")
-                inc_sub = "TRUE" if domain.startswith(".") else "FALSE"
-                path = c.get("path", "/")
-                secure = "TRUE" if c.get("secure", False) else "FALSE"
-                expires = str(int(c.get("expires", 0))) if c.get("expires", -1) != -1 else "0"
-                name = c.get("name", "")
-                value = c.get("value", "")
-                f.write(f"{domain}\t{inc_sub}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
-
-        opts = {
-            "http_headers": headers,
-            "impersonate": ImpersonateTarget(client="chrome"),
-            "cookiefile": str(cookie_path)
-        }
-            
-        try:
-            await asyncio.to_thread(self._execute_ytdlp, url, jid, dl_dir, opts)
-            
-            # STRICT VALIDATION: Ensure a file was actually dropped
-            valid_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".flv", ".php"]]
-            if valid_files:
-                return True
-            else:
-                self.db.log_trace(jid, "PASS 9 FAILED: yt-dlp cookie bypass exited cleanly but wrote no payload.")
-                return False
-        except Exception as e:
-            self.db.log_trace(jid, f"PASS 9 FAILED: yt-dlp cookie bypass error: {e}")
-            return False
-
     async def _run_playwright_extraction(self, url: str, jid: str, dl_dir: Path) -> dict:
         from playwright.async_api import async_playwright
         
@@ -280,14 +243,12 @@ class DownloaderEngine:
         
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-            # [span_1](start_span)PASS 7: HAR capture for hidden token extraction initialized here[span_1](end_span)
             context = await browser.new_context(user_agent=USER_AGENT, record_har_path=str(har_path))
             page = await context.new_page()
 
             found_urls = []
             capture_headers = {}
 
-            # [span_2](start_span)PASS 6: Network Interception[span_2](end_span)
             async def handle_route(route):
                 req = route.request
                 req_url = req.url
@@ -310,12 +271,10 @@ class DownloaderEngine:
             except Exception as e:
                 self.db.log_trace(jid, f"Playwright page load warning: {e}")
 
-            # 1. Prefer PASS 6 Intercepted Network URLs
             if found_urls:
                 m3u8s = [u for u in found_urls if ".m3u8" in u]
                 extracted_payload["url"] = m3u8s[0] if m3u8s else found_urls[0]
             
-            # 2. [span_3](start_span)Fallback to PASS 5 DOM extraction[span_3](end_span)
             if not extracted_payload["url"]:
                 extracted_payload["url"] = await page.evaluate('''() => {
                     let v = document.querySelector('video'); if (v && v.src && !v.src.startsWith('blob:')) return v.src;
@@ -323,12 +282,10 @@ class DownloaderEngine:
                     return null;
                 }''')
 
-            # [span_4](start_span)Export Context Identity via export browser cookies[span_4](end_span)
             cookies = await context.cookies()
             extracted_payload["raw_cookies"] = cookies
             extracted_payload["cookie_str"] = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             
-            # Formulate strict headers
             extracted_payload["headers"] = {
                 "Referer": page.url,
                 "Origin": "/".join(page.url.split("/")[:3]),
@@ -336,7 +293,6 @@ class DownloaderEngine:
                 "Accept": "*/*",
                 "Connection": "keep-alive"
             }
-            # Overlay any specific headers caught during network sniff
             for k in ["sec-fetch-site", "sec-fetch-mode"]:
                 if k in capture_headers: extracted_payload["headers"][k] = capture_headers[k]
 
@@ -363,7 +319,6 @@ class DownloaderEngine:
     async def _run_ytdlp_with_cookies(self, url: str, jid: str, dl_dir: Path, headers: dict, raw_cookies: list) -> bool:
         cookie_path = dl_dir / f"{jid}_cookies.txt"
         
-        # Write exact Netscape format to avoid yt-dlp cookie header drops
         with open(cookie_path, "w", encoding="utf-8") as f:
             f.write("# Netscape HTTP Cookie File\n")
             for c in raw_cookies:
@@ -384,9 +339,15 @@ class DownloaderEngine:
             
         try:
             await asyncio.to_thread(self._execute_ytdlp, url, jid, dl_dir, opts)
-            return True
+            
+            valid_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".flv", ".php"]]
+            if valid_files:
+                return True
+            else:
+                self.db.log_trace(jid, "PASS 9 FAILED: yt-dlp cookie bypass exited cleanly but wrote no payload.")
+                return False
         except Exception as e:
-            self.db.log_trace(jid, f"yt-dlp cookie bypass error: {e}")
+            self.db.log_trace(jid, f"PASS 9 FAILED: yt-dlp cookie bypass error: {e}")
             return False
 
     def _execute_ytdlp(self, url: str, jid: str, dl_dir: Path, custom_opts: dict = None):
@@ -405,7 +366,6 @@ class DownloaderEngine:
                     
                     val = float(re.search(r"[\d.]+", pct_str).group()) if re.search(r"[\d.]+", pct_str) else 0.0
                     
-                    # TERMUX HIGH SPEED MEMORY BRIDGE
                     global _live_ui_text
                     _live_ui_text[jid] = f"[yt-dlp] {pct_str} of {tot_str} at {speed} ETA {eta}"
 
@@ -426,8 +386,8 @@ class DownloaderEngine:
             
         with yt_dlp.YoutubeDL(opts) as ydl: ydl.extract_info(url, download=True)
 
-     async def _run_aria(self, url: str, jid: str, dl_dir: Path, headers: dict = None):
-        out_name = f"{jid}.mp4"  # Force the exact output filename
+    async def _run_aria(self, url: str, jid: str, dl_dir: Path, headers: dict = None):
+        out_name = f"{jid}.mp4"
         cmd = ["aria2c", "-d", str(dl_dir), "-o", out_name, "-c", "-x", "16", "-s", "10", "--file-allocation=none"]
         if headers:
             for k, v in headers.items(): cmd.append(f"--header={k}: {v}")
@@ -446,7 +406,6 @@ class DownloaderEngine:
                 if chunk_str:
                     clean_str = re.sub(r"\x1b[^m]*m", "", chunk_str)
                     
-                    # TERMUX HIGH SPEED MEMORY BRIDGE
                     if "DL:" in clean_str or "%" in clean_str:
                         global _live_ui_text
                         _live_ui_text[jid] = f"[aria2c] {clean_str}"
