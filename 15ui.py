@@ -590,22 +590,14 @@ def _job_tracker_text(job: dict, avg_speed: str = None, avg_eta: str = None) -> 
 async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: PipelineManager) -> tuple[str, InlineKeyboardMarkup]:
     global _last_completed
     
-    # 1. Mobile-Optimized Retro Header (Max 28 chars wide to prevent iOS wrap)
-    total_storage = sum(f.stat().st_size for f in JOBS_DIR.rglob("*") if f.is_file()) / (1024 ** 3)
-    text = (
-        f"💻 **STEALTH MAINFRAME v14**\n"
-        f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
-        f"`[❖] STAT :` `SECURE & ONLINE`\n"
-        f"`[❖] DISK :` `{total_storage:.2f} GB`\n"
-        f"`[❖] LAST :` `{_last_completed[:12]}`\n"
-        f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
-        f"**Select a subsystem:**"
-    )
+    # 1. Parse the tab state for the 3-Level Deep Accordion (e.g., "dl:1a2b3c4d")
+    stage_tab = tab.split(":")[0] if ":" in tab else tab
+    expanded_jid = tab.split(":")[1] if ":" in tab else None
 
-    # 2. Fetch jobs and organize into buckets
+    # 2. iPhone-Optimized Header (Uptime removed, Queue summary added)
+    total_storage = sum(f.stat().st_size for f in JOBS_DIR.rglob("*") if f.is_file()) / (1024 ** 3)
     jobs = await db.get_active_jobs()
     
-    # Safely strip the dynamic Speed/ETA from the stage string for exact matching
     def _base(stage_str):
         if not stage_str: return ""
         return stage_str.split("|")[0].strip().lower() if "|" in stage_str else stage_str.strip().lower()
@@ -618,39 +610,73 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
         "up": [j for j in jobs if _base(j['stage']) == "uploading"]
     }
 
+    text = (
+        f"💻 **STEALTH MAINFRAME v14**\n"
+        f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
+        f"`[⚡] STAT :` `ONLINE & SECURE`\n"
+        f"`[💾] DISK :` `{total_storage:.2f} GB`\n"
+        f"`[🔄] ACT  :` `{len(buckets['dl'])} DL | {len(buckets['enc'])} PR | {len(buckets['up'])} UP`\n"
+        f"`[🏁] LAST :` `{_last_completed[:12]}`\n"
+        f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
+        f"**Select a subsystem:**"
+    )
+
     kb_lines = []
 
-    # 3. Mobile Dropdown Builder
-    def build_dropdown(target_tab: str, label: str, icon: str, job_list: list):
-        is_open = (tab == target_tab)
-        prefix = "[-]" if is_open else "[+]"
+    # 3. The 3-Level Dropdown Builder
+    def build_dropdown(target_stage: str, label: str, icon: str, job_list: list):
+        is_stage_open = (stage_tab == target_stage)
+        prefix = "[-]" if is_stage_open else "[+]"
         
-        # Main Category Button
-        kb_lines.append([InlineKeyboardButton(f"{prefix} {icon} {label} ({len(job_list)})", callback_data=f"dash|{'root' if is_open else target_tab}")])
+        # LEVEL 1: Main Category Button
+        kb_lines.append([InlineKeyboardButton(f"{prefix} {icon} {label} ({len(job_list)})", callback_data=f"dash|{'root' if is_stage_open else target_stage}")])
         
-        # Expanded Job Buttons
-        if is_open:
+        if is_stage_open:
             if not job_list:
                 kb_lines.append([InlineKeyboardButton("└ No active tasks", callback_data="noop")])
             for j in job_list[:10]:
-                title = j['title'][:8] # Heavily truncated for iPhone screen width
-                pct = j.get('pct', 0.0)
+                jid = j['id']
+                title = j['title'][:10]
+                is_job_expanded = (expanded_jid == jid)
                 
-                # Button 1: Stats (Left 80%) | Button 2: Kill Switch (Right 20%)
-                kb_lines.append([
-                    InlineKeyboardButton(f"└ ⚡ {title}.. | {pct:.1f}%", callback_data=f"joblog|{j['id']}"),
-                    InlineKeyboardButton("❌", callback_data=f"kill|{j['id']}")
-                ])
+                if is_job_expanded:
+                    # LEVEL 3: Expanded Job Details
+                    raw_stage = j.get('stage', '')
+                    speed, eta = "—", "—"
+                    if "|" in raw_stage:
+                        parts = [p.strip() for p in raw_stage.split("|")]
+                        if len(parts) >= 3: speed, eta = parts[1], parts[2]
+                        
+                    pct = j.get('pct', 0.0)
+                    bar = make_bar(pct, 8)
+                    
+                    # The Job Header acts as a close/collapse button
+                    kb_lines.append([InlineKeyboardButton(f"▼ {title}...", callback_data=f"dash|{target_stage}")])
+                    # Read-Only Telemetry Rows
+                    kb_lines.append([InlineKeyboardButton(f"⚡ {speed}  |  ⏳ {eta}", callback_data="noop")])
+                    kb_lines.append([InlineKeyboardButton(f"📊 [{bar}] {pct:.1f}%", callback_data="noop")])
+                    # Action Row
+                    kb_lines.append([
+                        InlineKeyboardButton("📄 LOGS", callback_data=f"joblog|{jid}"),
+                        InlineKeyboardButton("❌ KILL", callback_data=f"kill|{jid}")
+                    ])
+                else:
+                    # LEVEL 2: Collapsed Job List (Clicking this expands the job to Level 3)
+                    pct = j.get('pct', 0.0)
+                    kb_lines.append([
+                        InlineKeyboardButton(f" ├ ⚡ {title}.. | {pct:.1f}%", callback_data=f"dash|{target_stage}:{jid}"),
+                        InlineKeyboardButton("❌", callback_data=f"kill|{jid}")
+                    ])
 
-    # Construct the 5 required menus
+    # Construct the 5 menus
     build_dropdown("dl", "DOWNLOADING", "📥", buckets["dl"])
     build_dropdown("dl_done", "WAITING PROC", "⏳", buckets["dl_done"])
     build_dropdown("enc", "PROCESSING", "⚙️", buckets["enc"])
     build_dropdown("enc_done", "WAITING UP", "⏳", buckets["enc_done"])
     build_dropdown("up", "UPLOADING", "📤", buckets["up"])
 
-    # 4. Storage Manager Dropdown (Optimized for mobile)
-    is_storage_open = (tab == "storage")
+    # 4. Storage Manager
+    is_storage_open = (stage_tab == "storage")
     kb_lines.append([InlineKeyboardButton(f"{'[-]' if is_storage_open else '[+]'} 💾 STORAGE MANAGER", callback_data=f"dash|{'root' if is_storage_open else 'storage'}")])
     
     if is_storage_open:
@@ -658,12 +684,12 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
             kb_lines.append([InlineKeyboardButton("└ Storage empty", callback_data="noop")])
         else:
             for j in jobs[:10]:
-                title = j['title'][:8]
+                title = j['title'][:10]
                 j_dir = JOBS_DIR / f"JOB_{j['id']}"
                 size_mb = sum(f.stat().st_size for f in j_dir.rglob("*") if f.is_file()) / (1024 ** 2) if j_dir.exists() else 0
                 
                 kb_lines.append([
-                    InlineKeyboardButton(f"└ 📁 {title}.. | {size_mb:.1f} MB", callback_data="noop"),
+                    InlineKeyboardButton(f" ├ 📁 {title}.. | {size_mb:.1f} MB", callback_data="noop"),
                     InlineKeyboardButton("🗑️", callback_data=f"kill|{j['id']}") 
                 ])
 
