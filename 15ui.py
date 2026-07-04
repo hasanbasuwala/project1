@@ -561,8 +561,8 @@ _last_completed = "—"
 _live_ui_text = {}
 
 def _job_tracker_text(job: dict, avg_speed: str = None, avg_eta: str = None) -> str:
-    title = job['title'][:18]
-    status_raw = job['stage'].upper()
+    title = str(job.get('title', 'Unknown'))[:18]
+    status_raw = str(job.get('stage', 'PROCESSING')).upper()
     
     speed, eta = "—", "—"
     if "|" in status_raw:
@@ -572,11 +572,13 @@ def _job_tracker_text(job: dict, avg_speed: str = None, avg_eta: str = None) -> 
             speed = parts[1]
             eta = parts[2]
 
-    # Inject the true averages calculated by the loop
     if avg_speed: speed = avg_speed
     if avg_eta: eta = avg_eta
 
-    bar = make_bar(job['pct'], 10)
+    # Safely handle 'None' progress values on fresh jobs
+    pct = job.get('pct')
+    pct_float = float(pct) if pct is not None else 0.0
+    bar = make_bar(pct_float, 10)
     
     return (
         f"`[❖] ＴＡＳＫ :` `{title}..`\n"
@@ -584,7 +586,7 @@ def _job_tracker_text(job: dict, avg_speed: str = None, avg_eta: str = None) -> 
         f"`⚙️ PHASE :` `{status_raw}`\n"
         f"`⚡ SPEED :` `{speed}`\n"
         f"`⏳ ETA   :` `{eta}`\n"
-        f"`📊 PROG  :` `[{bar}] {job['pct']:.1f}%`"
+        f"`📊 PROG  :` `[{bar}] {pct_float:.1f}%`"
     )
 
 async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: PipelineManager) -> tuple[str, InlineKeyboardMarkup]:
