@@ -697,7 +697,47 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         title = msg.caption.strip() if msg.caption else "Direct Media Upload"
         file_id = msg.video.file_id if msg.video else msg.document.file_id
         
-        # Initial Placeholder UI
-        tracker = await msg.reply(f"**STEALTH JOB ACTIVE**\n
-http://googleusercontent.com/immersive_entry_chip/0
-http://googleusercontent.com/immersive_entry_chip/1
+        # Multiline formatted for safety
+        initial_text = (
+            f"**STEALTH JOB ACTIVE**\n"
+            f"```yaml\n"
+            f"File: {title[:30]}\n"
+            f"Job ID: {jid}\n"
+            f"Stage: QUEUED\n"
+            f"```"
+        )
+        
+        tracker = await msg.reply(
+            initial_text, 
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
+        )
+        
+        await db.create_job({"id": jid, "url": file_id, "title": title, "source": "telegram", "strategy": "TELEGRAM", "chat_id": msg.chat.id, "tracker_id": tracker.id})
+        await pipeline.dl_q.put(jid)
+        try: await msg.delete()
+        except: pass
+
+    @app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["start", "dashboard", "jobs", "stats", "pauseall", "resumeall", "cleanup", "system", "restart", "killall", "help"]))
+    async def url_catcher(_, msg: Message):
+        url = next((w for w in msg.text.split() if w.startswith("http") or w.startswith("magnet:?")), None)
+        if url:
+            jid = str(uuid.uuid4())[:8]
+            title = msg.text.replace(url, "").strip() or url[:40]
+            
+            # Multiline formatted for safety
+            initial_text = (
+                f"**STEALTH JOB ACTIVE**\n"
+                f"```yaml\n"
+                f"File: {title[:30]}\n"
+                f"Job ID: {jid}\n"
+                f"Stage: QUEUED\n"
+                f"```"
+            )
+            
+            tracker = await msg.reply(
+                initial_text, 
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
+            )
+            
+            await db.create_job({"id": jid, "url": url, "title": title, "source": "Direct", "quality": "auto", "strategy": LinkClassifier.classify(url), "chat_id": msg.chat.id, "tracker_id": tracker.id})
+            await pipeline.dl_q.put(jid)
