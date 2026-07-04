@@ -740,12 +740,42 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
 
 # ──────────────────────────── EVENT LOOPS ─────────────────────────────
 
+# ── Rolling Average Math Helpers ──
+def _parse_speed(s: str) -> float:
+    try:
+        m = re.search(r"([\d\.]+)\s*([KMG]?i?B/s)", str(s).upper().replace(" ", ""))
+        if not m: return 0.0
+        v, u = float(m.group(1)), m.group(2)
+        return v * 1024**3 if "G" in u else v * 1024**2 if "M" in u else v * 1024 if "K" in u else v
+    except: return 0.0
+
+def _format_speed(b: float) -> str:
+    if b <= 0: return "—"
+    for u in ["B/s", "KiB/s", "MiB/s", "GiB/s"]:
+        if b < 1024.0: return f"{b:.2f} {u}"
+        b /= 1024.0
+    return f"{b:.2f} TiB/s"
+
+def _parse_eta(s: str) -> int:
+    try:
+        parts = re.findall(r"\d+", str(s))
+        if len(parts) == 3: return int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
+        if len(parts) == 2: return int(parts[0])*60 + int(parts[1])
+    except: pass
+    return 0
+
+def _format_eta(s: int) -> str:
+    if s <= 0: return "—"
+    h, s = divmod(int(s), 3600)
+    m, s = divmod(s, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
 _last_ui_stage = {}
+_job_stats_history = {} # Memory bank for rolling averages
 
 async def ui_throttle_loop(app: Client, db: JobScheduler):
     global _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab
     while True:
-        # We can safely run this every 3 seconds because the 10% lock is now bulletproof
         await asyncio.sleep(3) 
         
         try:
@@ -753,28 +783,50 @@ async def ui_throttle_loop(app: Client, db: JobScheduler):
                 jid = job['id']
                 if not job['tracker_id']: continue
                 
-                last_stage = _last_ui_stage.get(jid, "")
-                current_stage = job['stage']
+                raw_stage = job['stage']
+                base_phase = raw_stage.split("|")[0].strip().lower() if "|" in raw_stage else raw_stage.strip().lower()
+                last_phase = _last_ui_stage.get(jid, "")
                 
-                # Fetch numbers safely
                 last_pct = float(job['last_ui_pct']) if job['last_ui_pct'] is not None else -10.0
                 current_pct = float(job['pct']) if job['pct'] is not None else 0.0
+
+                # 1. Silently collect the data every 3 seconds
+                if jid not in _job_stats_history:
+                    _job_stats_history[jid] = {'speeds': [], 'etas': []}
                 
-                # THE LOCK: Only edit if the stage word changes, OR progress jumps by exactly 10% or more
-                if current_stage != last_stage or (current_pct - last_pct) >= 10.0: 
-                    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📄 LOGS", callback_data=f"joblog|{jid}"), InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
-                    await safe_edit(app, job['chat_id'], job['tracker_id'], _job_tracker_text(job), kb)
+                if "|" in raw_stage:
+                    parts = [p.strip() for p in raw_stage.split("|")]
+                    if len(parts) >= 3:
+                        _job_stats_history[jid]['speeds'].append(_parse_speed(parts[1]))
+                        _job_stats_history[jid]['etas'].append(_parse_eta(parts[2]))
+                
+                # 2. THE ARMOR: 10% Threshold Check
+                if (base_phase != last_phase) or (current_pct - last_pct) >= 10.0: 
                     
-                    # Update the trackers so it waits for the next 10%
+                    # 3. Calculate the True Averages
+                    hist = _job_stats_history[jid]
+                    avg_s = _format_speed(sum(hist['speeds']) / len(hist['speeds'])) if hist['speeds'] else None
+                    avg_e = _format_eta(sum(hist['etas']) / len(hist['etas'])) if hist['etas'] else None
+
+                    kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📄 LOGS", callback_data=f"joblog|{jid}"), 
+                         InlineKeyboardButton("❌ KILL", callback_data=f"kill|{jid}")]
+                    ])
+                    
+                    # Inject the smooth averages into the UI Card
+                    await safe_edit(app, job['chat_id'], job['tracker_id'], _job_tracker_text(job, avg_s, avg_e), kb)
+                    
+                    # 4. Lock it in and Wipe the memory for the next 10% block
                     await db.update_job(jid, last_ui_pct=current_pct)
-                    _last_ui_stage[jid] = current_stage
+                    _last_ui_stage[jid] = base_phase
+                    _job_stats_history[jid] = {'speeds': [], 'etas': []} # Reset averages
                     
             if _dashboard_msg_id and _dashboard_chat_id:
                 text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline_ref)
                 await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
                 
         except FloodWait as e:
-            # If a FloodWait hits, sleep the exact penalty time silently without crashing
+            # If the API ever gets angry, silently sleep it off without crashing
             await asyncio.sleep(e.value)
         except Exception: 
             pass
