@@ -458,31 +458,81 @@ class EncoderEngine:
             proc.kill()
             raise TimeoutError("FFmpeg Zombie Sandbox Timeout: Corrupted video headers caused process hang.")
 
-class UploadEngine:
-    def __init__(self, scheduler: JobScheduler, app: Client):
-        self.db = scheduler
+class UploaderEngine:
+    def __init__(self, db: JobScheduler, app: Client):
+        self.db = db
         self.app = app
 
     async def execute(self, job_data: dict):
-        jid, title = job_data['id'], job_data['title']
-        enc_file, thumb_file = JOBS_DIR / f"JOB_{jid}" / "enc" / f"{jid}.mp4", JOBS_DIR / f"JOB_{jid}" / "thumb" / f"{jid}.jpg"
-
-        w, h, dur = 1280, 720, 100
-        try:
-            proc = await asyncio.create_subprocess_exec("ffprobe", "-v", "error", "-show_entries", "stream=width,height:format=duration", "-of", "json", str(enc_file), stdout=subprocess.PIPE)
-            stdout, _ = await proc.communicate()
-            probe = json.loads(stdout.decode())
-            dur = int(float(probe.get("format", {}).get("duration", 100)))
-            for s in probe.get("streams", []):
-                if s.get("width"): w, h = s["width"], s["height"]
-        except Exception: pass
-
-        async def up_prog(c, t):
-            if t: await self.db.update_job(jid, pct=(c * 100 / t))
-
-        await self.app.send_video(CHANNEL_ID, video=str(enc_file), thumb=str(thumb_file) if thumb_file.exists() else None, caption=title, width=w, height=h, duration=dur, supports_streaming=True, progress=up_prog)
+        jid = job_data['id']
+        job_dir = JOBS_DIR / f"JOB_{jid}"
+        enc_dir = job_dir / "enc"
+        dl_dir = job_dir / "dl"
         
-        shutil.move(str(JOBS_DIR / f"JOB_{jid}"), str(DONE_DIR / f"JOB_{jid}"))
+        self.db.log_trace(jid, "Uploader Engine initialized.")
+        await self.db.update_job(jid, stage="uploading", pct=0.0)
+
+        # 1. Find the target file (prefer encoded, fallback to raw download)
+        target_file = None
+        for d in [enc_dir, dl_dir]:
+            if d.exists():
+                files = [f for f in d.rglob("*") if f.is_file() and not f.name.endswith('.part')]
+                if files:
+                    target_file = sorted(files, key=lambda x: x.stat().st_size, reverse=True)[0]
+                    break
+                    
+        if not target_file:
+            raise RuntimeError("Uploader failed: No media payload found in job directories.")
+
+        self.db.log_trace(jid, f"Target locked: {target_file.name}. Commencing uplink...")
+        
+        # 2. Pyrogram Progress Hook (Pushes directly to DB for the UI throttle loop to read)
+        start_time = time.time()
+        async def _up_prog(current, total):
+            if not total: return
+            pct = (current / total) * 100
+            elapsed = time.time() - start_time
+            speed = current / elapsed if elapsed > 0 else 0
+            eta = (total - current) / speed if speed > 0 else 0
+            
+            # Format to strings for the UI loop
+            speed_str = f"{speed / (1024*1024):.2f} MiB/s"
+            eta_str = f"{int(eta // 60):02d}:{int(eta % 60):02d}"
+            
+            await self.db.update_job(jid, pct=pct, stage=f"uploading | {speed_str} | {eta_str}")
+
+        # 3. Execute the Upload
+        caption = f"**{job_data['title']}**"
+        await self.app.send_video(
+            chat_id=job_data['chat_id'],
+            video=str(target_file),
+            caption=caption,
+            progress=_up_prog
+        )
+        
+        self.db.log_trace(jid, "Upload sequence complete. Running final UI cleanup...")
+
+        # 4. Final UI Freeze & Cleanup (Prevents "Ghost" Jobs)
+        try:
+            latest_job = await self.db.get_job(jid)
+            if latest_job and latest_job.get('tracker_id'):
+                final_text = (
+                    f"`[❖] ＴＡＳＫ :` `{latest_job['title'][:18]}..`\n"
+                    f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
+                    f"`✅ PHASE : COMPLETED`\n"
+                    f"`💾 ALLOC : RELEASED`\n"
+                    f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`"
+                )
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ DISMISS", callback_data=f"delmsg|{latest_job['tracker_id']}")]])
+                await self.app.edit_message_text(latest_job['chat_id'], latest_job['tracker_id'], final_text, reply_markup=kb)
+        except Exception as e:
+            self.db.log_trace(jid, f"Failed to push final completion card: {e}")
+
+        # 5. Nuke the database entry and wipe the hard drive allocation
+        global _last_completed
+        _last_completed = job_data['title']
+        await self.db.delete_job(jid)
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 # ──────────────────────────── SUBSYSTEM 4: RECOVERY & LOGGING ─────────
 
