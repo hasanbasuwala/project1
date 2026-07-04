@@ -741,3 +741,171 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
             
             await db.create_job({"id": jid, "url": url, "title": title, "source": "Direct", "quality": "auto", "strategy": LinkClassifier.classify(url), "chat_id": msg.chat.id, "tracker_id": tracker.id})
             await pipeline.dl_q.put(jid)
+
+    @app.on_callback_query(filters.user(OWNER_ID))
+    async def cb_router(_, cb):
+        parts = cb.data.split("|"); action = parts[0]
+        
+        if action == "dash":
+            global _dashboard_tab; _dashboard_tab = parts[1]
+            text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
+            await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
+            await cb.answer()
+            
+        elif action == "kill":
+            jid = parts[1]
+            await db.update_job(jid, stage=Stage.CANCELLED.value)
+            if jid in pipeline.dl_engine.procs:
+                try: pipeline.dl_engine.procs[jid].kill()
+                except Exception: pass
+            if jid in pipeline.enc_engine.procs:
+                try: pipeline.enc_engine.procs[jid].kill()
+                except Exception: pass
+            shutil.rmtree(JOBS_DIR / f"JOB_{jid}", ignore_errors=True)
+            await cb.answer("Job Killed and Temp Files Cleared.")
+            
+        elif action == "pause":
+            jid = parts[1]
+            if jid in pipeline.dl_engine.procs:
+                try: 
+                    os.kill(pipeline.dl_engine.procs[jid].pid, signal.SIGSTOP)
+                    await db.update_job(jid, paused=1)
+                    await cb.answer("Process Paused (SIGSTOP).")
+                except Exception as e: await cb.answer(f"Failed to pause: {e}", show_alert=True)
+            else: await cb.answer("No active process to pause.")
+
+        elif action == "resume":
+            jid = parts[1]
+            if jid in pipeline.dl_engine.procs:
+                try:
+                    os.kill(pipeline.dl_engine.procs[jid].pid, signal.SIGCONT)
+                    await db.update_job(jid, paused=0)
+                    await cb.answer("Process Resumed (SIGCONT).")
+                except Exception as e: await cb.answer(f"Failed to resume: {e}", show_alert=True)
+            else: await cb.answer("No active process to resume.")
+
+        elif action == "joblog":
+            log_path = JOBS_DIR / f"JOB_{parts[1]}" / "trace.log"
+            if not log_path.exists(): log_path = DONE_DIR / f"JOB_{parts[1]}" / "trace.log"
+            if log_path.exists(): await cb.message.reply_document(str(log_path))
+            else: await cb.answer("No logs found.", show_alert=True)
+            
+        elif action == "cmd":
+            if parts[1] == "cleanup":
+                shutil.rmtree(DONE_DIR, ignore_errors=True)
+                DONE_DIR.mkdir(parents=True, exist_ok=True)
+                await cb.answer("Cleanup Complete: Completed temp files removed.", show_alert=True)
+
+# ──────────────────────────── EVENT LOOPS ─────────────────────────────
+
+_last_ui_stage = {}
+
+async def ui_throttle_loop(app: Client, db: JobScheduler):
+    global _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab
+    while True:
+        await asyncio.sleep(3) 
+        
+        try:
+            for job in await db.get_active_jobs():
+                jid = job['id']
+                if not job['tracker_id']: continue
+                
+                last_stage = _last_ui_stage.get(jid, "")
+                current_stage = job['stage']
+                
+                last_pct = float(job['last_ui_pct']) if job['last_ui_pct'] is not None else -10.0
+                current_pct = float(job['pct']) if job['pct'] is not None else 0.0
+                
+                if current_stage != last_stage or (current_pct - last_pct) >= 10.0: 
+                    # v14 Job Card Action Buttons
+                    kb = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("⏸ Pause", callback_data=f"pause|{jid}"), 
+                            InlineKeyboardButton("▶️ Resume", callback_data=f"resume|{jid}")
+                        ],
+                        [
+                            InlineKeyboardButton("🔄 Retry", callback_data=f"retry|{jid}"), 
+                            InlineKeyboardButton("🛑 Kill", callback_data=f"kill|{jid}")
+                        ],
+                        [
+                            InlineKeyboardButton("📄 Logs", callback_data=f"joblog|{jid}"),
+                            InlineKeyboardButton("⚙️ Engine Swap", callback_data=f"swap|{jid}")
+                        ]
+                    ])
+                    await safe_edit(app, job['chat_id'], job['tracker_id'], _job_tracker_text(job), kb)
+                    
+                    await db.update_job(jid, last_ui_pct=current_pct)
+                    _last_ui_stage[jid] = current_stage
+                    
+            if _dashboard_msg_id and _dashboard_chat_id:
+                text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline_ref)
+                await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
+                
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+        except Exception: 
+            pass
+
+async def terminal_loop(db: JobScheduler, pipeline: PipelineManager):
+    sys.stdout.write("\033[2J") 
+    while True:
+        await asyncio.sleep(1) # 1-second ultra-fast refresh for Termux
+        sys.stdout.write("\033[H") 
+        sys.stdout.write(f"{C_CYAN}{C_BOLD}=== STEALTH MAINFRAME [LIVE] ==={C_RESET}\n")
+        sys.stdout.write(f"QUEUES | DL: {pipeline.dl_q.qsize()} | ENC: {pipeline.enc_q.qsize()} | UP: {pipeline.up_q.qsize()}\n{'─' * 40}\n")
+        
+        jobs = await db.get_active_jobs()
+        if not jobs: 
+            sys.stdout.write(f"{C_GREEN}System Idle. Awaiting vectors.{C_RESET}\033[K\n")
+        else:
+            for j in jobs[:5]:
+                col = C_YELLOW if "download" in j['stage'] else C_CYAN if "enc" in j['stage'] else C_GREEN
+                
+                # 1. Main Job Bar
+                sys.stdout.write(f"{C_BOLD}[{j['title'][:15]}]{C_RESET} {col}{j['stage']}{C_RESET} | [{make_bar(j['pct'], 10)}] {j['pct']:.1f}%\033[K\n")
+                
+                # 2. Database Log File Stream
+                log_path = JOBS_DIR / f"JOB_{j['id']}" / "trace.log"
+                last_log = "Initializing..."
+                if log_path.exists():
+                    try:
+                        with open(log_path, "r", encoding="utf-8") as f:
+                            lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+                            if lines: last_log = re.sub(r"^\[.*?\]\s*", "", lines[-1])
+                    except Exception: pass
+                sys.stdout.write(f"  ├ 📄 \033[2m{last_log[:70]}\033[0m\033[K\n")
+                
+                # 3. High-Speed Raw Console Stream (Pulled from memory)
+                live_text = _live_ui_text.get(j['id'], "Awaiting data stream...")
+                sys.stdout.write(f"  └ 📡 \033[36m{live_text[:75]}\033[0m\033[K\n")
+        
+        # Clear trailing lines to prevent screen glitches
+        sys.stdout.write("\033[J") 
+        sys.stdout.flush()
+
+# ──────────────────────────── BOOTSTRAP ───────────────────────────────
+
+async def main():
+    app = Client("stealth_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+    db = JobScheduler(DB_PATH)
+    pipeline = PipelineManager(app, db)
+    setup_router(app, db, pipeline)
+
+    async with app:
+        await RecoveryManager.scan_and_requeue(db, pipeline.dl_q, pipeline.enc_q, pipeline.up_q, app)
+        pipeline.start_workers()
+        asyncio.create_task(ui_throttle_loop(app, db))
+        asyncio.create_task(terminal_loop(db, pipeline))
+        
+        if OWNER_ID:
+            m = await app.send_message(OWNER_ID, "🟢 Mainframe Systems Online.")
+            global _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab
+            _dashboard_msg_id, _dashboard_chat_id = m.id, m.chat.id
+            text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
+            await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
+
+        while True: await asyncio.sleep(3600)
+
+if __name__ == "__main__":
+    try: loop.run_until_complete(main())
+    except KeyboardInterrupt: sys.exit(0)
