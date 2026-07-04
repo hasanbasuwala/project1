@@ -560,9 +560,32 @@ _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab = 0, 0, "root"
 _last_completed = "—"
 _live_ui_text = {}
 
-def _job_tracker_text(job: dict) -> str:
-    bar = make_bar(job['pct'], 12)
-    return f"`[ ⚡ ] ＴＡＳＫ :` `{job['title'][:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `{job['stage'].upper()}`\n`[ 📊 ] ＰＲＯＧ :` `[{bar}] {job['pct']:.1f}%`"
+def _job_tracker_text(job: dict, avg_speed: str = None, avg_eta: str = None) -> str:
+    title = job['title'][:18]
+    status_raw = job['stage'].upper()
+    
+    speed, eta = "—", "—"
+    if "|" in status_raw:
+        parts = [p.strip() for p in status_raw.split("|")]
+        status_raw = parts[0]
+        if len(parts) >= 3:
+            speed = parts[1]
+            eta = parts[2]
+
+    # Inject the true averages calculated by the loop
+    if avg_speed: speed = avg_speed
+    if avg_eta: eta = avg_eta
+
+    bar = make_bar(job['pct'], 10)
+    
+    return (
+        f"`[❖] ＴＡＳＫ :` `{title}..`\n"
+        f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
+        f"`⚙️ PHASE :` `{status_raw}`\n"
+        f"`⚡ SPEED :` `{speed}`\n"
+        f"`⏳ ETA   :` `{eta}`\n"
+        f"`📊 PROG  :` `[{bar}] {job['pct']:.1f}%`"
+    )
 
 async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: PipelineManager) -> tuple[str, InlineKeyboardMarkup]:
     global _last_completed
