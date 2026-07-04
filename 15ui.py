@@ -797,29 +797,83 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
             await db.create_job({"id": jid, "url": url, "title": title, "source": "Direct", "quality": "auto", "strategy": LinkClassifier.classify(url), "chat_id": msg.chat.id, "tracker_id": tracker.id})
             await pipeline.dl_q.put(jid)
 
-    @app.on_callback_query(filters.user(OWNER_ID))
-    async def cb_router(_, cb):
-        parts = cb.data.split("|"); action = parts[0]
+@app.on_callback_query()
+async def _router(client: Client, cb: CallbackQuery):
+    global _dashboard_tab, _dashboard_msg_id, _dashboard_chat_id
+    
+    # 1. No-Op (For decorative buttons)
+    if cb.data == "noop":
+        await cb.answer()
+        return
+
+    # 2. Delete Message (Used for final cleanup of COMPLETED jobs)
+    if cb.data.startswith("delmsg|"):
+        _, msg_id = cb.data.split("|")
+        try: 
+            await client.delete_messages(cb.message.chat.id, int(msg_id))
+            await cb.answer("Cleared from terminal.")
+        except Exception: 
+            await cb.answer("Failed to clear message.", show_alert=True)
+        return
+
+    # 3. Accordion Dashboard Navigation (Handles both categories and specific jobs)
+    if cb.data.startswith("dash|"):
+        new_tab = cb.data.split("|")[1]
+        if new_tab != _dashboard_tab:
+            _dashboard_tab = new_tab
+            try:
+                text, kb = await _get_dashboard_components(_dashboard_tab, pipeline_ref.db, pipeline_ref)
+                await cb.message.edit_text(text, reply_markup=kb)
+            except MessageNotModified:
+                pass
+        await cb.answer()
+        return
+
+    # 4. Action: View Trace Logs
+    if cb.data.startswith("joblog|"):
+        jid = cb.data.split("|")[1]
+        log_path = JOBS_DIR / f"JOB_{jid}" / "trace.log"
+        if not log_path.exists():
+            await cb.answer("Log file empty or job uninitialized.", show_alert=True)
+            return
+            
+        with open(log_path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+            # Grab the last 15 lines of the trace log to fit on an iPhone screen
+            recent_logs = "\n".join(lines[-15:]) if lines else "No data."
+            
+        await cb.answer(f"--- TRACE LOGS ---\n{recent_logs}", show_alert=True)
+        return
+
+    # 5. Action: Kill / Delete Switch
+    if cb.data.startswith("kill|"):
+        jid = cb.data.split("|")[1]
         
-        if action == "dash":
-            global _dashboard_tab; _dashboard_tab = parts[1]
-            text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
-            await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
-            await cb.answer()
+        # Log the intervention
+        await pipeline_ref.db.log_trace(jid, "SYS_OP INITIATED MANUAL OVERRIDE: KILL COMMAND RECEIVED.")
+        
+        # Remove from database to immediately sever it from the UI loops
+        await pipeline_ref.db.delete_job(jid)
+        
+        # Destroy the files on disk
+        job_dir = JOBS_DIR / f"JOB_{jid}"
+        shutil.rmtree(job_dir, ignore_errors=True)
+        
+        # Visually confirm deletion on the Job Card if it wasn't triggered from the main dashboard
+        if _dashboard_msg_id != cb.message.id:
+            try:
+                await cb.message.edit_text(f"💀 **TASK TERMINATED:** `JOB_{jid}`", reply_markup=None)
+            except Exception: pass
             
-        elif action == "kill":
-            await db.update_job(parts[1], stage=Stage.CANCELLED.value)
-            if parts[1] in pipeline.dl_engine.procs:
-                try: pipeline.dl_engine.procs[parts[1]].kill()
-                except Exception: pass
-            shutil.rmtree(JOBS_DIR / f"JOB_{parts[1]}", ignore_errors=True)
-            await cb.answer("Killed.")
+        # If triggered from inside the Dashboard, refresh the Dashboard to show it disappeared
+        else:
+            try:
+                text, kb = await _get_dashboard_components(_dashboard_tab, pipeline_ref.db, pipeline_ref)
+                await cb.message.edit_text(text, reply_markup=kb)
+            except Exception: pass
             
-        elif action == "joblog":
-            log_path = JOBS_DIR / f"JOB_{parts[1]}" / "trace.log"
-            if not log_path.exists(): log_path = DONE_DIR / f"JOB_{parts[1]}" / "trace.log"
-            if log_path.exists(): await cb.message.reply_document(str(log_path))
-            else: await cb.answer("No logs found.", show_alert=True)
+        await cb.answer("Process terminated and payload destroyed.", show_alert=True)
+        return
 
 # ──────────────────────────── EVENT LOOPS ─────────────────────────────
 
