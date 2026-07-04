@@ -1,12 +1,11 @@
 """
-stealth_bot.py - v14 (The Complete Structured Monolith)
+stealth_bot.py - v13.3 (The Complete Structured Monolith)
 ───────────────────────────────────────────────────────────────
 ARCHITECTURE:
   • Single-file Micro-Orchestration (Classes).
   • JobScheduler (SQLite + asyncio.Lock).
   • High-Speed Memory Bridge for Termux UI.
   • Full Accordion Dashboard & ANSI Logger.
-  • Operator-Grade Telegram UI + Subprocess Signaling.
 ───────────────────────────────────────────────────────────────
 """
 
@@ -23,8 +22,6 @@ import uuid
 import sys
 import traceback
 import sqlite3
-import signal
-import psutil
 from enum import Enum
 from pathlib import Path
 import yt_dlp
@@ -44,7 +41,6 @@ import config
 
 # ──────────────────────────── CONFIGURATION ─────────────────────────────
 
-BOOT_TIME = time.time()
 BASE_DIR = Path("SysCache")
 LOG_DIR = BASE_DIR / "logs"
 DB_PATH = BASE_DIR / "scheduler.db"
@@ -77,11 +73,6 @@ def make_bar(percent: float, width: int = 10) -> str:
     filled = int(max(0.0, min(percent, 100.0)) / (100.0 / width))
     return "█" * filled + "░" * (width - filled)
 
-def format_uptime(seconds: int) -> str:
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{int(h)}h {int(m)}m"
-
 # ──────────────────────────── SUBSYSTEM 1: DATABASE ─────────────────────
 
 class Stage(str, Enum):
@@ -99,20 +90,16 @@ class JobScheduler:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY, url TEXT, title TEXT, source TEXT, quality TEXT, strategy TEXT,
-                stage TEXT, pct REAL, last_ui_pct REAL, retries INTEGER, chat_id INTEGER, tracker_id INTEGER,
-                speed TEXT, eta TEXT, size TEXT, engine TEXT, runtime INTEGER, paused INTEGER
+                stage TEXT, pct REAL, last_ui_pct REAL, retries INTEGER, chat_id INTEGER, tracker_id INTEGER
             )''')
 
     async def create_job(self, data: dict):
         async with self.lock:
             with sqlite3.connect(self.db_path) as conn:
-                conn.execute('''INSERT INTO jobs (
-                                id, url, title, source, quality, strategy, stage, pct, last_ui_pct, 
-                                retries, chat_id, tracker_id, speed, eta, size, engine, runtime, paused)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
-                             (data['id'], data['url'], data['title'], data['source'], data.get('quality', 'auto'), 
-                              data.get('strategy', 'GENERIC'), Stage.QUEUED.value, 0.0, -10.0, 0, 
-                              data['chat_id'], data['tracker_id'], "0 MB/s", "Unknown", "Unknown", "Pending", 0, 0))
+                conn.execute('''INSERT INTO jobs (id, url, title, source, quality, strategy, stage, pct, last_ui_pct, retries, chat_id, tracker_id)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
+                             (data['id'], data['url'], data['title'], data['source'], data.get('quality', 'auto'), data.get('strategy', 'GENERIC'), 
+                              Stage.QUEUED.value, 0.0, -10.0, 0, data['chat_id'], data['tracker_id']))
                 
         root = JOBS_DIR / f"JOB_{data['id']}"
         for d in (root, root / "dl", root / "enc", root / "thumb"): d.mkdir(parents=True, exist_ok=True)
@@ -168,14 +155,12 @@ class DownloaderEngine:
         self.db.log_trace(jid, f"Download Orchestrator engaged. Strategy: {strategy}")
 
         if strategy == "TELEGRAM":
-            await self.db.update_job(jid, engine="Pyrogram Bridge")
             async def tg_prog(c, t):
-                if t: await self.db.update_job(jid, pct=(c * 100 / t), size=f"{t/1024/1024:.1f} MB")
+                if t: await self.db.update_job(jid, pct=(c * 100 / t))
             await self.app.download_media(url, file_name=str(dl_dir / f"{jid}.mp4"), progress=tg_prog)
             return
 
         if strategy in ["MAGNET", "DIRECT_MP4"]:
-            await self.db.update_job(jid, engine="aria2c")
             await self._run_aria(url, jid, dl_dir)
             return
             
@@ -186,9 +171,8 @@ class DownloaderEngine:
         if variant_success:
             return
 
-        # PASS 5-7: Playwright Deep Extraction
+        # PASS 5-7: Playwright Deep Extraction (DOM, Network, HAR) & Cookie Export
         self.db.log_trace(jid, "yt-dlp variants failed. Escalating to Playwright extraction...")
-        await self.db.update_job(jid, engine="Playwright Fallback")
         playwright_data = await self._run_playwright_extraction(url, jid, dl_dir)
         
         if not playwright_data or not playwright_data.get('url'):
@@ -208,7 +192,7 @@ class DownloaderEngine:
                 return
             self.db.log_trace(jid, "PASS 8 FAILED: FFmpeg direct stream capture aborted.")
 
-        # PASS 9: yt-dlp with Exported Session Cookies
+        # PASS 9: yt-dlp with Exported Session Cookies (Netscape Format Bypass)
         self.db.log_trace(jid, "PASS 9: Attempting yt-dlp with exported Netscape cookiefile...")
         if await self._run_ytdlp_with_cookies(extracted_url, jid, dl_dir, headers, raw_cookies):
             return
@@ -218,7 +202,8 @@ class DownloaderEngine:
         self.db.log_trace(jid, "PASS 10: Attempting Aria2c full header replay bypass...")
         try:
             full_headers = headers.copy()
-            if cookie_str: full_headers["Cookie"] = cookie_str
+            if cookie_str:
+                full_headers["Cookie"] = cookie_str
             await self._run_aria(extracted_url, jid, dl_dir, headers=full_headers)
             return
         except Exception as e:
@@ -235,7 +220,6 @@ class DownloaderEngine:
             ("PASS 4 Mobile UA", {"http_headers": {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"}})
         ]
         
-        await self.db.update_job(jid, engine="yt-dlp core")
         for pass_name, custom_opts in variants:
             self.db.log_trace(jid, f"Attempting {pass_name}...")
             try:
@@ -316,7 +300,6 @@ class DownloaderEngine:
             return extracted_payload
 
     async def _run_ffmpeg_capture(self, url: str, jid: str, dl_dir: Path, headers: dict, cookie_str: str) -> bool:
-        await self.db.update_job(jid, engine="ffmpeg stream copy")
         out_file = dl_dir / f"{jid}.mp4"
         header_arg = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
         if cookie_str: header_arg += f"Cookie: {cookie_str}\r\n"
@@ -327,16 +310,13 @@ class DownloaderEngine:
         ]
         
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        self.procs[jid] = proc
         _, stderr = await proc.communicate()
-        self.procs.pop(jid, None)
         
         if proc.returncode == 0 and out_file.exists() and out_file.stat().st_size > 1024:
             return True
         return False
 
     async def _run_ytdlp_with_cookies(self, url: str, jid: str, dl_dir: Path, headers: dict, raw_cookies: list) -> bool:
-        await self.db.update_job(jid, engine="yt-dlp (Cookie Auth)")
         cookie_path = dl_dir / f"{jid}_cookies.txt"
         
         with open(cookie_path, "w", encoding="utf-8") as f:
@@ -359,8 +339,10 @@ class DownloaderEngine:
             
         try:
             await asyncio.to_thread(self._execute_ytdlp, url, jid, dl_dir, opts)
+            
             valid_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".flv", ".php"]]
-            if valid_files: return True
+            if valid_files:
+                return True
             else:
                 self.db.log_trace(jid, "PASS 9 FAILED: yt-dlp cookie bypass exited cleanly but wrote no payload.")
                 return False
@@ -387,8 +369,8 @@ class DownloaderEngine:
                     global _live_ui_text
                     _live_ui_text[jid] = f"[yt-dlp] {pct_str} of {tot_str} at {speed} ETA {eta}"
 
-                    stage_str = Stage.DOWNLOADING.value
-                    asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val, stage=stage_str, speed=speed, eta=eta, size=tot_str), loop)
+                    stage_str = f"downloading | {speed} | {eta}"
+                    asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val, stage=stage_str), loop)
                 except Exception: pass
         
         opts = {
@@ -431,9 +413,8 @@ class DownloaderEngine:
                     m = re.search(r"\(([\d.]+)%\).*?DL:([^\s]+).*?ETA:([^\s\]]+)", chunk_str)
                     if m:
                         val = float(m.group(1))
-                        speed = m.group(2)
-                        eta = m.group(3)
-                        await self.db.update_job(jid, pct=val, stage=Stage.DOWNLOADING.value, speed=speed, eta=eta)
+                        stage_str = f"downloading | {m.group(2)} | {m.group(3)}"
+                        await self.db.update_job(jid, pct=val, stage=stage_str)
                     else:
                         m2 = re.search(r"\((\d+)%\)", chunk_str)
                         if m2: await self.db.update_job(jid, pct=float(m2.group(1)))
@@ -447,11 +428,9 @@ class DownloaderEngine:
 class EncoderEngine:
     def __init__(self, scheduler: JobScheduler):
         self.db = scheduler
-        self.procs = {}
 
     async def execute(self, job_data: dict):
         jid = job_data['id']
-        await self.db.update_job(jid, engine="ffmpeg copy")
         dl_dir, enc_dir, thumb_dir = JOBS_DIR / f"JOB_{jid}" / "dl", JOBS_DIR / f"JOB_{jid}" / "enc", JOBS_DIR / f"JOB_{jid}" / "thumb"
         
         dl_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".flv", ".php"]]
@@ -473,14 +452,11 @@ class EncoderEngine:
             str(enc_file), 
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        self.procs[jid] = proc
         try:
             await asyncio.wait_for(proc.wait(), timeout=900)
         except asyncio.TimeoutError:
             proc.kill()
             raise TimeoutError("FFmpeg Zombie Sandbox Timeout: Corrupted video headers caused process hang.")
-        finally:
-            self.procs.pop(jid, None)
 
 class UploadEngine:
     def __init__(self, scheduler: JobScheduler, app: Client):
@@ -489,7 +465,6 @@ class UploadEngine:
 
     async def execute(self, job_data: dict):
         jid, title = job_data['id'], job_data['title']
-        await self.db.update_job(jid, engine="Pyrogram")
         enc_file, thumb_file = JOBS_DIR / f"JOB_{jid}" / "enc" / f"{jid}.mp4", JOBS_DIR / f"JOB_{jid}" / "thumb" / f"{jid}.jpg"
 
         w, h, dur = 1280, 720, 100
@@ -503,7 +478,7 @@ class UploadEngine:
         except Exception: pass
 
         async def up_prog(c, t):
-            if t: await self.db.update_job(jid, pct=(c * 100 / t), size=f"{t/1024/1024:.1f} MB")
+            if t: await self.db.update_job(jid, pct=(c * 100 / t))
 
         await self.app.send_video(CHANNEL_ID, video=str(enc_file), thumb=str(thumb_file) if thumb_file.exists() else None, caption=title, width=w, height=h, duration=dur, supports_streaming=True, progress=up_prog)
         
@@ -579,58 +554,33 @@ class PipelineManager:
         asyncio.create_task(self._worker_loop(self.enc_q, self.enc_engine, Stage.ENCODING, Stage.ENCODED, self.up_q))
         asyncio.create_task(self._worker_loop(self.up_q, self.up_engine, Stage.UPLOADING, Stage.COMPLETED, None))
 
-# ──────────────────────────── UI & COMMAND ROUTER (v14 Blueprint) ────────
+# ──────────────────────────── UI & COMMAND ROUTER ───────────────────────
 
 _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab = 0, 0, "root"
 _last_completed = "—"
 _live_ui_text = {}
 
 def _job_tracker_text(job: dict) -> str:
-    # v14 Complete Job Card Structure
     bar = make_bar(job['pct'], 12)
-    return (
-        f"**STEALTH JOB ACTIVE**\n"
-        f"```yaml\n"
-        f"File     : {job['title'][:30]}\n"
-        f"Job ID   : {job['id']}\n"
-        f"Source   : {job['source'].upper()}\n"
-        f"Engine   : {job.get('engine', 'Pending')}\n"
-        f"Stage    : {job['stage'].upper()}\n"
-        f"Size     : {job.get('size', 'Unknown')}\n"
-        f"Speed    : {job.get('speed', '0 MB/s')}\n"
-        f"ETA      : {job.get('eta', 'Unknown')}\n"
-        f"```\n"
-        f"**[{bar}]** `{job['pct']:.1f}%`\n"
-        f"`Retry    : {job.get('retries', 0)}/{MAX_RETRIES}`"
-    )
+    return f"`[ ⚡ ] ＴＡＳＫ :` `{job['title'][:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `{job['stage'].upper()}`\n`[ 📊 ] ＰＲＯＧ :` `[{bar}] {job['pct']:.1f}%`"
 
 async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: PipelineManager) -> tuple[str, InlineKeyboardMarkup]:
     global _last_completed
     wait_dl, wait_enc, wait_up = pipeline.dl_q.qsize(), pipeline.enc_q.qsize(), pipeline.up_q.qsize()
     
+    text = f"🖥 **STEALTH MAINFRAME**\n{'═' * 28}\n\n"
     if tab == "root":
-        # v14 Hardware Telemetry Integration
         storage_mb = sum(f.stat().st_size for f in JOBS_DIR.rglob("*") if f.is_file()) / (1024 ** 2)
-        total, used, free = shutil.disk_usage(BASE_DIR)
-        
-        cpu_usage = psutil.cpu_percent()
-        ram = psutil.virtual_memory()
-        uptime_str = format_uptime(int(time.time() - BOOT_TIME))
-        
-        text = (
-            f"🖥 **STEALTH MAINFRAME**\n"
-            f"🟢 STATUS: `ONLINE`\n"
-            f"⏱ UPTIME: `{uptime_str}`\n"
-            f"⚙️ CPU: `{cpu_usage}%`\n"
-            f"🧠 RAM: `{ram.used // (1024**2)}MB / {ram.total // (1024**2)}MB`\n"
-            f"💾 STORAGE: `{storage_mb:.1f} MB / {total // (1024**3)} GB`\n\n"
-            f"📥 ACTIVE DOWNLOADS: `{MAX_DL_WORKERS - wait_dl if wait_dl < MAX_DL_WORKERS else MAX_DL_WORKERS}`\n"
-            f"⚙️ ACTIVE ENCODERS: `{1 if pipeline.enc_engine.procs else 0}`\n"
-            f"📤 ACTIVE UPLOADS: `1`\n\n"
+        text += (
+            f"**[ 📡 TELEMETRY ]**\n"
+            f"  ├ Wait Download  : `{wait_dl}`\n"
+            f"  ├ Wait Encode    : `{wait_enc}`\n"
+            f"  ├ Wait Upload    : `{wait_up}`\n"
+            f"  └ Storage Use    : `{storage_mb:.1f} MB`\n\n"
             f"**[ 🏁 LATEST ]**\n  └ `{_last_completed[:35]}`"
         )
     else:
-        text = f"**[ 📂 VIEW: {tab.upper()} ]**\n{'═' * 28}\n"
+        text += f"**[ 📂 VIEW: {tab.upper()} ]**\n"
         jobs = await db.get_active_jobs()
         found = False
         for job in jobs:
@@ -642,21 +592,12 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
                 text += f"  ├ `{job['title'][:20]}`\n  └ `[{make_bar(pct, 8)}] {pct:.1f}%`\n"
         if not found: text += "  └ _Empty_"
 
-    # v14 Expanded Modular Navigation Array
     kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 SUMMARY" if tab != "root" else "🔘 SUMMARY", callback_data="dash|root")],
         [
-            InlineKeyboardButton("📥 Downloads", callback_data="dash|dl"),
-            InlineKeyboardButton("⚙️ Encoder", callback_data="dash|enc"),
-            InlineKeyboardButton("📤 Uploads", callback_data="dash|up")
-        ],
-        [
-            InlineKeyboardButton("📋 Queue", callback_data="dash|queue"),
-            InlineKeyboardButton("📊 Stats", callback_data="dash|stats"),
-            InlineKeyboardButton("💻 System", callback_data="dash|system")
-        ],
-        [
-            InlineKeyboardButton("🧹 Cleanup", callback_data="cmd|cleanup"),
-            InlineKeyboardButton("🔄 Refresh UI", callback_data="dash|root")
+            InlineKeyboardButton(f"📥 DL", callback_data="dash|dl"),
+            InlineKeyboardButton(f"⚙️ ENC", callback_data="dash|enc"),
+            InlineKeyboardButton(f"📤 UP", callback_data="dash|up"),
         ]
     ])
     return text, kb
@@ -683,12 +624,6 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
         await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
 
-    # Blueprint v14 Extended Commands Mapping
-    @app.on_message(filters.command(["jobs", "stats", "pauseall", "resumeall", "cleanup", "system", "restart", "killall", "help"]) & filters.user(OWNER_ID))
-    async def extended_command_handler(_, msg: Message):
-        cmd = msg.command[0].lower()
-        await msg.reply(f"🔧 Command `/{cmd}` acknowledged. Subsystem routing pending implementation.")
-
     @app.on_message((filters.video | filters.document) & filters.user(OWNER_ID))
     async def auto_catch_media(_, msg: Message):
         if msg.document and msg.document.mime_type and not msg.document.mime_type.startswith("video/"): return
@@ -697,47 +632,19 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         title = msg.caption.strip() if msg.caption else "Direct Media Upload"
         file_id = msg.video.file_id if msg.video else msg.document.file_id
         
-        # Multiline formatted for safety
-        initial_text = (
-            f"**STEALTH JOB ACTIVE**\n"
-            f"```yaml\n"
-            f"File: {title[:30]}\n"
-            f"Job ID: {jid}\n"
-            f"Stage: QUEUED\n"
-            f"```"
-        )
-        
-        tracker = await msg.reply(
-            initial_text, 
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
-        )
-        
+        tracker = await msg.reply(f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]]))
         await db.create_job({"id": jid, "url": file_id, "title": title, "source": "telegram", "strategy": "TELEGRAM", "chat_id": msg.chat.id, "tracker_id": tracker.id})
         await pipeline.dl_q.put(jid)
         try: await msg.delete()
         except: pass
 
-    @app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["start", "dashboard", "jobs", "stats", "pauseall", "resumeall", "cleanup", "system", "restart", "killall", "help"]))
+    @app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["start", "dashboard"]))
     async def url_catcher(_, msg: Message):
         url = next((w for w in msg.text.split() if w.startswith("http") or w.startswith("magnet:?")), None)
         if url:
             jid = str(uuid.uuid4())[:8]
             title = msg.text.replace(url, "").strip() or url[:40]
-            
-            # Multiline formatted for safety
-            initial_text = (
-                f"**STEALTH JOB ACTIVE**\n"
-                f"```yaml\n"
-                f"File: {title[:30]}\n"
-                f"Job ID: {jid}\n"
-                f"Stage: QUEUED\n"
-                f"```"
-            )
-            
-            tracker = await msg.reply(
-                initial_text, 
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
-            )
+            tracker = await msg.reply(f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]]))
             
             await db.create_job({"id": jid, "url": url, "title": title, "source": "Direct", "quality": "auto", "strategy": LinkClassifier.classify(url), "chat_id": msg.chat.id, "tracker_id": tracker.id})
             await pipeline.dl_q.put(jid)
@@ -753,48 +660,18 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
             await cb.answer()
             
         elif action == "kill":
-            jid = parts[1]
-            await db.update_job(jid, stage=Stage.CANCELLED.value)
-            if jid in pipeline.dl_engine.procs:
-                try: pipeline.dl_engine.procs[jid].kill()
+            await db.update_job(parts[1], stage=Stage.CANCELLED.value)
+            if parts[1] in pipeline.dl_engine.procs:
+                try: pipeline.dl_engine.procs[parts[1]].kill()
                 except Exception: pass
-            if jid in pipeline.enc_engine.procs:
-                try: pipeline.enc_engine.procs[jid].kill()
-                except Exception: pass
-            shutil.rmtree(JOBS_DIR / f"JOB_{jid}", ignore_errors=True)
-            await cb.answer("Job Killed and Temp Files Cleared.")
+            shutil.rmtree(JOBS_DIR / f"JOB_{parts[1]}", ignore_errors=True)
+            await cb.answer("Killed.")
             
-        elif action == "pause":
-            jid = parts[1]
-            if jid in pipeline.dl_engine.procs:
-                try: 
-                    os.kill(pipeline.dl_engine.procs[jid].pid, signal.SIGSTOP)
-                    await db.update_job(jid, paused=1)
-                    await cb.answer("Process Paused (SIGSTOP).")
-                except Exception as e: await cb.answer(f"Failed to pause: {e}", show_alert=True)
-            else: await cb.answer("No active process to pause.")
-
-        elif action == "resume":
-            jid = parts[1]
-            if jid in pipeline.dl_engine.procs:
-                try:
-                    os.kill(pipeline.dl_engine.procs[jid].pid, signal.SIGCONT)
-                    await db.update_job(jid, paused=0)
-                    await cb.answer("Process Resumed (SIGCONT).")
-                except Exception as e: await cb.answer(f"Failed to resume: {e}", show_alert=True)
-            else: await cb.answer("No active process to resume.")
-
         elif action == "joblog":
             log_path = JOBS_DIR / f"JOB_{parts[1]}" / "trace.log"
             if not log_path.exists(): log_path = DONE_DIR / f"JOB_{parts[1]}" / "trace.log"
             if log_path.exists(): await cb.message.reply_document(str(log_path))
             else: await cb.answer("No logs found.", show_alert=True)
-            
-        elif action == "cmd":
-            if parts[1] == "cleanup":
-                shutil.rmtree(DONE_DIR, ignore_errors=True)
-                DONE_DIR.mkdir(parents=True, exist_ok=True)
-                await cb.answer("Cleanup Complete: Completed temp files removed.", show_alert=True)
 
 # ──────────────────────────── EVENT LOOPS ─────────────────────────────
 
@@ -803,6 +680,7 @@ _last_ui_stage = {}
 async def ui_throttle_loop(app: Client, db: JobScheduler):
     global _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab
     while True:
+        # We can safely run this every 3 seconds because the 10% lock is now bulletproof
         await asyncio.sleep(3) 
         
         try:
@@ -813,27 +691,16 @@ async def ui_throttle_loop(app: Client, db: JobScheduler):
                 last_stage = _last_ui_stage.get(jid, "")
                 current_stage = job['stage']
                 
+                # Fetch numbers safely
                 last_pct = float(job['last_ui_pct']) if job['last_ui_pct'] is not None else -10.0
                 current_pct = float(job['pct']) if job['pct'] is not None else 0.0
                 
+                # THE LOCK: Only edit if the stage word changes, OR progress jumps by exactly 10% or more
                 if current_stage != last_stage or (current_pct - last_pct) >= 10.0: 
-                    # v14 Job Card Action Buttons
-                    kb = InlineKeyboardMarkup([
-                        [
-                            InlineKeyboardButton("⏸ Pause", callback_data=f"pause|{jid}"), 
-                            InlineKeyboardButton("▶️ Resume", callback_data=f"resume|{jid}")
-                        ],
-                        [
-                            InlineKeyboardButton("🔄 Retry", callback_data=f"retry|{jid}"), 
-                            InlineKeyboardButton("🛑 Kill", callback_data=f"kill|{jid}")
-                        ],
-                        [
-                            InlineKeyboardButton("📄 Logs", callback_data=f"joblog|{jid}"),
-                            InlineKeyboardButton("⚙️ Engine Swap", callback_data=f"swap|{jid}")
-                        ]
-                    ])
+                    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📄 LOGS", callback_data=f"joblog|{jid}"), InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
                     await safe_edit(app, job['chat_id'], job['tracker_id'], _job_tracker_text(job), kb)
                     
+                    # Update the trackers so it waits for the next 10%
                     await db.update_job(jid, last_ui_pct=current_pct)
                     _last_ui_stage[jid] = current_stage
                     
@@ -842,6 +709,7 @@ async def ui_throttle_loop(app: Client, db: JobScheduler):
                 await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
                 
         except FloodWait as e:
+            # If a FloodWait hits, sleep the exact penalty time silently without crashing
             await asyncio.sleep(e.value)
         except Exception: 
             pass
