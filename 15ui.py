@@ -566,41 +566,83 @@ def _job_tracker_text(job: dict) -> str:
 
 async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: PipelineManager) -> tuple[str, InlineKeyboardMarkup]:
     global _last_completed
-    wait_dl, wait_enc, wait_up = pipeline.dl_q.qsize(), pipeline.enc_q.qsize(), pipeline.up_q.qsize()
     
-    text = f"🖥 **STEALTH MAINFRAME**\n{'═' * 28}\n\n"
-    if tab == "root":
-        storage_mb = sum(f.stat().st_size for f in JOBS_DIR.rglob("*") if f.is_file()) / (1024 ** 2)
-        text += (
-            f"**[ 📡 TELEMETRY ]**\n"
-            f"  ├ Wait Download  : `{wait_dl}`\n"
-            f"  ├ Wait Encode    : `{wait_enc}`\n"
-            f"  ├ Wait Upload    : `{wait_up}`\n"
-            f"  └ Storage Use    : `{storage_mb:.1f} MB`\n\n"
-            f"**[ 🏁 LATEST ]**\n  └ `{_last_completed[:35]}`"
-        )
-    else:
-        text += f"**[ 📂 VIEW: {tab.upper()} ]**\n"
-        jobs = await db.get_active_jobs()
-        found = False
-        for job in jobs:
-            if (tab == "dl" and "download" in job['stage']) or \
-               (tab == "enc" and ("process" in job['stage'] or "enc" in job['stage'])) or \
-               (tab == "up" and "upload" in job['stage']):
-                found = True
-                pct = job.get('pct', 0.0)
-                text += f"  ├ `{job['title'][:20]}`\n  └ `[{make_bar(pct, 8)}] {pct:.1f}%`\n"
-        if not found: text += "  └ _Empty_"
+    # 1. Mobile-Optimized Retro Header (Max 28 chars wide to prevent iOS wrap)
+    total_storage = sum(f.stat().st_size for f in JOBS_DIR.rglob("*") if f.is_file()) / (1024 ** 3)
+    text = (
+        f"💻 **STEALTH MAINFRAME v14**\n"
+        f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
+        f"`[❖] STAT :` `SECURE & ONLINE`\n"
+        f"`[❖] DISK :` `{total_storage:.2f} GB`\n"
+        f"`[❖] LAST :` `{_last_completed[:12]}`\n"
+        f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
+        f"**Select a subsystem:**"
+    )
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 SUMMARY" if tab != "root" else "🔘 SUMMARY", callback_data="dash|root")],
-        [
-            InlineKeyboardButton(f"📥 DL", callback_data="dash|dl"),
-            InlineKeyboardButton(f"⚙️ ENC", callback_data="dash|enc"),
-            InlineKeyboardButton(f"📤 UP", callback_data="dash|up"),
-        ]
-    ])
-    return text, kb
+    # 2. Fetch jobs and organize into buckets
+    jobs = await db.get_active_jobs()
+    
+    buckets = {
+        "dl": [j for j in jobs if j['stage'] in ["queued", "downloading"]],
+        "dl_done": [j for j in jobs if j['stage'] == "downloaded"],
+        "enc": [j for j in jobs if j['stage'] == "encoding"],
+        "enc_done": [j for j in jobs if j['stage'] == "encoded"],
+        "up": [j for j in jobs if j['stage'] == "uploading"]
+    }
+
+    kb_lines = []
+
+    # 3. Mobile Dropdown Builder
+    def build_dropdown(target_tab: str, label: str, icon: str, job_list: list):
+        is_open = (tab == target_tab)
+        prefix = "[-]" if is_open else "[+]"
+        
+        # Main Category Button
+        kb_lines.append([InlineKeyboardButton(f"{prefix} {icon} {label} ({len(job_list)})", callback_data=f"dash|{'root' if is_open else target_tab}")])
+        
+        # Expanded Job Buttons
+        if is_open:
+            if not job_list:
+                kb_lines.append([InlineKeyboardButton("└ No active tasks", callback_data="noop")])
+            for j in job_list[:10]:
+                title = j['title'][:8] # Heavily truncated for iPhone screen width
+                pct = j.get('pct', 0.0)
+                
+                # Button 1: Stats (Left 80%) | Button 2: Kill Switch (Right 20%)
+                kb_lines.append([
+                    InlineKeyboardButton(f"└ ⚡ {title}.. | {pct:.1f}%", callback_data=f"joblog|{j['id']}"),
+                    InlineKeyboardButton("❌", callback_data=f"kill|{j['id']}")
+                ])
+
+    # Construct the 5 required menus
+    build_dropdown("dl", "DOWNLOADING", "📥", buckets["dl"])
+    build_dropdown("dl_done", "WAITING PROC", "⏳", buckets["dl_done"])
+    build_dropdown("enc", "PROCESSING", "⚙️", buckets["enc"])
+    build_dropdown("enc_done", "WAITING UP", "⏳", buckets["enc_done"])
+    build_dropdown("up", "UPLOADING", "📤", buckets["up"])
+
+    # 4. Storage Manager Dropdown (Optimized for mobile)
+    is_storage_open = (tab == "storage")
+    kb_lines.append([InlineKeyboardButton(f"{'[-]' if is_storage_open else '[+]'} 💾 STORAGE MANAGER", callback_data=f"dash|{'root' if is_storage_open else 'storage'}")])
+    
+    if is_storage_open:
+        if not jobs:
+            kb_lines.append([InlineKeyboardButton("└ Storage empty", callback_data="noop")])
+        else:
+            for j in jobs[:10]:
+                title = j['title'][:8]
+                j_dir = JOBS_DIR / f"JOB_{j['id']}"
+                size_mb = sum(f.stat().st_size for f in j_dir.rglob("*") if f.is_file()) / (1024 ** 2) if j_dir.exists() else 0
+                
+                kb_lines.append([
+                    InlineKeyboardButton(f"└ 📁 {title}.. | {size_mb:.1f} MB", callback_data="noop"),
+                    InlineKeyboardButton("🗑️", callback_data=f"kill|{j['id']}") 
+                ])
+
+    # 5. Global Refresh Button
+    kb_lines.append([InlineKeyboardButton("🔄 REFRESH SYSTEM", callback_data=f"dash|{tab}")])
+
+    return text, InlineKeyboardMarkup(kb_lines)
 
 async def safe_edit(app: Client, chat_id: int, msg_id: int, text: str, kb: InlineKeyboardMarkup):
     try: await app.edit_message_text(chat_id, msg_id, text, reply_markup=kb)
