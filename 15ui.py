@@ -605,12 +605,17 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
     # 2. Fetch jobs and organize into buckets
     jobs = await db.get_active_jobs()
     
+    # Safely strip the dynamic Speed/ETA from the stage string for exact matching
+    def _base(stage_str):
+        if not stage_str: return ""
+        return stage_str.split("|")[0].strip().lower() if "|" in stage_str else stage_str.strip().lower()
+
     buckets = {
-        "dl": [j for j in jobs if j['stage'] in ["queued", "downloading"]],
-        "dl_done": [j for j in jobs if j['stage'] == "downloaded"],
-        "enc": [j for j in jobs if j['stage'] == "encoding"],
-        "enc_done": [j for j in jobs if j['stage'] == "encoded"],
-        "up": [j for j in jobs if j['stage'] == "uploading"]
+        "dl": [j for j in jobs if _base(j['stage']) in ["queued", "downloading"]],
+        "dl_done": [j for j in jobs if _base(j['stage']) == "downloaded"],
+        "enc": [j for j in jobs if _base(j['stage']) in ["encoding", "process"]],
+        "enc_done": [j for j in jobs if _base(j['stage']) == "encoded"],
+        "up": [j for j in jobs if _base(j['stage']) == "uploading"]
     }
 
     kb_lines = []
