@@ -719,14 +719,46 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
         "up": [j for j in standard_jobs if _base(j['stage']) == "uploading"]
     }
 
+    # ─── NEW: DYNAMIC ACT LIST BUILDER ───
+    act_text_blocks = []
+    if not buckets['dl'] and not buckets['enc'] and not buckets['up']:
+        act_text_blocks.append("`[🔄] ACT  :` `0 DL | 0 PR | 0 UP`")
+    else:
+        act_text_blocks.append("`[🔄] ACT  :`")
+        counter = 1
+        
+        if buckets['dl']:
+            act_text_blocks.append(f"`  {counter}. DL ({len(buckets['dl'])})`")
+            for i, j in enumerate(buckets['dl'][:5]): # Capped at 5 for UI safety
+                pct = float(j.get('pct', 0.0) or 0.0)
+                act_text_blocks.append(f"`     {chr(97+i)}. {j['title'][:12]}.. [{make_bar(pct, 8)}] {pct:.1f}%`")
+            counter += 1
+            
+        if buckets['enc']:
+            act_text_blocks.append(f"`  {counter}. PR ({len(buckets['enc'])})`")
+            for i, j in enumerate(buckets['enc'][:5]):
+                pct = float(j.get('pct', 0.0) or 0.0)
+                act_text_blocks.append(f"`     {chr(97+i)}. {j['title'][:12]}.. [{make_bar(pct, 8)}] {pct:.1f}%`")
+            counter += 1
+            
+        if buckets['up']:
+            act_text_blocks.append(f"`  {counter}. UP ({len(buckets['up'])})`")
+            for i, j in enumerate(buckets['up'][:5]):
+                pct = float(j.get('pct', 0.0) or 0.0)
+                act_text_blocks.append(f"`     {chr(97+i)}. {j['title'][:12]}.. [{make_bar(pct, 8)}] {pct:.1f}%`")
+                
+    act_string = "\n".join(act_text_blocks)
+    # ─────────────────────────────────────
+
     sync_stat = "`RECOVERY AUDIT ACTIVE`" if recovery_pool else "`SYSTEM NORMAL`"
+    
     text = (
         f"💻 **STEALTH MAINFRAME v14**\n"
         f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
         f"`[⚡] STAT :` `ONLINE & SECURE`\n"
         f"`[⚠️] SYNC :` {sync_stat}\n"
         f"`[💾] DISK :` `{total_storage:.2f} GB`\n"
-        f"`[🔄] ACT  :` `{len(buckets['dl'])} DL | {len(buckets['enc'])} PR | {len(buckets['up'])} UP`\n"
+        f"{act_string}\n"
         f"`[🏁] LAST :` `{_last_completed[:12]}`\n"
         f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
         f"**Select a subsystem:**"
@@ -734,7 +766,6 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
 
     kb_lines = []
 
-    # 🔧 FIX 2: Added 'parent_tab' routing to prevent kicking you out to the main menu
     def build_dropdown(target_stage: str, label: str, icon: str, job_list: list, parent_tab: str = "root"):
         is_stage_open = (stage_tab == target_stage)
         prefix = "[-]" if is_stage_open else "[+]"
@@ -759,7 +790,6 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
                     pct = j.get('pct', 0.0)
                     bar = make_bar(pct, 8)
                     
-                    # VIEW SWAP: The Isolated Job Card Layout
                     kb_lines.append([InlineKeyboardButton(f"🪪 ISOLATED JOB CARD: {jid}", callback_data="noop")])
                     kb_lines.append([InlineKeyboardButton(f"📁 {title}...", callback_data="noop")])
                     kb_lines.append([InlineKeyboardButton(f"⚡ {speed}  |  ⏳ {eta}", callback_data="noop")])
@@ -780,9 +810,7 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
                         InlineKeyboardButton("❌", callback_data=f"kill|{jid}")
                     ])
 
-    # 1. Inject the Recovery Pool at the very top (if it exists)
     if recovery_pool:
-        # 🔧 FIX 1: Allow the Recovery tab to stay open if ANY of its sub-menus are active
         is_rec_open = stage_tab in ["recovery", "rec_dl", "rec_enc", "rec_up"]
         kb_lines.append([InlineKeyboardButton(f"{'[-]' if is_rec_open else '[+]'} 🚨 RECOVERY POOL ({len(recovery_pool)})", callback_data=f"dash|{'root' if is_rec_open else 'recovery'}")])
         
@@ -791,21 +819,18 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
             rec_enc = [j for j in recovery_pool if _base(j['recovered_at_stage']) in ["encoding", "encoded"]]
             rec_up = [j for j in recovery_pool if _base(j['recovered_at_stage']) == "uploading"]
             
-            # 🔧 FIX 2 applied: Passing "recovery" as the parent tab
             build_dropdown("rec_dl", "STALLED DOWNLOADS", "📥", rec_dl, parent_tab="recovery")
             build_dropdown("rec_enc", "STALLED PROCESSING", "⚙️", rec_enc, parent_tab="recovery")
             build_dropdown("rec_up", "STALLED UPLOADS", "📤", rec_up, parent_tab="recovery")
             
             kb_lines.append([InlineKeyboardButton("🗑️ PURGE ALL RECOVERED", callback_data="purge_recovery")])
 
-    # 2. Render Standard Dashboard
     build_dropdown("dl", "DOWNLOADING", "📥", buckets["dl"])
     build_dropdown("dl_done", "WAITING PROC", "⏳", buckets["dl_done"])
     build_dropdown("enc", "PROCESSING", "⚙️", buckets["enc"])
     build_dropdown("enc_done", "WAITING UP", "⏳", buckets["enc_done"])
     build_dropdown("up", "UPLOADING", "📤", buckets["up"])
 
-    # 3. Render Storage Manager
     is_storage_open = (stage_tab == "storage")
     kb_lines.append([InlineKeyboardButton(f"{'[-]' if is_storage_open else '[+]'} 💾 STORAGE MANAGER", callback_data=f"dash|{'root' if is_storage_open else 'storage'}")])
     
