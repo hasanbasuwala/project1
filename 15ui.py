@@ -606,6 +606,9 @@ class PipelineManager:
 
 # ──────────────────────────── UI & COMMAND ROUTER ───────────────────────
 
+from pyrogram.types import ForceReply
+import re
+
 _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab = 0, 0, "root"
 _last_completed = "—"
 _live_ui_text = {}
@@ -625,7 +628,6 @@ def _job_tracker_text(job: dict, avg_speed: str = None, avg_eta: str = None) -> 
     if avg_speed: speed = avg_speed
     if avg_eta: eta = avg_eta
 
-    # Safely handle 'None' progress values on fresh jobs
     pct = job.get('pct')
     pct_float = float(pct) if pct is not None else 0.0
     bar = make_bar(pct_float, 10)
@@ -642,11 +644,9 @@ def _job_tracker_text(job: dict, avg_speed: str = None, avg_eta: str = None) -> 
 async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: PipelineManager) -> tuple[str, InlineKeyboardMarkup]:
     global _last_completed
     
-    # 1. Parse the tab state for the 3-Level Deep Accordion (e.g., "dl:1a2b3c4d")
     stage_tab = tab.split(":")[0] if ":" in tab else tab
     expanded_jid = tab.split(":")[1] if ":" in tab else None
 
-    # 2. iPhone-Optimized Header (Uptime removed, Queue summary added)
     total_storage = sum(f.stat().st_size for f in JOBS_DIR.rglob("*") if f.is_file()) / (1024 ** 3)
     jobs = await db.get_active_jobs()
     
@@ -675,12 +675,10 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
 
     kb_lines = []
 
-    # 3. The 3-Level Dropdown Builder
     def build_dropdown(target_stage: str, label: str, icon: str, job_list: list):
         is_stage_open = (stage_tab == target_stage)
         prefix = "[-]" if is_stage_open else "[+]"
         
-        # LEVEL 1: Main Category Button
         kb_lines.append([InlineKeyboardButton(f"{prefix} {icon} {label} ({len(job_list)})", callback_data=f"dash|{'root' if is_stage_open else target_stage}")])
         
         if is_stage_open:
@@ -692,7 +690,6 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
                 is_job_expanded = (expanded_jid == jid)
                 
                 if is_job_expanded:
-                    # LEVEL 3: Expanded Job Details
                     raw_stage = j.get('stage', '')
                     speed, eta = "—", "—"
                     if "|" in raw_stage:
@@ -702,32 +699,32 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
                     pct = j.get('pct', 0.0)
                     bar = make_bar(pct, 8)
                     
-                    # The Job Header acts as a close/collapse button
                     kb_lines.append([InlineKeyboardButton(f"▼ {title}...", callback_data=f"dash|{target_stage}")])
-                    # Read-Only Telemetry Rows
                     kb_lines.append([InlineKeyboardButton(f"⚡ {speed}  |  ⏳ {eta}", callback_data="noop")])
                     kb_lines.append([InlineKeyboardButton(f"📊 [{bar}] {pct:.1f}%", callback_data="noop")])
-                    # Action Row
+                    
+                    # ── NEW ACTION BAR ──
                     kb_lines.append([
                         InlineKeyboardButton("📄 LOGS", callback_data=f"joblog|{jid}"),
                         InlineKeyboardButton("❌ KILL", callback_data=f"kill|{jid}")
                     ])
+                    kb_lines.append([
+                        InlineKeyboardButton("✏️ RENAME", callback_data=f"rename|{jid}"),
+                        InlineKeyboardButton("⏭ FORCE UP", callback_data=f"forceup|{jid}")
+                    ])
                 else:
-                    # LEVEL 2: Collapsed Job List (Clicking this expands the job to Level 3)
                     pct = j.get('pct', 0.0)
                     kb_lines.append([
                         InlineKeyboardButton(f" ├ ⚡ {title}.. | {pct:.1f}%", callback_data=f"dash|{target_stage}:{jid}"),
                         InlineKeyboardButton("❌", callback_data=f"kill|{jid}")
                     ])
 
-    # Construct the 5 menus
     build_dropdown("dl", "DOWNLOADING", "📥", buckets["dl"])
     build_dropdown("dl_done", "WAITING PROC", "⏳", buckets["dl_done"])
     build_dropdown("enc", "PROCESSING", "⚙️", buckets["enc"])
     build_dropdown("enc_done", "WAITING UP", "⏳", buckets["enc_done"])
     build_dropdown("up", "UPLOADING", "📤", buckets["up"])
 
-    # 4. Storage Manager
     is_storage_open = (stage_tab == "storage")
     kb_lines.append([InlineKeyboardButton(f"{'[-]' if is_storage_open else '[+]'} 💾 STORAGE MANAGER", callback_data=f"dash|{'root' if is_storage_open else 'storage'}")])
     
@@ -745,7 +742,6 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
                     InlineKeyboardButton("🗑️", callback_data=f"kill|{j['id']}") 
                 ])
 
-    # 5. Global Refresh Button
     kb_lines.append([InlineKeyboardButton("🔄 REFRESH SYSTEM", callback_data=f"dash|{tab}")])
 
     return text, InlineKeyboardMarkup(kb_lines)
@@ -758,6 +754,7 @@ async def safe_edit(app: Client, chat_id: int, msg_id: int, text: str, kb: Inlin
 
 pipeline_ref = None
 
+# ──────────────────────────── ALL ROUTERS INSIDE THIS FUNCTION ──────────
 def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
     global pipeline_ref
     pipeline_ref = pipeline
@@ -788,6 +785,26 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
 
     @app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["start", "dashboard"]))
     async def url_catcher(_, msg: Message):
+        # NEW: Catch replies for the Rename function
+        if msg.reply_to_message and msg.reply_to_message.text and "RENAME TASK" in msg.reply_to_message.text:
+            try:
+                jid = re.search(r"`([a-zA-Z0-9_]+)`", msg.reply_to_message.text).group(1)
+                new_title = msg.text.strip()
+                await db.update_job(jid, title=new_title)
+                
+                # Delete the setup messages to keep chat clean
+                await msg.reply_to_message.delete()
+                await msg.delete()
+                
+                # Refresh dashboard if active
+                if _dashboard_msg_id:
+                    text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
+                    await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
+                    
+            except Exception: pass
+            return
+
+        # Standard Link Catcher
         url = next((w for w in msg.text.split() if w.startswith("http") or w.startswith("magnet:?")), None)
         if url:
             jid = str(uuid.uuid4())[:8]
@@ -797,27 +814,23 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
             await db.create_job({"id": jid, "url": url, "title": title, "source": "Direct", "quality": "auto", "strategy": LinkClassifier.classify(url), "chat_id": msg.chat.id, "tracker_id": tracker.id})
             await pipeline.dl_q.put(jid)
 
-    # 👇 The fully indented router that now correctly sees the 'app' variable 👇
     @app.on_callback_query()
     async def _router(client: Client, cb: CallbackQuery):
         global _dashboard_tab, _dashboard_msg_id, _dashboard_chat_id
         
-        # 1. No-Op (For decorative buttons)
         if cb.data == "noop":
             await cb.answer()
             return
 
-        # 2. Delete Message (Used for final cleanup of COMPLETED jobs)
         if cb.data.startswith("delmsg|"):
             _, msg_id = cb.data.split("|")
             try: 
                 await client.delete_messages(cb.message.chat.id, int(msg_id))
                 await cb.answer("Cleared from terminal.")
             except Exception: 
-                await cb.answer("Failed to clear message.", show_alert=True)
+                await cb.answer("Failed to clear.", show_alert=True)
             return
 
-        # 3. Accordion Dashboard Navigation (Handles both categories and specific jobs)
         if cb.data.startswith("dash|"):
             new_tab = cb.data.split("|")[1]
             if new_tab != _dashboard_tab:
@@ -825,54 +838,67 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
                 try:
                     text, kb = await _get_dashboard_components(_dashboard_tab, pipeline_ref.db, pipeline_ref)
                     await cb.message.edit_text(text, reply_markup=kb)
-                except MessageNotModified:
-                    pass
+                except MessageNotModified: pass
             await cb.answer()
             return
 
-        # 4. Action: View Trace Logs
         if cb.data.startswith("joblog|"):
             jid = cb.data.split("|")[1]
             log_path = JOBS_DIR / f"JOB_{jid}" / "trace.log"
             if not log_path.exists():
-                await cb.answer("Log file empty or job uninitialized.", show_alert=True)
+                await cb.answer("No logs found.", show_alert=True)
                 return
-                
             with open(log_path, "r", encoding="utf-8") as f:
                 lines = f.read().splitlines()
-                # Grab the last 15 lines of the trace log to fit on an iPhone screen
                 recent_logs = "\n".join(lines[-15:]) if lines else "No data."
-                
             await cb.answer(f"--- TRACE LOGS ---\n{recent_logs}", show_alert=True)
             return
 
-        # 5. Action: Kill / Delete Switch
+        # ── NEW: RENAME ACTION ──
+        if cb.data.startswith("rename|"):
+            jid = cb.data.split("|")[1]
+            await cb.message.reply(
+                f"✏️ **RENAME TASK:** `{jid}`\nReply to this exact message with the new file name.", 
+                reply_markup=ForceReply(selective=True)
+            )
+            await cb.answer()
+            return
+
+        # ── NEW: FORCE UPLOAD ACTION ──
+        if cb.data.startswith("forceup|"):
+            jid = cb.data.split("|")[1]
+            # Override database status to bypass the rest of the download phase
+            await pipeline_ref.db.update_job(jid, stage="downloaded")
+            
+            # Push into Encoder queue (Pipeline will safely move it to Upload queue if no encoding is needed)
+            await pipeline_ref.enc_q.put(jid)
+            await pipeline_ref.db.log_trace(jid, "SYS_OP OVERRIDE: FORCE UPLOAD INITIATED.")
+            
+            await cb.answer("Download interrupted. Pushing payload to encoder/uploader pipeline.", show_alert=True)
+            
+            # Refresh Dashboard to show it moved queues
+            try:
+                text, kb = await _get_dashboard_components(_dashboard_tab, pipeline_ref.db, pipeline_ref)
+                await cb.message.edit_text(text, reply_markup=kb)
+            except Exception: pass
+            return
+
         if cb.data.startswith("kill|"):
             jid = cb.data.split("|")[1]
-            
-            # Log the intervention
             await pipeline_ref.db.log_trace(jid, "SYS_OP INITIATED MANUAL OVERRIDE: KILL COMMAND RECEIVED.")
-            
-            # Remove from database to immediately sever it from the UI loops
             await pipeline_ref.db.delete_job(jid)
             
-            # Destroy the files on disk
             job_dir = JOBS_DIR / f"JOB_{jid}"
             shutil.rmtree(job_dir, ignore_errors=True)
             
-            # Visually confirm deletion on the Job Card if it wasn't triggered from the main dashboard
             if _dashboard_msg_id != cb.message.id:
-                try:
-                    await cb.message.edit_text(f"💀 **TASK TERMINATED:** `JOB_{jid}`", reply_markup=None)
+                try: await cb.message.edit_text(f"💀 **TASK TERMINATED:** `JOB_{jid}`", reply_markup=None)
                 except Exception: pass
-                
-            # If triggered from inside the Dashboard, refresh the Dashboard to show it disappeared
             else:
                 try:
                     text, kb = await _get_dashboard_components(_dashboard_tab, pipeline_ref.db, pipeline_ref)
                     await cb.message.edit_text(text, reply_markup=kb)
                 except Exception: pass
-                
             await cb.answer("Process terminated and payload destroyed.", show_alert=True)
             return
 
