@@ -106,11 +106,19 @@ class JobScheduler:
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
+            # 1. Create the table if it's a completely fresh install
             conn.execute('''CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY, url TEXT, title TEXT, source TEXT, quality TEXT, strategy TEXT,
                 stage TEXT, pct REAL, last_ui_pct REAL, retries INTEGER, chat_id INTEGER, tracker_id INTEGER,
                 recovered_at_stage TEXT DEFAULT NULL
             )''')
+            
+            # 2. Patch existing databases that are missing the new column
+            try:
+                conn.execute('ALTER TABLE jobs ADD COLUMN recovered_at_stage TEXT DEFAULT NULL')
+            except sqlite3.OperationalError:
+                # If the column already exists, SQLite throws an error. We just ignore it.
+                pass
 
     async def create_job(self, data: dict):
         async with self.lock:
