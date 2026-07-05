@@ -734,11 +734,12 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
 
     kb_lines = []
 
-    def build_dropdown(target_stage: str, label: str, icon: str, job_list: list):
+    # 🔧 FIX 2: Added 'parent_tab' routing to prevent kicking you out to the main menu
+    def build_dropdown(target_stage: str, label: str, icon: str, job_list: list, parent_tab: str = "root"):
         is_stage_open = (stage_tab == target_stage)
         prefix = "[-]" if is_stage_open else "[+]"
         
-        kb_lines.append([InlineKeyboardButton(f"{prefix} {icon} {label} ({len(job_list)})", callback_data=f"dash|{'root' if is_stage_open else target_stage}")])
+        kb_lines.append([InlineKeyboardButton(f"{prefix} {icon} {label} ({len(job_list)})", callback_data=f"dash|{parent_tab if is_stage_open else target_stage}")])
         
         if is_stage_open:
             if not job_list:
@@ -781,7 +782,8 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
 
     # 1. Inject the Recovery Pool at the very top (if it exists)
     if recovery_pool:
-        is_rec_open = (stage_tab == "recovery")
+        # 🔧 FIX 1: Allow the Recovery tab to stay open if ANY of its sub-menus are active
+        is_rec_open = stage_tab in ["recovery", "rec_dl", "rec_enc", "rec_up"]
         kb_lines.append([InlineKeyboardButton(f"{'[-]' if is_rec_open else '[+]'} 🚨 RECOVERY POOL ({len(recovery_pool)})", callback_data=f"dash|{'root' if is_rec_open else 'recovery'}")])
         
         if is_rec_open:
@@ -789,9 +791,10 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
             rec_enc = [j for j in recovery_pool if _base(j['recovered_at_stage']) in ["encoding", "encoded"]]
             rec_up = [j for j in recovery_pool if _base(j['recovered_at_stage']) == "uploading"]
             
-            build_dropdown("rec_dl", "STALLED DOWNLOADS", "📥", rec_dl)
-            build_dropdown("rec_enc", "STALLED PROCESSING", "⚙️", rec_enc)
-            build_dropdown("rec_up", "STALLED UPLOADS", "📤", rec_up)
+            # 🔧 FIX 2 applied: Passing "recovery" as the parent tab
+            build_dropdown("rec_dl", "STALLED DOWNLOADS", "📥", rec_dl, parent_tab="recovery")
+            build_dropdown("rec_enc", "STALLED PROCESSING", "⚙️", rec_enc, parent_tab="recovery")
+            build_dropdown("rec_up", "STALLED UPLOADS", "📤", rec_up, parent_tab="recovery")
             
             kb_lines.append([InlineKeyboardButton("🗑️ PURGE ALL RECOVERED", callback_data="purge_recovery")])
 
