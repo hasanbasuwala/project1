@@ -575,7 +575,9 @@ class PipelineManager:
     def __init__(self, app: Client, db: JobScheduler):
         self.app, self.db = app, db
         self.dl_q, self.enc_q, self.up_q = asyncio.Queue(), asyncio.Queue(), asyncio.Queue()
-        self.dl_engine, self.enc_engine, self.up_engine = DownloaderEngine(db, app), EncoderEngine(db), UploadEngine(db, app)
+        
+        # 👇 FIX IS HERE: Changed UploadEngine to UploaderEngine 👇
+        self.dl_engine, self.enc_engine, self.up_engine = DownloaderEngine(db, app), EncoderEngine(db), UploaderEngine(db, app)
 
     async def _worker_loop(self, queue: asyncio.Queue, engine, start_stage: Stage, success_stage: Stage, next_q: asyncio.Queue = None):
         while True:
