@@ -292,22 +292,32 @@ class DownloaderEngine:
             )
             page = await context.new_page()
             
-            # Apply V2 Stealth class to defeat Cloudflare Turnstile
             await Stealth().apply_stealth_async(page)
 
             found_urls = []
             capture_headers = {}
 
+            # ─── UPGRADED: NETWORK RESPONSE SNIFFER ───
+            async def handle_response(response):
+                try:
+                    req_url = response.url
+                    # Actively sniff the network for media streams
+                    if any(ext in req_url for ext in [".m3u8", ".mp4", ".ts", "video/mp4"]):
+                        if "ads" not in req_url and "tracking" not in req_url:
+                            found_urls.append(req_url)
+                            # Capture the exact request headers that succeeded
+                            req_headers = await response.request.all_headers()
+                            capture_headers.update(req_headers)
+                except Exception:
+                    pass
+            
+            page.on("response", handle_response)
+            # ──────────────────────────────────────────
+
+            # Block useless assets to speed up extraction and prevent Cloudflare tracking
             async def handle_route(route):
                 req = route.request
-                req_url = req.url
-                
-                if any(ext in req_url for ext in [".m3u8", ".mp4", ".mkv", ".ts"]):
-                    if "ads" not in req_url and "tracking" not in req_url:
-                        found_urls.append(req_url)
-                        capture_headers.update(req.headers)
-
-                if req.resource_type in ["image", "font", "stylesheet"] or any(x in req_url for x in ["ads", "tracking", "analytics"]):
+                if req.resource_type in ["image", "font", "stylesheet"] or any(x in req.url for x in ["ads", "tracking", "analytics"]):
                     await route.abort()
                 else: 
                     await route.continue_()
@@ -315,11 +325,10 @@ class DownloaderEngine:
             await page.route("**/*", handle_route)
             
             try:
-                # 45-second timeout to allow Cloudflare challenges to resolve
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 await page.wait_for_timeout(8000) 
                 
-                # SIMULATE HUMAN INTERACTION (Bypass Autoplay Blocks & Lazy Loading)
+                # SIMULATE HUMAN INTERACTION
                 await page.evaluate('''() => {
                     window.scrollBy(0, 500);
                     let v = document.querySelector('video');
@@ -327,18 +336,22 @@ class DownloaderEngine:
                         v.muted = true; 
                         v.play().catch(()=>{}); 
                     } else {
+                        // Click exactly in the center to trigger overlays/popunders
                         document.elementFromPoint(window.innerWidth/2, window.innerHeight/2)?.click();
                     }
                 }''')
-                await page.wait_for_timeout(4000) 
+                # Wait longer for the video chunk to actually start streaming into the network tab
+                await page.wait_for_timeout(6000) 
                 
             except Exception as e:
                 self.db.log_trace(jid, f"Playwright page load warning: {e}")
 
+            # Grab the first valid media URL sniffed from the network
             if found_urls:
                 m3u8s = [u for u in found_urls if ".m3u8" in u]
                 extracted_payload["url"] = m3u8s[0] if m3u8s else found_urls[0]
             
+            # Fallback to DOM extraction if network sniffing missed it
             if not extracted_payload["url"]:
                 extracted_payload["url"] = await page.evaluate('''() => {
                     let v = document.querySelector('video'); if (v && v.src && !v.src.startsWith('blob:')) return v.src;
@@ -347,7 +360,6 @@ class DownloaderEngine:
                     return null;
                 }''')
 
-            # URL SANITIZER & COOKIE FALLBACK
             if extracted_payload["url"]:
                 raw_url = extracted_payload["url"]
                 if raw_url.startswith("//"):
@@ -371,8 +383,10 @@ class DownloaderEngine:
                 "Accept": "*/*",
                 "Connection": "keep-alive"
             }
-            for k in ["sec-fetch-site", "sec-fetch-mode"]:
-                if k in capture_headers: extracted_payload["headers"][k] = capture_headers[k]
+            # Add the exact successful request headers we sniffed
+            for k, v in capture_headers.items():
+                if k.lower() not in ["host", "accept-encoding"]:
+                    extracted_payload["headers"][k] = v
 
             await browser.close()
             return extracted_payload
