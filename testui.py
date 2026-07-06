@@ -269,23 +269,21 @@ class DownloaderEngine:
 
     async def _run_playwright_extraction(self, url: str, jid: str, dl_dir: Path) -> dict:
         from playwright.async_api import async_playwright
-        from playwright_stealth import stealth_async # <-- NEW STEALTH IMPORT
+        from playwright_stealth import Stealth # <-- FIX: Updated to the new V2 class import
         
         har_path = dl_dir / f"{jid}_intercept.har"
         extracted_payload = {"url": None, "headers": {}, "cookie_str": "", "raw_cookies": []}
         
         async with async_playwright() as p:
-            # Added a few extra args to help mask the headless nature
             browser = await p.chromium.launch(
                 headless=True, 
                 args=[
                     "--no-sandbox", 
                     "--disable-setuid-sandbox",
-                    "--disable-blink-features=AutomationControlled" # <-- ANTI-DETECTION
+                    "--disable-blink-features=AutomationControlled" # Anti-detection flag
                 ]
             )
             
-            # Upgraded context with realistic viewport and language
             context = await browser.new_context(
                 user_agent=USER_AGENT, 
                 record_har_path=str(har_path),
@@ -294,8 +292,8 @@ class DownloaderEngine:
             )
             page = await context.new_page()
             
-            # Apply stealth scripts to defeat Cloudflare JS checks
-            await stealth_async(page)
+            # FIX: Apply the new V2 Stealth class to the page before routing
+            await Stealth().apply_stealth_async(page)
 
             found_urls = []
             capture_headers = {}
@@ -317,9 +315,9 @@ class DownloaderEngine:
             await page.route("**/*", handle_route)
             
             try:
-                # Increased timeout to allow Cloudflare challenges to resolve
+                # 45-second timeout to allow Cloudflare Turnstile to solve
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                await page.wait_for_timeout(8000) # Give Turnstile extra time to clear
+                await page.wait_for_timeout(8000) 
             except Exception as e:
                 self.db.log_trace(jid, f"Playwright page load warning: {e}")
 
