@@ -332,7 +332,19 @@ class DownloaderEngine:
                     return null;
                 }''')
 
+            # ─── NEW URL SANITIZER ───
+            if extracted_payload["url"]:
+                raw_url = extracted_payload["url"]
+                if raw_url.startswith("//"):
+                    extracted_payload["url"] = "https:" + raw_url
+                elif raw_url.startswith("/"):
+                    from urllib.parse import urlparse
+                    parsed = urlparse(page.url)
+                    extracted_payload["url"] = f"{parsed.scheme}://{parsed.netloc}{raw_url}"
+            # ─────────────────────────
+
             cookies = await context.cookies()
+            # ... (rest of the code continues as normal)
             extracted_payload["raw_cookies"] = cookies
             extracted_payload["cookie_str"] = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             
