@@ -409,13 +409,14 @@ class DownloaderEngine:
                 value = c.get("value", "")
                 f.write(f"{domain}\t{inc_sub}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
 
-        # ─── FIX: REMOVED IMPERSONATE TARGET ───
+        # ─── FIX: RE-ARMING CHROME TLS IMPERSONATION ───
         opts = {
             "http_headers": headers,
-            "cookiefile": str(cookie_path)
-            # We let yt-dlp use its default TLS hello, relying purely on the strict headers & cookies
+            "cookiefile": str(cookie_path),
+            "impersonate": ImpersonateTarget(client="chrome"), 
+            "extractor_args": {"generic": ["impersonate"]} # Forces the generic extractor to mask its TLS
         }
-        # ───────────────────────────────────────
+        # ───────────────────────────────────────────────
             
         try:
             await asyncio.to_thread(self._execute_ytdlp, url, jid, dl_dir, opts)
