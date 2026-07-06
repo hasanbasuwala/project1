@@ -269,7 +269,7 @@ class DownloaderEngine:
 
     async def _run_playwright_extraction(self, url: str, jid: str, dl_dir: Path) -> dict:
         from playwright.async_api import async_playwright
-        from playwright_stealth import Stealth # <-- FIX: Updated to the new V2 class import
+        from playwright_stealth import Stealth 
         
         har_path = dl_dir / f"{jid}_intercept.har"
         extracted_payload = {"url": None, "headers": {}, "cookie_str": "", "raw_cookies": []}
@@ -280,7 +280,7 @@ class DownloaderEngine:
                 args=[
                     "--no-sandbox", 
                     "--disable-setuid-sandbox",
-                    "--disable-blink-features=AutomationControlled" # Anti-detection flag
+                    "--disable-blink-features=AutomationControlled" 
                 ]
             )
             
@@ -292,7 +292,7 @@ class DownloaderEngine:
             )
             page = await context.new_page()
             
-            # FIX: Apply the new V2 Stealth class to the page before routing
+            # Apply V2 Stealth class to defeat Cloudflare Turnstile
             await Stealth().apply_stealth_async(page)
 
             found_urls = []
@@ -315,19 +315,22 @@ class DownloaderEngine:
             await page.route("**/*", handle_route)
             
             try:
-                # 45-second timeout to allow Cloudflare Turnstile to solve
+                # 45-second timeout to allow Cloudflare challenges to resolve
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 await page.wait_for_timeout(8000) 
                 
-                # ─── NEW: SIMULATE HUMAN INTERACTION ───
-                # Scrolls the page and attempts to wake up lazy-loaded video players
+                # SIMULATE HUMAN INTERACTION (Bypass Autoplay Blocks & Lazy Loading)
                 await page.evaluate('''() => {
                     window.scrollBy(0, 500);
                     let v = document.querySelector('video');
-                    if(v) { v.play().catch(()=>{}); }
+                    if(v) { 
+                        v.muted = true; 
+                        v.play().catch(()=>{}); 
+                    } else {
+                        document.elementFromPoint(window.innerWidth/2, window.innerHeight/2)?.click();
+                    }
                 }''')
-                await page.wait_for_timeout(3000) # Give the network time to catch the media request
-                # ───────────────────────────────────────
+                await page.wait_for_timeout(4000) 
                 
             except Exception as e:
                 self.db.log_trace(jid, f"Playwright page load warning: {e}")
@@ -344,7 +347,7 @@ class DownloaderEngine:
                     return null;
                 }''')
 
-            # ─── URL SANITIZER & THE COOKIE FALLBACK ───
+            # URL SANITIZER & COOKIE FALLBACK
             if extracted_payload["url"]:
                 raw_url = extracted_payload["url"]
                 if raw_url.startswith("//"):
@@ -354,11 +357,8 @@ class DownloaderEngine:
                     parsed = urlparse(page.url)
                     extracted_payload["url"] = f"{parsed.scheme}://{parsed.netloc}{raw_url}"
             else:
-                # THE MASTER KEY: If no direct media is found, we don't crash. 
-                # We pass the ORIGINAL URL back to downstream yt-dlp with the stolen Cloudflare cookies!
                 self.db.log_trace(jid, "Playwright yielded no direct media. Passing original URL and cleared cookies to Downstream Extractors.")
                 extracted_payload["url"] = url 
-            # ───────────────────────────────────────────
 
             cookies = await context.cookies()
             extracted_payload["raw_cookies"] = cookies
@@ -409,11 +409,13 @@ class DownloaderEngine:
                 value = c.get("value", "")
                 f.write(f"{domain}\t{inc_sub}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
 
+        # ─── FIX: REMOVED IMPERSONATE TARGET ───
         opts = {
             "http_headers": headers,
-            "impersonate": ImpersonateTarget(client="chrome"),
             "cookiefile": str(cookie_path)
+            # We let yt-dlp use its default TLS hello, relying purely on the strict headers & cookies
         }
+        # ───────────────────────────────────────
             
         try:
             await asyncio.to_thread(self._execute_ytdlp, url, jid, dl_dir, opts)
