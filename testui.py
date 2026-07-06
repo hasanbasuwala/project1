@@ -318,6 +318,17 @@ class DownloaderEngine:
                 # 45-second timeout to allow Cloudflare Turnstile to solve
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 await page.wait_for_timeout(8000) 
+                
+                # ─── NEW: SIMULATE HUMAN INTERACTION ───
+                # Scrolls the page and attempts to wake up lazy-loaded video players
+                await page.evaluate('''() => {
+                    window.scrollBy(0, 500);
+                    let v = document.querySelector('video');
+                    if(v) { v.play().catch(()=>{}); }
+                }''')
+                await page.wait_for_timeout(3000) # Give the network time to catch the media request
+                # ───────────────────────────────────────
+                
             except Exception as e:
                 self.db.log_trace(jid, f"Playwright page load warning: {e}")
 
@@ -329,10 +340,11 @@ class DownloaderEngine:
                 extracted_payload["url"] = await page.evaluate('''() => {
                     let v = document.querySelector('video'); if (v && v.src && !v.src.startsWith('blob:')) return v.src;
                     let s = document.querySelector('video source'); if (s && s.src && !s.src.startsWith('blob:')) return s.src;
+                    let vdata = document.querySelector('video[data-src]'); if (vdata) return vdata.getAttribute('data-src');
                     return null;
                 }''')
 
-            # ─── NEW URL SANITIZER ───
+            # ─── URL SANITIZER & THE COOKIE FALLBACK ───
             if extracted_payload["url"]:
                 raw_url = extracted_payload["url"]
                 if raw_url.startswith("//"):
@@ -341,10 +353,14 @@ class DownloaderEngine:
                     from urllib.parse import urlparse
                     parsed = urlparse(page.url)
                     extracted_payload["url"] = f"{parsed.scheme}://{parsed.netloc}{raw_url}"
-            # ─────────────────────────
+            else:
+                # THE MASTER KEY: If no direct media is found, we don't crash. 
+                # We pass the ORIGINAL URL back to downstream yt-dlp with the stolen Cloudflare cookies!
+                self.db.log_trace(jid, "Playwright yielded no direct media. Passing original URL and cleared cookies to Downstream Extractors.")
+                extracted_payload["url"] = url 
+            # ───────────────────────────────────────────
 
             cookies = await context.cookies()
-            # ... (rest of the code continues as normal)
             extracted_payload["raw_cookies"] = cookies
             extracted_payload["cookie_str"] = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             
