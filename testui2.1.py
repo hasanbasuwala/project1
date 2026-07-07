@@ -343,35 +343,33 @@ class DownloaderEngine:
             except Exception as e:
                 self.db.log_trace(jid, f"Playwright page load warning: {e}")
 
-                # ─── UPGRADED: STATE-AWARE MEMORY EXTRACTOR ───
-            # Force the player to load the real video and wait for actual content
+            # ─── NEW: THE MEMORY EXTRACTOR (Ultimate Bypass) ───
+            # Scans every iframe and extracts the raw decrypted video link directly from JWPlayer's RAM
             if not extracted_payload["url"]:
-                extracted_payload["url"] = await page.evaluate('''async () => {
-                    return await new Promise((resolve) => {
-                        let attempts = 0;
-                        let interval = setInterval(() => {
-                            attempts++;
-                            // Check for JWPlayer or raw Video tag
-                            if (typeof jwplayer === 'function' && jwplayer().getPlaylist()) {
-                                let item = jwplayer().getPlaylist()[0];
-                                if (item && item.file && item.duration > 5) {
-                                    clearInterval(interval);
-                                    resolve(item.file);
+                for frame in page.frames:
+                    try:
+                        jw_url = await frame.evaluate('''() => {
+                            // Target JWPlayer (Lulustream, Sxyprn, etc.)
+                            if (typeof jwplayer === 'function') {
+                                let playlist = jwplayer().getPlaylist();
+                                if (playlist && playlist.length > 0) {
+                                    return playlist[0].file;
                                 }
                             }
-                            let v = document.querySelector('video');
-                            if (v && v.src && v.duration > 5) {
-                                clearInterval(interval);
-                                resolve(v.src);
-                            }
-                            if (attempts > 20) { // Timeout after 10 seconds
-                                clearInterval(interval);
-                                resolve(null);
-                            }
-                        }, 500);
-                    });
-                }''')
-            # ───────────────────────────────────────────────
+                            // Target standard HTML5 players
+                            let v = document.querySelector('video'); 
+                            if (v && v.src && !v.src.startsWith('blob:')) return v.src;
+                            let s = document.querySelector('video source'); 
+                            if (s && s.src && !s.src.startsWith('blob:')) return s.src;
+                            return null;
+                        }''')
+                        if jw_url:
+                            extracted_payload["url"] = jw_url
+                            self.db.log_trace(jid, "Playwright successfully extracted decrypted URL from Player Memory.")
+                            break
+                    except Exception:
+                        pass
+            # ───────────────────────────────────────────────────
 
             if not extracted_payload["url"] and found_urls:
                 m3u8s = [u for u in found_urls if ".m3u8" in u]
