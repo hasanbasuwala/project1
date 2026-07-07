@@ -297,33 +297,29 @@ class DownloaderEngine:
             found_urls = []
             capture_headers = {}
 
-            # ─── UPGRADED: NETWORK RESPONSE SNIFFER ───
-            async def handle_response(response):
-                try:
-                    req_url = response.url
-                    # Actively sniff the network for media streams
-                    if any(ext in req_url for ext in [".m3u8", ".mp4", ".ts", "video/mp4"]):
-                        if "ads" not in req_url and "tracking" not in req_url:
-                            found_urls.append(req_url)
-                            # Capture the exact request headers that succeeded
-                            req_headers = await response.request.all_headers()
-                            capture_headers.update(req_headers)
-                except Exception:
-                    pass
-            
-            page.on("response", handle_response)
-            # ──────────────────────────────────────────
-
-            # Block useless assets to speed up extraction and prevent Cloudflare tracking
+            # ─── UPGRADED: TOKEN PRESERVATION INTERCEPTOR ───
             async def handle_route(route):
                 req = route.request
-                if req.resource_type in ["image", "font", "stylesheet"] or any(x in req.url for x in ["ads", "tracking", "analytics"]):
+                req_url = req.url
+                
+                # If we detect the actual media stream...
+                if req.resource_type == "media" or any(ext in req_url for ext in [".m3u8", ".mp4", ".ts"]):
+                    if "ads" not in req_url and "tracking" not in req_url and "blank" not in req_url:
+                        found_urls.append(req_url)
+                        capture_headers.update(req.headers)
+                        # INSTANT ABORT: Steal the link but prevent the browser from burning the token!
+                        await route.abort()
+                        return
+
+                # Standard block for useless assets to prevent tracking
+                if req.resource_type in ["image", "font", "stylesheet"] or any(x in req_url for x in ["ads", "tracking", "analytics"]):
                     await route.abort()
                 else: 
                     await route.continue_()
 
             await page.route("**/*", handle_route)
-            
+            # ────────────────────────────────────────────────
+
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 await page.wait_for_timeout(8000) 
@@ -336,22 +332,18 @@ class DownloaderEngine:
                         v.muted = true; 
                         v.play().catch(()=>{}); 
                     } else {
-                        // Click exactly in the center to trigger overlays/popunders
                         document.elementFromPoint(window.innerWidth/2, window.innerHeight/2)?.click();
                     }
                 }''')
-                # Wait longer for the video chunk to actually start streaming into the network tab
-                await page.wait_for_timeout(6000) 
+                await page.wait_for_timeout(5000) 
                 
             except Exception as e:
                 self.db.log_trace(jid, f"Playwright page load warning: {e}")
 
-            # Grab the first valid media URL sniffed from the network
             if found_urls:
                 m3u8s = [u for u in found_urls if ".m3u8" in u]
                 extracted_payload["url"] = m3u8s[0] if m3u8s else found_urls[0]
             
-            # Fallback to DOM extraction if network sniffing missed it
             if not extracted_payload["url"]:
                 extracted_payload["url"] = await page.evaluate('''() => {
                     let v = document.querySelector('video'); if (v && v.src && !v.src.startsWith('blob:')) return v.src;
@@ -368,8 +360,11 @@ class DownloaderEngine:
                     from urllib.parse import urlparse
                     parsed = urlparse(page.url)
                     extracted_payload["url"] = f"{parsed.scheme}://{parsed.netloc}{raw_url}"
+                
+                # Inject a trace log so we can see the exact locked payload URL
+                self.db.log_trace(jid, f"Playwright Payload Locked: {extracted_payload['url'][:80]}...")
             else:
-                self.db.log_trace(jid, "Playwright yielded no direct media. Passing original URL and cleared cookies to Downstream Extractors.")
+                self.db.log_trace(jid, "Playwright yielded no direct media. Passing original URL and cleared cookies downstream.")
                 extracted_payload["url"] = url 
 
             cookies = await context.cookies()
@@ -383,7 +378,6 @@ class DownloaderEngine:
                 "Accept": "*/*",
                 "Connection": "keep-alive"
             }
-            # Add the exact successful request headers we sniffed
             for k, v in capture_headers.items():
                 if k.lower() not in ["host", "accept-encoding"]:
                     extracted_payload["headers"][k] = v
