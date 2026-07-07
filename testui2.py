@@ -291,91 +291,102 @@ class DownloaderEngine:
                 locale="en-US"
             )
             page = await context.new_page()
-            
             await Stealth().apply_stealth_async(page)
 
             found_urls = []
             capture_headers = {}
 
-            # ─── UPGRADED: PASSIVE INTELLIGENT SNIFFER ───
+            # Passive Sniffer for standard tube sites
             async def handle_route(route):
                 req = route.request
-                req_url = req.url
-                url_lower = req_url.lower()
+                url_lower = req.url.lower()
                 
-                # 1. Kill known trackers and ad networks
                 bad_keywords = ["google", "analytics", "track", "ad", "beacon", "metrics", "pixel"]
                 if any(bad in url_lower for bad in bad_keywords):
                     await route.abort()
                     return
 
-                # 2. Block visual clutter (images, fonts)
                 if req.resource_type in ["image", "font", "stylesheet"]:
                     await route.abort()
                     return
 
-                # 3. Sniff Media (Passively - DO NOT ABORT)
                 is_media = req.resource_type == "media"
-                has_ext = any(ext in url_lower for ext in [".m3u8", ".mp4", ".ts", ".m3u"])
-                
-                # Filter out obvious previews, thumbnails, and short teaser clips
-                is_preview = any(bad in url_lower for bad in ["preview", "thumb", "teaser", "trailer", "sprite", "poster"])
+                has_ext = any(ext in url_lower for ext in [".m3u8", ".mp4", ".ts"])
+                is_preview = any(bad in url_lower for bad in ["preview", "thumb", "teaser"])
                 
                 if (is_media or has_ext) and not is_preview and "blank" not in url_lower:
                     if "audio" not in url_lower: 
-                        found_urls.append(req_url)
-                        # Keep updating headers so we always have the freshest ones
+                        found_urls.append(req.url)
                         capture_headers.update(req.headers)
                 
-                # Let the request continue so the player doesn't crash
                 await route.continue_()
 
             await page.route("**/*", handle_route)
-            # ─────────────────────────────────────────────
 
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 await page.wait_for_timeout(8000) 
                 
-                # SIMULATE HUMAN INTERACTION
-                await page.evaluate('''() => {
-                    window.scrollBy(0, 500);
-                    let v = document.querySelector('video');
-                    if(v) { 
-                        v.muted = true; 
-                        v.play().catch(()=>{}); 
-                    } else {
-                        document.elementFromPoint(window.innerWidth/2, window.innerHeight/2)?.click();
-                    }
-                }''')
-                # Wait 5 seconds to let the real video buffer into the network tab
-                await page.wait_for_timeout(5000) 
+                # We will still run the clicker as a fallback for sites that don't use JWPlayer
+                viewport = page.viewport_size
+                center_x = viewport['width'] / 2
+                center_y = viewport['height'] / 2
                 
+                await page.mouse.move(center_x, center_y)
+                await page.mouse.down()
+                await page.mouse.up()
+                await page.wait_for_timeout(1000)
+                await page.mouse.down()
+                await page.mouse.up()
+                
+                await page.wait_for_timeout(6000) 
             except Exception as e:
                 self.db.log_trace(jid, f"Playwright page load warning: {e}")
 
-            # ─── PAYLOAD SELECTION LOGIC ───
-            if found_urls:
-                # Prioritize .m3u8 playlists (always the main video on modern tube sites)
+            # ─── NEW: THE MEMORY EXTRACTOR (Ultimate Bypass) ───
+            # Scans every iframe and extracts the raw decrypted video link directly from JWPlayer's RAM
+            if not extracted_payload["url"]:
+                for frame in page.frames:
+                    try:
+                        jw_url = await frame.evaluate('''() => {
+                            // Target JWPlayer (Lulustream, Sxyprn, etc.)
+                            if (typeof jwplayer === 'function') {
+                                let playlist = jwplayer().getPlaylist();
+                                if (playlist && playlist.length > 0) {
+                                    return playlist[0].file;
+                                }
+                            }
+                            // Target standard HTML5 players
+                            let v = document.querySelector('video'); 
+                            if (v && v.src && !v.src.startsWith('blob:')) return v.src;
+                            let s = document.querySelector('video source'); 
+                            if (s && s.src && !s.src.startsWith('blob:')) return s.src;
+                            return null;
+                        }''')
+                        if jw_url:
+                            extracted_payload["url"] = jw_url
+                            self.db.log_trace(jid, "Playwright successfully extracted decrypted URL from Player Memory.")
+                            break
+                    except Exception:
+                        pass
+            # ───────────────────────────────────────────────────
+
+            if not extracted_payload["url"] and found_urls:
                 m3u8s = [u for u in found_urls if ".m3u8" in u]
                 if m3u8s:
-                    extracted_payload["url"] = m3u8s[-1] # Usually the last m3u8 loaded is the master playlist
+                    extracted_payload["url"] = m3u8s[-1]
                 else:
-                    # Fallback to the last .mp4 loaded (skipping early previews)
                     mp4s = [u for u in found_urls if ".mp4" in u]
                     extracted_payload["url"] = mp4s[-1] if mp4s else found_urls[-1]
             
-            # Absolute DOM fallback
+            # Failsafe: Steal the Luluvdo iframe URL and let yt-dlp crack it
             if not extracted_payload["url"]:
-                extracted_payload["url"] = await page.evaluate('''() => {
-                    let v = document.querySelector('video'); 
-                    if (v && v.src && !v.src.startsWith('blob:') && !v.src.includes('google')) return v.src;
-                    let s = document.querySelector('video source'); 
-                    if (s && s.src && !s.src.startsWith('blob:') && !s.src.includes('google')) return s.src;
-                    return null;
-                }''')
+                for frame in page.frames:
+                    if "luluvdo" in frame.url or "lulustream" in frame.url:
+                        self.db.log_trace(jid, "Playwright grabbed raw iframe host link. Delegating to yt-dlp.")
+                        extracted_payload["url"] = frame.url
+                        break
 
-            # URL SANITIZER
             if extracted_payload["url"]:
                 raw_url = extracted_payload["url"]
                 if raw_url.startswith("//"):
@@ -384,10 +395,8 @@ class DownloaderEngine:
                     from urllib.parse import urlparse
                     parsed = urlparse(page.url)
                     extracted_payload["url"] = f"{parsed.scheme}://{parsed.netloc}{raw_url}"
-                
                 self.db.log_trace(jid, f"Playwright Payload Locked: {extracted_payload['url'][:80]}...")
             else:
-                self.db.log_trace(jid, "Playwright yielded no direct media. Passing original URL and cleared cookies downstream.")
                 extracted_payload["url"] = url 
 
             cookies = await context.cookies()
