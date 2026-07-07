@@ -297,37 +297,41 @@ class DownloaderEngine:
             found_urls = []
             capture_headers = {}
 
-            # ─── UPGRADED: HYPER-STRICT NETWORK SNIFFER ───
+            # ─── UPGRADED: PASSIVE INTELLIGENT SNIFFER ───
             async def handle_route(route):
                 req = route.request
                 req_url = req.url
                 url_lower = req_url.lower()
                 
-                # 1. Kill known trackers masquerading as media
+                # 1. Kill known trackers and ad networks
                 bad_keywords = ["google", "analytics", "track", "ad", "beacon", "metrics", "pixel"]
                 if any(bad in url_lower for bad in bad_keywords):
                     await route.abort()
                     return
 
-                # 2. Token Preservation Sniffer (Strict Match)
+                # 2. Block visual clutter (images, fonts)
+                if req.resource_type in ["image", "font", "stylesheet"]:
+                    await route.abort()
+                    return
+
+                # 3. Sniff Media (Passively - DO NOT ABORT)
                 is_media = req.resource_type == "media"
                 has_ext = any(ext in url_lower for ext in [".m3u8", ".mp4", ".ts", ".m3u"])
                 
-                if (is_media or has_ext) and "blank" not in url_lower:
-                    if "audio" not in url_lower: # Ignore audio-only tracker pings
+                # Filter out obvious previews, thumbnails, and short teaser clips
+                is_preview = any(bad in url_lower for bad in ["preview", "thumb", "teaser", "trailer", "sprite", "poster"])
+                
+                if (is_media or has_ext) and not is_preview and "blank" not in url_lower:
+                    if "audio" not in url_lower: 
                         found_urls.append(req_url)
+                        # Keep updating headers so we always have the freshest ones
                         capture_headers.update(req.headers)
-                        await route.abort() # Steal and preserve token
-                        return
-
-                # 3. Block visual clutter
-                if req.resource_type in ["image", "font", "stylesheet"]:
-                    await route.abort()
-                else: 
-                    await route.continue_()
+                
+                # Let the request continue so the player doesn't crash
+                await route.continue_()
 
             await page.route("**/*", handle_route)
-            # ──────────────────────────────────────────────
+            # ─────────────────────────────────────────────
 
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
@@ -344,27 +348,34 @@ class DownloaderEngine:
                         document.elementFromPoint(window.innerWidth/2, window.innerHeight/2)?.click();
                     }
                 }''')
+                # Wait 5 seconds to let the real video buffer into the network tab
                 await page.wait_for_timeout(5000) 
                 
             except Exception as e:
                 self.db.log_trace(jid, f"Playwright page load warning: {e}")
 
+            # ─── PAYLOAD SELECTION LOGIC ───
             if found_urls:
+                # Prioritize .m3u8 playlists (always the main video on modern tube sites)
                 m3u8s = [u for u in found_urls if ".m3u8" in u]
-                extracted_payload["url"] = m3u8s[0] if m3u8s else found_urls[0]
+                if m3u8s:
+                    extracted_payload["url"] = m3u8s[-1] # Usually the last m3u8 loaded is the master playlist
+                else:
+                    # Fallback to the last .mp4 loaded (skipping early previews)
+                    mp4s = [u for u in found_urls if ".mp4" in u]
+                    extracted_payload["url"] = mp4s[-1] if mp4s else found_urls[-1]
             
+            # Absolute DOM fallback
             if not extracted_payload["url"]:
-                # Added filter to DOM extraction to prevent grabbing fake tracker videos
                 extracted_payload["url"] = await page.evaluate('''() => {
                     let v = document.querySelector('video'); 
                     if (v && v.src && !v.src.startsWith('blob:') && !v.src.includes('google')) return v.src;
                     let s = document.querySelector('video source'); 
                     if (s && s.src && !s.src.startsWith('blob:') && !s.src.includes('google')) return s.src;
-                    let vdata = document.querySelector('video[data-src]'); 
-                    if (vdata && !vdata.getAttribute('data-src').includes('google')) return vdata.getAttribute('data-src');
                     return null;
                 }''')
 
+            # URL SANITIZER
             if extracted_payload["url"]:
                 raw_url = extracted_payload["url"]
                 if raw_url.startswith("//"):
