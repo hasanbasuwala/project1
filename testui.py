@@ -297,28 +297,37 @@ class DownloaderEngine:
             found_urls = []
             capture_headers = {}
 
-            # ─── UPGRADED: TOKEN PRESERVATION INTERCEPTOR ───
+            # ─── UPGRADED: HYPER-STRICT NETWORK SNIFFER ───
             async def handle_route(route):
                 req = route.request
                 req_url = req.url
+                url_lower = req_url.lower()
                 
-                # If we detect the actual media stream...
-                if req.resource_type == "media" or any(ext in req_url for ext in [".m3u8", ".mp4", ".ts"]):
-                    if "ads" not in req_url and "tracking" not in req_url and "blank" not in req_url:
+                # 1. Kill known trackers masquerading as media
+                bad_keywords = ["google", "analytics", "track", "ad", "beacon", "metrics", "pixel"]
+                if any(bad in url_lower for bad in bad_keywords):
+                    await route.abort()
+                    return
+
+                # 2. Token Preservation Sniffer (Strict Match)
+                is_media = req.resource_type == "media"
+                has_ext = any(ext in url_lower for ext in [".m3u8", ".mp4", ".ts", ".m3u"])
+                
+                if (is_media or has_ext) and "blank" not in url_lower:
+                    if "audio" not in url_lower: # Ignore audio-only tracker pings
                         found_urls.append(req_url)
                         capture_headers.update(req.headers)
-                        # INSTANT ABORT: Steal the link but prevent the browser from burning the token!
-                        await route.abort()
+                        await route.abort() # Steal and preserve token
                         return
 
-                # Standard block for useless assets to prevent tracking
-                if req.resource_type in ["image", "font", "stylesheet"] or any(x in req_url for x in ["ads", "tracking", "analytics"]):
+                # 3. Block visual clutter
+                if req.resource_type in ["image", "font", "stylesheet"]:
                     await route.abort()
                 else: 
                     await route.continue_()
 
             await page.route("**/*", handle_route)
-            # ────────────────────────────────────────────────
+            # ──────────────────────────────────────────────
 
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
@@ -345,10 +354,14 @@ class DownloaderEngine:
                 extracted_payload["url"] = m3u8s[0] if m3u8s else found_urls[0]
             
             if not extracted_payload["url"]:
+                # Added filter to DOM extraction to prevent grabbing fake tracker videos
                 extracted_payload["url"] = await page.evaluate('''() => {
-                    let v = document.querySelector('video'); if (v && v.src && !v.src.startsWith('blob:')) return v.src;
-                    let s = document.querySelector('video source'); if (s && s.src && !s.src.startsWith('blob:')) return s.src;
-                    let vdata = document.querySelector('video[data-src]'); if (vdata) return vdata.getAttribute('data-src');
+                    let v = document.querySelector('video'); 
+                    if (v && v.src && !v.src.startsWith('blob:') && !v.src.includes('google')) return v.src;
+                    let s = document.querySelector('video source'); 
+                    if (s && s.src && !s.src.startsWith('blob:') && !s.src.includes('google')) return s.src;
+                    let vdata = document.querySelector('video[data-src]'); 
+                    if (vdata && !vdata.getAttribute('data-src').includes('google')) return vdata.getAttribute('data-src');
                     return null;
                 }''')
 
@@ -361,7 +374,6 @@ class DownloaderEngine:
                     parsed = urlparse(page.url)
                     extracted_payload["url"] = f"{parsed.scheme}://{parsed.netloc}{raw_url}"
                 
-                # Inject a trace log so we can see the exact locked payload URL
                 self.db.log_trace(jid, f"Playwright Payload Locked: {extracted_payload['url'][:80]}...")
             else:
                 self.db.log_trace(jid, "Playwright yielded no direct media. Passing original URL and cleared cookies downstream.")
