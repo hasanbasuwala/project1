@@ -330,38 +330,38 @@ class DownloaderEngine:
             capture_headers = {}
 
             # Passive Sniffer for standard tube sites
+            # ─── THE ANTI-ADBLOCK SAFE SNIFFER ───
             async def handle_route(route):
                 req = route.request
                 url_lower = req.url.lower()
                 
-                # Aggressively filter out ads, trackers, and short previews
+                # CRITICAL: We MUST let everything load! 
+                # Aborting ad requests triggers the player's Anti-Adblock and freezes the video.
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+                
+                # Now we passively filter what we log in the background
                 bad_keywords = [
                     "google", "analytics", "track", "ad", "beacon", "metrics", "pixel",
                     "promo", "banner", "pop", "teaser", "trailer", "thumb", "preview",
-                    "vast", "vpaid", "doubleclick", "syndication"
+                    "vast", "vpaid", "doubleclick", "syndication", "blank"
                 ]
                 
-                if any(bad in url_lower for bad in bad_keywords):
-                    await route.abort()
-                    return
+                # Silently ignore the junk
+                if any(bad in url_lower for bad in bad_keywords): return
+                if req.resource_type in ["image", "font", "stylesheet"]: return
+                if "audio" in url_lower: return
 
-                if req.resource_type in ["image", "font", "stylesheet"]:
-                    await route.abort()
-                    return
-
-                is_media = req.resource_type == "media"
-                has_ext = any(ext in url_lower for ext in [".m3u8", ".mp4", ".ts"])
-                
-                # Only capture the URL if it survives the aggressive filters
-                if (is_media or has_ext) and "blank" not in url_lower and "audio" not in url_lower: 
-                    # If it's an m3u8, it's highly likely to be the main video.
-                    # We append it to a dedicated list so we can prioritize it later.
-                    if ".m3u8" in url_lower:
-                        found_urls.append({"type": "m3u8", "url": req.url})
-                    else:
-                        found_urls.append({"type": "mp4", "url": req.url})
-                    
+                # Catch the true media manifests
+                if ".m3u8" in url_lower:
+                    found_urls.append({"type": "m3u8", "url": req.url})
                     capture_headers.update(req.headers)
+                elif ".mp4" in url_lower or ".ts" in url_lower:
+                    if req.resource_type in ["media", "xhr", "fetch"]:
+                        found_urls.append({"type": "mp4", "url": req.url})
+                        capture_headers.update(req.headers)
                 
                 await route.continue_()
 
