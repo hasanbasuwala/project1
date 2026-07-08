@@ -388,12 +388,16 @@ class DownloaderEngine:
                         raw_embed = await embed_element.first.get_attribute("data-embed")
                         if raw_embed:
                             self.db.log_trace(jid, f"Player overlay bypassed. Navigating directly to iframe: {raw_embed}")
+                            
+                            # CRITICAL FIX: Lock in the iframe URL so yt-dlp targets the host, not the ad-filled webpage
+                            extracted_payload["url"] = raw_embed 
+                            
                             await page.goto(raw_embed, wait_until="domcontentloaded", timeout=45000)
                             await page.wait_for_timeout(4000) # Wait for the new iframe DOM to settle
                 except Exception as e:
                     self.db.log_trace(jid, f"Embed extraction bypassed: {e}")
 
-                # ─── 3. UNIVERSAL REAL-MOUSE SIMULATION (All Sites & Iframes) ───
+                # ─── 3. RAM RIPPER & REAL-MOUSE SIMULATION ───
                 try:
                     self.db.log_trace(jid, "Initiating humanized physical mouse clicks...")
                     viewport = page.viewport_size
@@ -411,8 +415,28 @@ class DownloaderEngine:
                     await page.mouse.down()
                     await page.mouse.up()
                     
-                    # Wait for the player to request the HLS stream so the sniffer catches it
-                    await page.wait_for_timeout(8000) 
+                    # Wait for ad pre-rolls to buffer
+                    await page.wait_for_timeout(6000) 
+                    
+                    # CRITICAL FIX: Bypass the 30-sec ad by ripping the decrypted stream directly from the player's RAM
+                    jw_url = await page.evaluate('''() => {
+                        try {
+                            if (typeof jwplayer === 'function') {
+                                let pl = jwplayer().getPlaylist();
+                                if (pl && pl.length > 0) return pl[0].file;
+                            }
+                            let v = document.querySelector('video'); 
+                            if (v && v.src && !v.src.startsWith('blob:')) return v.src;
+                            let s = document.querySelector('video source'); 
+                            if (s && s.src && !s.src.startsWith('blob:')) return s.src;
+                        } catch(e) {}
+                        return null;
+                    }''')
+                    
+                    if jw_url:
+                        self.db.log_trace(jid, "Successfully ripped decrypted stream from Player Memory!")
+                        extracted_payload["url"] = jw_url
+                        
                 except Exception as e:
                     self.db.log_trace(jid, f"Mouse simulation warning: {e}")
                     
