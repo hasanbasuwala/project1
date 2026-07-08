@@ -369,21 +369,32 @@ class DownloaderEngine:
 
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                await page.wait_for_timeout(8000) 
+                await page.wait_for_timeout(3000) 
                 
-                # ─── INJECTED VISUAL DEBUG ───
+                # ─── NEW: DEFEAT THE AGE GATE ───
                 try:
-                    # Dump the raw HTML
-                    html_content = await page.content()
-                    with open(dl_dir / f"{jid}_page_dump.html", "w", encoding="utf-8") as f:
-                        f.write(html_content)
-                    # Take a screenshot of the viewport
-                    await page.screenshot(path=str(dl_dir / f"{jid}_screenshot.png"))
+                    # Target the specific 'Yes' button from the MyPornerLeak HTML dump
+                    age_gate = page.locator("a.av_btn.av_go[rel='yes']")
+                    if await age_gate.count() > 0:
+                        self.db.log_trace(jid, "Age-gate detected. Clicking 'Yes'...")
+                        await age_gate.first.click()
+                        await page.wait_for_timeout(2000)
                 except Exception as e:
-                    self.db.log_trace(jid, f"Debug dump failed: {e}")
-                # ─────────────────────────────
-                
-                # We will still run the clicker as a fallback for sites that don't use JWPlayer
+                    pass
+
+                # ─── NEW: TRIGGER THE FAKE PLAYER OVERLAY ───
+                try:
+                    # Target the specific play button class from the MyPornerLeak HTML dump
+                    play_btn = page.locator("div.play span")
+                    if await play_btn.count() > 0:
+                        self.db.log_trace(jid, "Player overlay detected. Clicking Play...")
+                        await play_btn.first.click()
+                        await page.wait_for_timeout(6000) # Wait for the iframe to load and m3u8 to fire
+                except Exception as e:
+                    pass
+                # ────────────────────────────────────────────
+
+                # We will still run the fallback center-screen clicker just in case
                 viewport = page.viewport_size
                 center_x = viewport['width'] / 2
                 center_y = viewport['height'] / 2
@@ -391,10 +402,6 @@ class DownloaderEngine:
                 await page.mouse.move(center_x, center_y)
                 await page.mouse.down()
                 await page.mouse.up()
-                await page.wait_for_timeout(1000)
-                await page.mouse.down()
-                await page.mouse.up()
-                
                 await page.wait_for_timeout(6000) 
             except Exception as e:
                 self.db.log_trace(jid, f"Playwright page load warning: {e}")
