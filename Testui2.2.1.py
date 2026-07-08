@@ -334,7 +334,13 @@ class DownloaderEngine:
                 req = route.request
                 url_lower = req.url.lower()
                 
-                bad_keywords = ["google", "analytics", "track", "ad", "beacon", "metrics", "pixel"]
+                # Aggressively filter out ads, trackers, and short previews
+                bad_keywords = [
+                    "google", "analytics", "track", "ad", "beacon", "metrics", "pixel",
+                    "promo", "banner", "pop", "teaser", "trailer", "thumb", "preview",
+                    "vast", "vpaid", "doubleclick", "syndication"
+                ]
+                
                 if any(bad in url_lower for bad in bad_keywords):
                     await route.abort()
                     return
@@ -345,12 +351,17 @@ class DownloaderEngine:
 
                 is_media = req.resource_type == "media"
                 has_ext = any(ext in url_lower for ext in [".m3u8", ".mp4", ".ts"])
-                is_preview = any(bad in url_lower for bad in ["preview", "thumb", "teaser"])
                 
-                if (is_media or has_ext) and not is_preview and "blank" not in url_lower:
-                    if "audio" not in url_lower: 
-                        found_urls.append(req.url)
-                        capture_headers.update(req.headers)
+                # Only capture the URL if it survives the aggressive filters
+                if (is_media or has_ext) and "blank" not in url_lower and "audio" not in url_lower: 
+                    # If it's an m3u8, it's highly likely to be the main video.
+                    # We append it to a dedicated list so we can prioritize it later.
+                    if ".m3u8" in url_lower:
+                        found_urls.append({"type": "m3u8", "url": req.url})
+                    else:
+                        found_urls.append({"type": "mp4", "url": req.url})
+                    
+                    capture_headers.update(req.headers)
                 
                 await route.continue_()
 
@@ -405,12 +416,14 @@ class DownloaderEngine:
             # ───────────────────────────────────────────────────
 
             if not extracted_payload["url"] and found_urls:
-                m3u8s = [u for u in found_urls if ".m3u8" in u]
+                # Prioritize m3u8 streams (main video) over mp4s (often ads)
+                m3u8s = [u["url"] for u in found_urls if u["type"] == "m3u8"]
                 if m3u8s:
+                    # Grab the last m3u8 (often the master playlist)
                     extracted_payload["url"] = m3u8s[-1]
                 else:
-                    mp4s = [u for u in found_urls if ".mp4" in u]
-                    extracted_payload["url"] = mp4s[-1] if mp4s else found_urls[-1]
+                    mp4s = [u["url"] for u in found_urls if u["type"] == "mp4"]
+                    extracted_payload["url"] = mp4s[-1] if mp4s else found_urls[-1]["url"]
             
             # Failsafe: Steal the Luluvdo iframe URL and let yt-dlp crack it
             if not extracted_payload["url"]:
