@@ -329,21 +329,24 @@ class DownloaderEngine:
             found_urls = []
             capture_headers = {}
 
-            # Passive Sniffer for standard tube sites
-            # ─── THE ANTI-ADBLOCK SAFE SNIFFER ───
             # ─── THE ANTI-ADBLOCK SAFE SNIFFER ───
             async def handle_route(route):
                 req = route.request
                 url_lower = req.url.lower()
                 
-                # CRITICAL: We MUST let everything load! 
-                # Aborting ad requests triggers the player's Anti-Adblock and freezes the video.
+                # ─── SAFE UI OPTIMIZATION ───
+                # Block heavy images to prevent timeouts and save bandwidth.
+                if req.resource_type == "image":
+                    await route.abort()
+                    return
+                
+                # CRITICAL: We MUST let everything else load to prevent player freezes.
                 try:
                     await route.continue_()
                 except Exception:
                     pass
                 
-                # Now we passively filter what we log in the background
+                # Passively filter what we log in the background
                 bad_keywords = [
                     "google", "analytics", "track", "ad", "beacon", "metrics", "pixel",
                     "promo", "banner", "pop", "teaser", "trailer", "thumb", "preview",
@@ -352,7 +355,7 @@ class DownloaderEngine:
                 
                 # Silently ignore the junk
                 if any(bad in url_lower for bad in bad_keywords): return
-                if req.resource_type in ["image", "font", "stylesheet"]: return
+                if req.resource_type in ["font", "stylesheet"]: return
                 if "audio" in url_lower: return
 
                 # Catch the true media manifests
@@ -363,12 +366,10 @@ class DownloaderEngine:
                     if req.resource_type in ["media", "xhr", "fetch"]:
                         found_urls.append({"type": "mp4", "url": req.url})
                         capture_headers.update(req.headers)
-                
-                await route.continue_()
 
             await page.route("**/*", handle_route)
 
-              try:
+            try:
                 # Increased timeout to 60s to account for heavy ad traffic
                 await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 
@@ -467,44 +468,9 @@ class DownloaderEngine:
                     with open(dl_dir / f"{jid}_crash_dump.html", "w", encoding="utf-8") as f:
                         f.write(html_content)
                     self.db.log_trace(jid, "Crash screenshot and HTML saved to diagnostic zip.")
-                except:
+                except Exception:
                     pass
-            # ───────────────────────────────────────────────────
 
-            if not extracted_payload["url"] and found_urls:
-                # Prioritize m3u8 streams (main video) over mp4s (often ads)
-                m3u8s = [u["url"] for u in found_urls if u["type"] == "m3u8"]
-                if m3u8s:
-                    # Grab the last m3u8 (often the master playlist)
-                    extracted_payload["url"] = m3u8s[-1]
-                else:
-                    mp4s = [u["url"] for u in found_urls if u["type"] == "mp4"]
-                    extracted_payload["url"] = mp4s[-1] if mp4s else found_urls[-1]["url"]
-            
-            # Failsafe: Steal the Luluvdo iframe URL and let yt-dlp crack it
-            if not extracted_payload["url"]:
-                for frame in page.frames:
-                    if "luluvdo" in frame.url or "lulustream" in frame.url:
-                        self.db.log_trace(jid, "Playwright grabbed raw iframe host link. Delegating to yt-dlp.")
-                        extracted_payload["url"] = frame.url
-                        break
-
-            if extracted_payload["url"]:
-                raw_url = extracted_payload["url"]
-                if raw_url.startswith("//"):
-                    extracted_payload["url"] = "https:" + raw_url
-                elif raw_url.startswith("/"):
-                    from urllib.parse import urlparse
-                    parsed = urlparse(page.url)
-                    extracted_payload["url"] = f"{parsed.scheme}://{parsed.netloc}{raw_url}"
-                self.db.log_trace(jid, f"Playwright Payload Locked: {extracted_payload['url'][:80]}...")
-            else:
-                extracted_payload["url"] = url 
-
-            cookies = await context.cookies()
-            extracted_payload["raw_cookies"] = cookies
-            extracted_payload["cookie_str"] = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-            
             # ─── UPDATED HEADER ASSEMBLY ───
             # Force the Referer to be the original parent URL, NOT the media stream URL
             extracted_payload["headers"] = {
@@ -524,11 +490,11 @@ class DownloaderEngine:
                 "sec-ch-ua-platform",
                 "user-agent", 
                 "accept",
-                "referer", # Strip referer from the captured network requests
-                "origin"   # Strip origin from the captured network requests
+                "referer", 
+                "origin"   
             ]
 
-            # Safely merge intercepted headers (ignoring the bad ones)
+            # Safely merge intercepted headers
             for k, v in capture_headers.items():
                 if k.lower() not in bad_headers:
                     extracted_payload["headers"][k] = v
@@ -537,6 +503,10 @@ class DownloaderEngine:
             extracted_payload["headers"]["sec-ch-ua"] = '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"'
             extracted_payload["headers"]["sec-ch-ua-mobile"] = "?0"
             extracted_payload["headers"]["sec-ch-ua-platform"] = '"Windows"'
+            
+            cookies = await context.cookies()
+            extracted_payload["raw_cookies"] = cookies
+            extracted_payload["cookie_str"] = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
 
             await browser.close()
             return extracted_payload
