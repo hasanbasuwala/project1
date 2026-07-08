@@ -331,6 +331,7 @@ class DownloaderEngine:
 
             # Passive Sniffer for standard tube sites
             # ─── THE ANTI-ADBLOCK SAFE SNIFFER ───
+            # ─── THE ANTI-ADBLOCK SAFE SNIFFER ───
             async def handle_route(route):
                 req = route.request
                 url_lower = req.url.lower()
