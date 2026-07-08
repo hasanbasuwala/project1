@@ -371,38 +371,51 @@ class DownloaderEngine:
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 await page.wait_for_timeout(3000) 
                 
-                # ─── NEW: DEFEAT THE AGE GATE ───
+                # ─── 1. DEFEAT THE AGE GATE (If present) ───
                 try:
-                    # Target the specific 'Yes' button from the MyPornerLeak HTML dump
                     age_gate = page.locator("a.av_btn.av_go[rel='yes']")
                     if await age_gate.count() > 0:
                         self.db.log_trace(jid, "Age-gate detected. Clicking 'Yes'...")
                         await age_gate.first.click()
                         await page.wait_for_timeout(2000)
-                except Exception as e:
+                except Exception:
                     pass
 
-                # ─── NEW: TRIGGER THE FAKE PLAYER OVERLAY ───
+                # ─── 2. DIRECT EMBED EXTRACTION (Specific Sites) ───
                 try:
-                    # Target the specific play button class from the MyPornerLeak HTML dump
-                    play_btn = page.locator("div.play span")
-                    if await play_btn.count() > 0:
-                        self.db.log_trace(jid, "Player overlay detected. Clicking Play...")
-                        await play_btn.first.click()
-                        await page.wait_for_timeout(6000) # Wait for the iframe to load and m3u8 to fire
+                    embed_element = page.locator("span.change-video.c-aktif")
+                    if await embed_element.count() > 0:
+                        raw_embed = await embed_element.first.get_attribute("data-embed")
+                        if raw_embed:
+                            self.db.log_trace(jid, f"Player overlay bypassed. Navigating directly to iframe: {raw_embed}")
+                            await page.goto(raw_embed, wait_until="domcontentloaded", timeout=45000)
+                            await page.wait_for_timeout(4000) # Wait for the new iframe DOM to settle
                 except Exception as e:
-                    pass
-                # ────────────────────────────────────────────
+                    self.db.log_trace(jid, f"Embed extraction bypassed: {e}")
 
-                # We will still run the fallback center-screen clicker just in case
-                viewport = page.viewport_size
-                center_x = viewport['width'] / 2
-                center_y = viewport['height'] / 2
-                
-                await page.mouse.move(center_x, center_y)
-                await page.mouse.down()
-                await page.mouse.up()
-                await page.wait_for_timeout(6000) 
+                # ─── 3. UNIVERSAL REAL-MOUSE SIMULATION (All Sites & Iframes) ───
+                try:
+                    self.db.log_trace(jid, "Initiating humanized physical mouse clicks...")
+                    viewport = page.viewport_size
+                    center_x = viewport['width'] / 2
+                    center_y = viewport['height'] / 2
+                    
+                    await page.mouse.move(center_x, center_y)
+                    
+                    # Click 1: Eats the invisible pop-under ad overlay
+                    await page.mouse.down()
+                    await page.mouse.up()
+                    await page.wait_for_timeout(1500)
+                    
+                    # Click 2: Strikes the actual Play button on the video player
+                    await page.mouse.down()
+                    await page.mouse.up()
+                    
+                    # Wait for the player to request the HLS stream so the sniffer catches it
+                    await page.wait_for_timeout(8000) 
+                except Exception as e:
+                    self.db.log_trace(jid, f"Mouse simulation warning: {e}")
+                    
             except Exception as e:
                 self.db.log_trace(jid, f"Playwright page load warning: {e}")
 
