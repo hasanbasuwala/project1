@@ -452,19 +452,40 @@ class DownloaderEngine:
 
     async def _run_ffmpeg_capture(self, url: str, jid: str, dl_dir: Path, headers: dict, cookie_str: str) -> bool:
         out_file = dl_dir / f"{jid}.mp4"
-        header_arg = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
-        if cookie_str: header_arg += f"Cookie: {cookie_str}\r\n"
+        debug_log_file = dl_dir / f"{jid}_ffmpeg_debug.log"
         
+        # Assemble headers
+        header_arg = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
+        if cookie_str: 
+            header_arg += f"Cookie: {cookie_str}\r\n"
+        
+        # Injecting debug loglevel to monitor the HTTP handshake
         cmd = [
-            "ffmpeg", "-y", "-headers", header_arg,
+            "ffmpeg", "-y", 
+            "-loglevel", "debug", 
+            "-headers", header_arg,
             "-i", url, "-c", "copy", "-bsf:a", "aac_adtstoasc", str(out_file)
         ]
         
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         _, stderr = await proc.communicate()
         
+        # Dump the raw stderr to a debug file for deep inspection
+        with open(debug_log_file, "wb") as f:
+            f.write(stderr)
+        
         if proc.returncode == 0 and out_file.exists() and out_file.stat().st_size > 1024:
             return True
+            
+        # Parse the error stream to surface the exact HTTP failure to the main orchestrator log
+        try:
+            err_text = stderr.decode('utf-8', errors='ignore')
+            http_errors = [line.strip() for line in err_text.split('\n') if 'HTTP' in line or '403' in line or 'Forbidden' in line]
+            if http_errors:
+                self.db.log_trace(jid, f"PASS 8 FFmpeg HTTP Trace: {http_errors[-1]}")
+        except Exception:
+            pass
+            
         return False
 
     async def _run_ytdlp_with_cookies(self, url: str, jid: str, dl_dir: Path, headers: dict, raw_cookies: list) -> bool:
@@ -704,14 +725,35 @@ class CrashCourier:
         await db.update_job(jid, stage=Stage.FAILED.value)
         tb_str = traceback.format_exc()
         db.log_trace(jid, f"CRITICAL FAULT:\n{tb_str}")
+        
         job = await db.get_job(jid)
         chat_id = job.get('chat_id', OWNER_ID)
         
         cap = f"🚨 **MAINFRAME FAULT**\n`{jid}` collapsed.\nError: `{str(exc)[:100]}`"
-        log_path = JOBS_DIR / f"JOB_{jid}" / "trace.log"
-        if log_path.exists():
-            try: await app.send_document(chat_id, document=str(log_path), caption=cap)
-            except Exception: pass
+        job_dir = JOBS_DIR / f"JOB_{jid}"
+        
+        if job_dir.exists():
+            zip_target = JOBS_DIR / f"JOB_{jid}_diagnostic"
+            zip_file = f"{zip_target}.zip"
+            
+            try:
+                # Zip the entire job directory (includes trace.log, HAR files, FFmpeg debugs)
+                shutil.make_archive(str(zip_target), 'zip', str(job_dir))
+                
+                # Push the diagnostic package to Telegram
+                await app.send_document(chat_id, document=zip_file, caption=cap)
+                
+            except Exception as e:
+                # Failsafe: If zipping fails (e.g., file lock), attempt to just send the trace log
+                log_path = job_dir / "trace.log"
+                if log_path.exists():
+                    try: await app.send_document(chat_id, document=str(log_path), caption=f"{cap}\n*(Failed to zip dir: {e})*")
+                    except Exception: pass
+            finally:
+                # Cleanup the diagnostic zip to prevent disk bloat
+                if os.path.exists(zip_file):
+                    try: os.remove(zip_file)
+                    except Exception: pass
 
 class RecoveryManager:
     @staticmethod
