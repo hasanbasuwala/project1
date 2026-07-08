@@ -306,20 +306,18 @@ class DownloaderEngine:
         import shutil
         import os
         
-        # ─── EXTENSION CONFIGURATION ───
         path_to_extension = "/root/stealth_bot_v13/uBOL-home-main/chromium"
-        user_data_dir = f"/tmp/pw_data_{jid}" # Unique persistent dir per job
+        user_data_dir = f"/tmp/pw_data_{jid}" 
         
         extracted_payload = {"url": None, "headers": {}, "cookie_str": "", "raw_cookies": []}
         found_urls = []
         capture_headers = {}
         
         async with async_playwright() as p:
-            # ─── LAUNCH WITH UBLOCK LITE ───
             context = await p.chromium.launch_persistent_context(
                 user_data_dir,
                 headless=True,
-                channel="chromium", # Required for headless extensions
+                channel="chromium", 
                 user_agent=USER_AGENT,
                 viewport={"width": 1920, "height": 1080},
                 locale="en-US",
@@ -332,54 +330,52 @@ class DownloaderEngine:
                 ]
             )
             
-            # Persistent contexts auto-create a page, so we use that instead of new_page()
             page = context.pages[0]
             await Stealth().apply_stealth_async(page)
-            
-            # Give uBlock Origin Lite a moment to parse its MV3 rulesets
             await page.wait_for_timeout(2000) 
 
-            # ─── THE ANTI-ADBLOCK SAFE SNIFFER ───
-            async def handle_route(route):
-                req = route.request
-                url_lower = req.url.lower()
-                
-                # Block heavy images to save bandwidth, but let fonts/css load for the UI
-                if req.resource_type == "image":
-                    await route.abort()
-                    return
-                
+            # ─── RESPONSE-BASED SNIFFER (CATCHES HIDDEN EXTENSIONS) ───
+            async def handle_response(response):
                 try:
-                    await route.continue_()
+                    req = response.request
+                    url_lower = req.url.lower()
+                    content_type = response.headers.get("content-type", "").lower()
+                    
+                    bad_keywords = ["google", "analytics", "ad", "beacon", "vast", "blank", "trailer", "promo"]
+                    if any(bad in url_lower for bad in bad_keywords): return
+                    
+                    is_media = False
+                    vtype = "mp4"
+                    
+                    if "mpegurl" in content_type or ".m3u8" in url_lower:
+                        is_media = True
+                        vtype = "m3u8"
+                    elif "video/" in content_type or (".mp4" in url_lower):
+                        is_media = True
+                        vtype = "mp4"
+                        
+                    if is_media:
+                        found_urls.append({"type": vtype, "url": req.url})
+                        headers = await req.all_headers()
+                        capture_headers.update(headers)
                 except Exception:
                     pass
-                
-                # uBlock will kill the worst offenders, this is just our backend filter for the logs
-                bad_keywords = [
-                    "google", "analytics", "track", "ad", "beacon", "metrics", "pixel",
-                    "promo", "banner", "pop", "teaser", "trailer", "thumb", "preview",
-                    "vast", "vpaid", "doubleclick", "syndication", "blank"
-                ]
-                
-                if any(bad in url_lower for bad in bad_keywords): return
-                if req.resource_type in ["font", "stylesheet"]: return
-                if "audio" in url_lower: return
+                    
+            page.on("response", handle_response)
 
-                if ".m3u8" in url_lower:
-                    found_urls.append({"type": "m3u8", "url": req.url})
-                    capture_headers.update(req.headers)
-                elif ".mp4" in url_lower or ".ts" in url_lower:
-                    if req.resource_type in ["media", "xhr", "fetch"]:
-                        found_urls.append({"type": "mp4", "url": req.url})
-                        capture_headers.update(req.headers)
+            # ─── SAFE UI ROUTER (SAVES BANDWIDTH) ───
+            async def handle_route(route):
+                if route.request.resource_type == "image":
+                    await route.abort()
+                else:
+                    try: await route.continue_()
+                    except Exception: pass
 
             await page.route("**/*", handle_route)
 
             try:
-                self.db.log_trace(jid, "Navigating to target URL with uBlock Origin active...")
+                self.db.log_trace(jid, "Navigating to main target URL...")
                 await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                
-                raw_embed = None
                 
                 # ─── 1. SMART AGE GATE DEFEAT ───
                 try:
@@ -389,62 +385,78 @@ class DownloaderEngine:
                         await age_gate.click()
                         await page.wait_for_timeout(2000)
                 except Exception:
-                    self.db.log_trace(jid, "No age-gate appeared within 10s. Proceeding...")
+                    pass
 
-                # ─── 2. SMART EMBED EXTRACTION ───
+                # ─── 2. SPAWN THE IFRAME (STAY ON PARENT PAGE) ───
                 try:
-                    embed_element = await page.wait_for_selector("span.change-video.c-aktif", state="attached", timeout=10000)
-                    if embed_element:
-                        raw_embed = await embed_element.get_attribute("data-embed")
-                        if raw_embed:
-                            self.db.log_trace(jid, f"Navigating directly to iframe: {raw_embed}")
-                            await page.goto(raw_embed, wait_until="domcontentloaded", timeout=60000)
-                            await page.wait_for_timeout(4000) 
-                except Exception as e:
-                    self.db.log_trace(jid, f"Embed extraction bypassed: {e}")
+                    fake_player = await page.wait_for_selector("div.vi-on, div.play", state="visible", timeout=5000)
+                    if fake_player:
+                        self.db.log_trace(jid, "Clicking fake player overlay to spawn iframe...")
+                        await fake_player.click()
+                        await page.wait_for_timeout(4000)
+                except Exception:
+                    self.db.log_trace(jid, "No fake player overlay found. Proceeding...")
 
-                # ─── 3. RAM RIPPER & REAL-MOUSE SIMULATION ───
+                # ─── 3. IFRAME INTERACTION & RAM RIPPER ───
                 try:
-                    self.db.log_trace(jid, "Initiating humanized physical mouse clicks...")
+                    self.db.log_trace(jid, f"Scanning {len(page.frames)} active frames for video players...")
+                    jw_url = None
+                    
+                    # Click the center of the main page just in case
                     viewport = page.viewport_size
-                    center_x = viewport['width'] / 2
-                    center_y = viewport['height'] / 2
-                    
-                    await page.mouse.move(center_x, center_y)
-                    
+                    await page.mouse.move(viewport['width'] / 2, viewport['height'] / 2)
                     await page.mouse.down()
                     await page.mouse.up()
-                    await page.wait_for_timeout(1500)
-                    
+                    await page.wait_for_timeout(1000)
                     await page.mouse.down()
                     await page.mouse.up()
                     
-                    await page.evaluate("document.querySelectorAll('video').forEach(v => { v.muted = true; v.playbackRate = 16.0; });")
+                    for frame in page.frames:
+                        if "google" in frame.url or "blank" in frame.url: continue
+                        
+                        try:
+                            # Physically click play buttons inside the frame
+                            await frame.evaluate("document.querySelector('body').click();")
+                            await frame.evaluate("document.querySelectorAll('.play-button, .vjs-big-play-button, video').forEach(b => b.click());")
+                            
+                            # Burn through pre-roll ads
+                            await frame.evaluate("document.querySelectorAll('video').forEach(v => { v.muted = true; v.playbackRate = 16.0; });")
+                        except Exception:
+                            pass
+                            
                     await page.wait_for_timeout(6000) 
                     
-                    jw_url = await page.evaluate('''() => {
-                        try {
-                            const isBad = (url) => url.match(/trailer|promo|ad|blank|teaser/i);
-                            if (typeof jwplayer === 'function') {
-                                let pl = jwplayer().getPlaylist();
-                                if (pl) {
-                                    for (let i = 0; i < pl.length; i++) {
-                                        if (pl[i].file && !isBad(pl[i].file) && pl[i].file.includes('.m3u8')) return pl[i].file;
+                    # Rip RAM from all frames
+                    for frame in page.frames:
+                        try:
+                            res = await frame.evaluate('''() => {
+                                try {
+                                    const isBad = (url) => url.match(/trailer|promo|ad|blank|teaser/i);
+                                    if (typeof jwplayer === 'function') {
+                                        let pl = jwplayer().getPlaylist();
+                                        if (pl) {
+                                            for (let i = 0; i < pl.length; i++) {
+                                                if (pl[i].file && !isBad(pl[i].file) && pl[i].file.includes('.m3u8')) return pl[i].file;
+                                            }
+                                        }
                                     }
-                                }
-                            }
-                            let v = document.querySelector('video'); 
-                            if (v && v.src && !v.src.startsWith('blob:') && !isBad(v.src)) return v.src;
-                        } catch(e) {}
-                        return null;
-                    }''')
-                    
+                                    let v = document.querySelector('video'); 
+                                    if (v && v.src && !v.src.startsWith('blob:') && !isBad(v.src)) return v.src;
+                                } catch(e) {}
+                                return null;
+                            }''')
+                            if res:
+                                jw_url = res
+                                break
+                        except Exception:
+                            pass
+                            
                     if jw_url:
-                        self.db.log_trace(jid, "RAM Ripper successful!")
+                        self.db.log_trace(jid, "RAM Ripper successful from iframe!")
                         extracted_payload["url"] = jw_url
                         
                 except Exception as e:
-                    self.db.log_trace(jid, f"Mouse simulation warning: {e}")
+                    self.db.log_trace(jid, f"Iframe simulation warning: {e}")
 
                 # ─── 4. BULLETPROOF PAYLOAD SELECTION ───
                 if not extracted_payload.get("url"):
@@ -460,16 +472,16 @@ class DownloaderEngine:
                             extracted_payload["url"] = mp4s[-1]
                             self.db.log_trace(jid, "Sniffer successfully locked onto MP4 Stream.")
                         else:
-                            extracted_payload["url"] = raw_embed if raw_embed else url
+                            extracted_payload["url"] = url
                             
             except Exception as e:
-                self.db.log_trace(jid, f"Playwright critical failure/timeout: {e}")
+                self.db.log_trace(jid, f"Playwright critical failure: {e}")
                 try:
                     await page.screenshot(path=str(dl_dir / f"{jid}_crash_screenshot.png"))
                     html_content = await page.content()
                     with open(dl_dir / f"{jid}_crash_dump.html", "w", encoding="utf-8") as f:
                         f.write(html_content)
-                    self.db.log_trace(jid, "Crash screenshot and HTML saved to diagnostic zip.")
+                    self.db.log_trace(jid, "Crash screenshot and HTML saved.")
                 except Exception:
                     pass
 
@@ -496,7 +508,6 @@ class DownloaderEngine:
             extracted_payload["raw_cookies"] = cookies
             extracted_payload["cookie_str"] = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
 
-            # ─── CRITICAL DISK CLEANUP ───
             await context.close()
             try:
                 if os.path.exists(user_data_dir):
