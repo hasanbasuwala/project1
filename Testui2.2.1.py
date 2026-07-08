@@ -368,30 +368,32 @@ class DownloaderEngine:
 
             await page.route("**/*", handle_route)
 
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                await page.wait_for_timeout(3000) 
+              try:
+                # Increased timeout to 60s to account for heavy ad traffic
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 
                 raw_embed = None
                 
-                # ─── 1. DEFEAT THE AGE GATE ───
+                # ─── 1. SMART AGE GATE DEFEAT ───
                 try:
-                    age_gate = page.locator("a.av_btn.av_go[rel='yes']")
-                    if await age_gate.count() > 0:
+                    # Dynamically wait up to 10 seconds for the button to actually become visible
+                    age_gate = await page.wait_for_selector("a.av_btn.av_go[rel='yes']", state="visible", timeout=10000)
+                    if age_gate:
                         self.db.log_trace(jid, "Age-gate detected. Clicking 'Yes'...")
-                        await age_gate.first.click()
+                        await age_gate.click()
                         await page.wait_for_timeout(2000)
                 except Exception:
-                    pass
+                    self.db.log_trace(jid, "No age-gate appeared within 10s. Proceeding...")
 
-                # ─── 2. DIRECT EMBED EXTRACTION ───
+                # ─── 2. SMART EMBED EXTRACTION ───
                 try:
-                    embed_element = page.locator("span.change-video.c-aktif")
-                    if await embed_element.count() > 0:
-                        raw_embed = await embed_element.first.get_attribute("data-embed")
+                    # Dynamically wait for the player embed span to attach to the DOM
+                    embed_element = await page.wait_for_selector("span.change-video.c-aktif", state="attached", timeout=10000)
+                    if embed_element:
+                        raw_embed = await embed_element.get_attribute("data-embed")
                         if raw_embed:
                             self.db.log_trace(jid, f"Navigating directly to iframe: {raw_embed}")
-                            await page.goto(raw_embed, wait_until="domcontentloaded", timeout=45000)
+                            await page.goto(raw_embed, wait_until="domcontentloaded", timeout=60000)
                             await page.wait_for_timeout(4000) 
                 except Exception as e:
                     self.db.log_trace(jid, f"Embed extraction bypassed: {e}")
@@ -405,12 +407,10 @@ class DownloaderEngine:
                     
                     await page.mouse.move(center_x, center_y)
                     
-                    # Click 1: Eats the invisible pop-under ad overlay
                     await page.mouse.down()
                     await page.mouse.up()
                     await page.wait_for_timeout(1500)
                     
-                    # Click 2: Strikes the actual Play button on the video player
                     await page.mouse.down()
                     await page.mouse.up()
                     
@@ -443,7 +443,6 @@ class DownloaderEngine:
                     self.db.log_trace(jid, f"Mouse simulation warning: {e}")
 
                 # ─── 4. BULLETPROOF PAYLOAD SELECTION ───
-                # If RAM ripper failed (obfuscated player), fallback strictly to Network Sniffer
                 if not extracted_payload.get("url"):
                     self.db.log_trace(jid, "RAM Ripper missed. Checking Network Sniffer logs...")
                     m3u8s = [u["url"] for u in found_urls if u["type"] == "m3u8"]
@@ -457,38 +456,19 @@ class DownloaderEngine:
                             extracted_payload["url"] = mp4s[-1]
                             self.db.log_trace(jid, "Sniffer successfully locked onto MP4 Stream.")
                         else:
-                            # Ultimate failsafe: only use the raw embed if literally everything else fails
                             extracted_payload["url"] = raw_embed if raw_embed else url
                             
             except Exception as e:
-                self.db.log_trace(jid, f"Playwright page load warning: {e}")
-
-            # ─── NEW: THE MEMORY EXTRACTOR (Ultimate Bypass) ───
-            # Scans every iframe and extracts the raw decrypted video link directly from JWPlayer's RAM
-            if not extracted_payload["url"]:
-                for frame in page.frames:
-                    try:
-                        jw_url = await frame.evaluate('''() => {
-                            // Target JWPlayer (Lulustream, Sxyprn, etc.)
-                            if (typeof jwplayer === 'function') {
-                                let playlist = jwplayer().getPlaylist();
-                                if (playlist && playlist.length > 0) {
-                                    return playlist[0].file;
-                                }
-                            }
-                            // Target standard HTML5 players
-                            let v = document.querySelector('video'); 
-                            if (v && v.src && !v.src.startsWith('blob:')) return v.src;
-                            let s = document.querySelector('video source'); 
-                            if (s && s.src && !s.src.startsWith('blob:')) return s.src;
-                            return null;
-                        }''')
-                        if jw_url:
-                            extracted_payload["url"] = jw_url
-                            self.db.log_trace(jid, "Playwright successfully extracted decrypted URL from Player Memory.")
-                            break
-                    except Exception:
-                        pass
+                self.db.log_trace(jid, f"Playwright critical failure/timeout: {e}")
+                # ─── VISUAL DEBUG DUMP ───
+                try:
+                    await page.screenshot(path=str(dl_dir / f"{jid}_crash_screenshot.png"))
+                    html_content = await page.content()
+                    with open(dl_dir / f"{jid}_crash_dump.html", "w", encoding="utf-8") as f:
+                        f.write(html_content)
+                    self.db.log_trace(jid, "Crash screenshot and HTML saved to diagnostic zip.")
+                except:
+                    pass
             # ───────────────────────────────────────────────────
 
             if not extracted_payload["url"] and found_urls:
