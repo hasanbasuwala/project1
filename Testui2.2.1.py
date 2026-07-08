@@ -746,6 +746,24 @@ class UploaderEngine:
         except Exception as e:
             self.db.log_trace(jid, f"Failed to push final completion card: {e}")
 
+        # ─── INJECTED DIAGNOSTIC DUMP ───
+        try:
+            self.db.log_trace(jid, "Zipping diagnostic data before cleanup...")
+            zip_target = JOBS_DIR / f"JOB_{jid}_diagnostic_success"
+            zip_file = f"{zip_target}.zip"
+            
+            import shutil # Ensure this is imported at the top of your file
+            shutil.make_archive(str(zip_target), 'zip', str(job_dir))
+            
+            cap = f"🕵️ **SUCCESS DEBUG**\nPayload captured for `{jid}`.\nAnalyze this zip to see what was actually downloaded."
+            await self.app.send_document(job_data['chat_id'], document=zip_file, caption=cap)
+            
+            if os.path.exists(zip_file):
+                os.remove(zip_file)
+        except Exception as e:
+            self.db.log_trace(jid, f"Failed to send success debug zip: {e}")
+        # ────────────────────────────────
+
         # 6. Nuke the database entry and wipe the hard drive allocation
         global _last_completed
         _last_completed = job_data['title']
