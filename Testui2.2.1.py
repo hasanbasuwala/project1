@@ -436,6 +436,7 @@ class DownloaderEngine:
             extracted_payload["raw_cookies"] = cookies
             extracted_payload["cookie_str"] = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             
+            # Base standard headers
             extracted_payload["headers"] = {
                 "Referer": page.url,
                 "Origin": "/".join(page.url.split("/")[:3]),
@@ -443,9 +444,27 @@ class DownloaderEngine:
                 "Accept": "*/*",
                 "Connection": "keep-alive"
             }
+            
+            # Sanitization list: headers we absolutely do NOT want to copy from the raw intercept
+            bad_headers = [
+                "host", 
+                "accept-encoding", 
+                "sec-ch-ua", 
+                "sec-ch-ua-mobile", 
+                "sec-ch-ua-platform",
+                "user-agent", # Prevent duplicates
+                "accept"      # Prevent duplicates
+            ]
+
+            # Safely merge intercepted headers
             for k, v in capture_headers.items():
-                if k.lower() not in ["host", "accept-encoding"]:
+                if k.lower() not in bad_headers:
                     extracted_payload["headers"][k] = v
+            
+            # Fake a legitimate sec-ch-ua header to replace the headless one
+            extracted_payload["headers"]["sec-ch-ua"] = '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"'
+            extracted_payload["headers"]["sec-ch-ua-mobile"] = "?0"
+            extracted_payload["headers"]["sec-ch-ua-platform"] = '"Windows"'
 
             await browser.close()
             return extracted_payload
