@@ -303,62 +303,68 @@ class DownloaderEngine:
     async def _run_playwright_extraction(self, url: str, jid: str, dl_dir: Path) -> dict:
         from playwright.async_api import async_playwright
         from playwright_stealth import Stealth 
+        import shutil
+        import os
         
-        har_path = dl_dir / f"{jid}_intercept.har"
+        # ─── EXTENSION CONFIGURATION ───
+        path_to_extension = "/root/stealth_bot_v13/uBOL-home-main/chromium"
+        user_data_dir = f"/tmp/pw_data_{jid}" # Unique persistent dir per job
+        
         extracted_payload = {"url": None, "headers": {}, "cookie_str": "", "raw_cookies": []}
+        found_urls = []
+        capture_headers = {}
         
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True, 
+            # ─── LAUNCH WITH UBLOCK LITE ───
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir,
+                headless=True,
+                channel="chromium", # Required for headless extensions
+                user_agent=USER_AGENT,
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
                 args=[
-                    "--no-sandbox", 
+                    "--no-sandbox",
                     "--disable-setuid-sandbox",
-                    "--disable-blink-features=AutomationControlled" 
+                    "--disable-blink-features=AutomationControlled",
+                    f"--disable-extensions-except={path_to_extension}",
+                    f"--load-extension={path_to_extension}"
                 ]
             )
             
-            context = await browser.new_context(
-                user_agent=USER_AGENT, 
-                record_har_path=str(har_path),
-                viewport={"width": 1920, "height": 1080},
-                locale="en-US"
-            )
-            page = await context.new_page()
+            # Persistent contexts auto-create a page, so we use that instead of new_page()
+            page = context.pages[0]
             await Stealth().apply_stealth_async(page)
-
-            found_urls = []
-            capture_headers = {}
+            
+            # Give uBlock Origin Lite a moment to parse its MV3 rulesets
+            await page.wait_for_timeout(2000) 
 
             # ─── THE ANTI-ADBLOCK SAFE SNIFFER ───
             async def handle_route(route):
                 req = route.request
                 url_lower = req.url.lower()
                 
-                # ─── SAFE UI OPTIMIZATION ───
-                # Block heavy images to prevent timeouts and save bandwidth.
+                # Block heavy images to save bandwidth, but let fonts/css load for the UI
                 if req.resource_type == "image":
                     await route.abort()
                     return
                 
-                # CRITICAL: We MUST let everything else load to prevent player freezes.
                 try:
                     await route.continue_()
                 except Exception:
                     pass
                 
-                # Passively filter what we log in the background
+                # uBlock will kill the worst offenders, this is just our backend filter for the logs
                 bad_keywords = [
                     "google", "analytics", "track", "ad", "beacon", "metrics", "pixel",
                     "promo", "banner", "pop", "teaser", "trailer", "thumb", "preview",
                     "vast", "vpaid", "doubleclick", "syndication", "blank"
                 ]
                 
-                # Silently ignore the junk
                 if any(bad in url_lower for bad in bad_keywords): return
                 if req.resource_type in ["font", "stylesheet"]: return
                 if "audio" in url_lower: return
 
-                # Catch the true media manifests
                 if ".m3u8" in url_lower:
                     found_urls.append({"type": "m3u8", "url": req.url})
                     capture_headers.update(req.headers)
@@ -370,14 +376,13 @@ class DownloaderEngine:
             await page.route("**/*", handle_route)
 
             try:
-                # Increased timeout to 60s to account for heavy ad traffic
+                self.db.log_trace(jid, "Navigating to target URL with uBlock Origin active...")
                 await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 
                 raw_embed = None
                 
                 # ─── 1. SMART AGE GATE DEFEAT ───
                 try:
-                    # Dynamically wait up to 10 seconds for the button to actually become visible
                     age_gate = await page.wait_for_selector("a.av_btn.av_go[rel='yes']", state="visible", timeout=10000)
                     if age_gate:
                         self.db.log_trace(jid, "Age-gate detected. Clicking 'Yes'...")
@@ -388,7 +393,6 @@ class DownloaderEngine:
 
                 # ─── 2. SMART EMBED EXTRACTION ───
                 try:
-                    # Dynamically wait for the player embed span to attach to the DOM
                     embed_element = await page.wait_for_selector("span.change-video.c-aktif", state="attached", timeout=10000)
                     if embed_element:
                         raw_embed = await embed_element.get_attribute("data-embed")
@@ -415,7 +419,6 @@ class DownloaderEngine:
                     await page.mouse.down()
                     await page.mouse.up()
                     
-                    # Burn through pre-roll ads at 16x speed
                     await page.evaluate("document.querySelectorAll('video').forEach(v => { v.muted = true; v.playbackRate = 16.0; });")
                     await page.wait_for_timeout(6000) 
                     
@@ -461,7 +464,6 @@ class DownloaderEngine:
                             
             except Exception as e:
                 self.db.log_trace(jid, f"Playwright critical failure/timeout: {e}")
-                # ─── VISUAL DEBUG DUMP ───
                 try:
                     await page.screenshot(path=str(dl_dir / f"{jid}_crash_screenshot.png"))
                     html_content = await page.content()
@@ -471,8 +473,7 @@ class DownloaderEngine:
                 except Exception:
                     pass
 
-            # ─── UPDATED HEADER ASSEMBLY ───
-            # Force the Referer to be the original parent URL, NOT the media stream URL
+            # ─── HEADER & COOKIE EXTRACTION ───
             extracted_payload["headers"] = {
                 "Referer": url, 
                 "Origin": "/".join(url.split("/")[:3]),
@@ -481,25 +482,12 @@ class DownloaderEngine:
                 "Connection": "keep-alive"
             }
             
-            # Sanitization list
-            bad_headers = [
-                "host", 
-                "accept-encoding", 
-                "sec-ch-ua", 
-                "sec-ch-ua-mobile", 
-                "sec-ch-ua-platform",
-                "user-agent", 
-                "accept",
-                "referer", 
-                "origin"   
-            ]
+            bad_headers = ["host", "accept-encoding", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "user-agent", "accept", "referer", "origin"]
 
-            # Safely merge intercepted headers
             for k, v in capture_headers.items():
                 if k.lower() not in bad_headers:
                     extracted_payload["headers"][k] = v
             
-            # Inject clean Client Hints
             extracted_payload["headers"]["sec-ch-ua"] = '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"'
             extracted_payload["headers"]["sec-ch-ua-mobile"] = "?0"
             extracted_payload["headers"]["sec-ch-ua-platform"] = '"Windows"'
@@ -508,7 +496,14 @@ class DownloaderEngine:
             extracted_payload["raw_cookies"] = cookies
             extracted_payload["cookie_str"] = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
 
-            await browser.close()
+            # ─── CRITICAL DISK CLEANUP ───
+            await context.close()
+            try:
+                if os.path.exists(user_data_dir):
+                    shutil.rmtree(user_data_dir, ignore_errors=True)
+            except Exception as e:
+                self.db.log_trace(jid, f"Disk cleanup warning: {e}")
+
             return extracted_payload
 
     async def _run_ffmpeg_capture(self, url: str, jid: str, dl_dir: Path, headers: dict, cookie_str: str) -> bool:
