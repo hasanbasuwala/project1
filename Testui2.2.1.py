@@ -406,35 +406,47 @@ class DownloaderEngine:
                     
                     await page.mouse.move(center_x, center_y)
                     
-                    # Click 1: Eats the invisible pop-under ad overlay
                     await page.mouse.down()
                     await page.mouse.up()
                     await page.wait_for_timeout(1500)
                     
-                    # Click 2: Strikes the actual Play button on the video player
                     await page.mouse.down()
                     await page.mouse.up()
                     
-                    # Wait for ad pre-rolls to buffer
-                    await page.wait_for_timeout(6000) 
+                    # ─── NEW: THE AD BURNER ───
+                    # Instantly mute and fast-forward any playing video at 16x speed to burn through pre-rolls
+                    await page.evaluate("document.querySelectorAll('video').forEach(v => { v.muted = true; v.playbackRate = 16.0; });")
+                    await page.wait_for_timeout(4000) 
                     
-                    # CRITICAL FIX: Bypass the 30-sec ad by ripping the decrypted stream directly from the player's RAM
+                    # ─── UPGRADED: SMART RAM RIPPER ───
                     jw_url = await page.evaluate('''() => {
                         try {
+                            // Filter out known ad/trailer footprints
+                            const isBad = (url) => url.match(/trailer|promo|ad|blank|teaser/i);
+                            
                             if (typeof jwplayer === 'function') {
                                 let pl = jwplayer().getPlaylist();
-                                if (pl && pl.length > 0) return pl[0].file;
+                                if (pl) {
+                                    // Scan playlist for the master m3u8, ignoring trailers
+                                    for (let i = 0; i < pl.length; i++) {
+                                        if (pl[i].file && !isBad(pl[i].file) && pl[i].file.includes('.m3u8')) return pl[i].file;
+                                    }
+                                    // Fallback to any non-bad mp4 in the playlist
+                                    for (let i = 0; i < pl.length; i++) {
+                                        if (pl[i].file && !isBad(pl[i].file)) return pl[i].file;
+                                    }
+                                }
                             }
                             let v = document.querySelector('video'); 
-                            if (v && v.src && !v.src.startsWith('blob:')) return v.src;
+                            if (v && v.src && !v.src.startsWith('blob:') && !isBad(v.src)) return v.src;
                             let s = document.querySelector('video source'); 
-                            if (s && s.src && !s.src.startsWith('blob:')) return s.src;
+                            if (s && s.src && !s.src.startsWith('blob:') && !isBad(s.src)) return s.src;
                         } catch(e) {}
                         return null;
                     }''')
                     
                     if jw_url:
-                        self.db.log_trace(jid, "Successfully ripped decrypted stream from Player Memory!")
+                        self.db.log_trace(jid, f"Successfully ripped decrypted stream: {jw_url[:50]}...")
                         extracted_payload["url"] = jw_url
                         
                 except Exception as e:
