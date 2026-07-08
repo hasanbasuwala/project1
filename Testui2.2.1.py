@@ -371,7 +371,9 @@ class DownloaderEngine:
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 await page.wait_for_timeout(3000) 
                 
-                # ─── 1. DEFEAT THE AGE GATE (If present) ───
+                raw_embed = None
+                
+                # ─── 1. DEFEAT THE AGE GATE ───
                 try:
                     age_gate = page.locator("a.av_btn.av_go[rel='yes']")
                     if await age_gate.count() > 0:
@@ -381,19 +383,15 @@ class DownloaderEngine:
                 except Exception:
                     pass
 
-                # ─── 2. DIRECT EMBED EXTRACTION (Specific Sites) ───
+                # ─── 2. DIRECT EMBED EXTRACTION ───
                 try:
                     embed_element = page.locator("span.change-video.c-aktif")
                     if await embed_element.count() > 0:
                         raw_embed = await embed_element.first.get_attribute("data-embed")
                         if raw_embed:
-                            self.db.log_trace(jid, f"Player overlay bypassed. Navigating directly to iframe: {raw_embed}")
-                            
-                            # CRITICAL FIX: Lock in the iframe URL so yt-dlp targets the host, not the ad-filled webpage
-                            extracted_payload["url"] = raw_embed 
-                            
+                            self.db.log_trace(jid, f"Navigating directly to iframe: {raw_embed}")
                             await page.goto(raw_embed, wait_until="domcontentloaded", timeout=45000)
-                            await page.wait_for_timeout(4000) # Wait for the new iframe DOM to settle
+                            await page.wait_for_timeout(4000) 
                 except Exception as e:
                     self.db.log_trace(jid, f"Embed extraction bypassed: {e}")
 
@@ -406,52 +404,61 @@ class DownloaderEngine:
                     
                     await page.mouse.move(center_x, center_y)
                     
+                    # Click 1: Eats the invisible pop-under ad overlay
                     await page.mouse.down()
                     await page.mouse.up()
                     await page.wait_for_timeout(1500)
                     
+                    # Click 2: Strikes the actual Play button on the video player
                     await page.mouse.down()
                     await page.mouse.up()
                     
-                    # ─── NEW: THE AD BURNER ───
-                    # Instantly mute and fast-forward any playing video at 16x speed to burn through pre-rolls
+                    # Burn through pre-roll ads at 16x speed
                     await page.evaluate("document.querySelectorAll('video').forEach(v => { v.muted = true; v.playbackRate = 16.0; });")
-                    await page.wait_for_timeout(4000) 
+                    await page.wait_for_timeout(6000) 
                     
-                    # ─── UPGRADED: SMART RAM RIPPER ───
                     jw_url = await page.evaluate('''() => {
                         try {
-                            // Filter out known ad/trailer footprints
                             const isBad = (url) => url.match(/trailer|promo|ad|blank|teaser/i);
-                            
                             if (typeof jwplayer === 'function') {
                                 let pl = jwplayer().getPlaylist();
                                 if (pl) {
-                                    // Scan playlist for the master m3u8, ignoring trailers
                                     for (let i = 0; i < pl.length; i++) {
                                         if (pl[i].file && !isBad(pl[i].file) && pl[i].file.includes('.m3u8')) return pl[i].file;
-                                    }
-                                    // Fallback to any non-bad mp4 in the playlist
-                                    for (let i = 0; i < pl.length; i++) {
-                                        if (pl[i].file && !isBad(pl[i].file)) return pl[i].file;
                                     }
                                 }
                             }
                             let v = document.querySelector('video'); 
                             if (v && v.src && !v.src.startsWith('blob:') && !isBad(v.src)) return v.src;
-                            let s = document.querySelector('video source'); 
-                            if (s && s.src && !s.src.startsWith('blob:') && !isBad(s.src)) return s.src;
                         } catch(e) {}
                         return null;
                     }''')
                     
                     if jw_url:
-                        self.db.log_trace(jid, f"Successfully ripped decrypted stream: {jw_url[:50]}...")
+                        self.db.log_trace(jid, "RAM Ripper successful!")
                         extracted_payload["url"] = jw_url
                         
                 except Exception as e:
                     self.db.log_trace(jid, f"Mouse simulation warning: {e}")
+
+                # ─── 4. BULLETPROOF PAYLOAD SELECTION ───
+                # If RAM ripper failed (obfuscated player), fallback strictly to Network Sniffer
+                if not extracted_payload.get("url"):
+                    self.db.log_trace(jid, "RAM Ripper missed. Checking Network Sniffer logs...")
+                    m3u8s = [u["url"] for u in found_urls if u["type"] == "m3u8"]
                     
+                    if m3u8s:
+                        extracted_payload["url"] = m3u8s[-1]
+                        self.db.log_trace(jid, "Sniffer successfully locked onto HLS Stream.")
+                    else:
+                        mp4s = [u["url"] for u in found_urls if u["type"] == "mp4"]
+                        if mp4s:
+                            extracted_payload["url"] = mp4s[-1]
+                            self.db.log_trace(jid, "Sniffer successfully locked onto MP4 Stream.")
+                        else:
+                            # Ultimate failsafe: only use the raw embed if literally everything else fails
+                            extracted_payload["url"] = raw_embed if raw_embed else url
+                            
             except Exception as e:
                 self.db.log_trace(jid, f"Playwright page load warning: {e}")
 
