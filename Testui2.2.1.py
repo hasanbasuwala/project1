@@ -300,7 +300,223 @@ class DownloaderEngine:
                 self.db.log_trace(jid, f"{pass_name} FAILED: {str(e)[:100]}")
         return False
 
-https://w8.mypornerleak.com/marica-chanelle-busty-big-tits-slut-paying-her-debt-by-fucking-in-the-car/ #MaricaChanelle
+    async def _run_playwright_extraction(self, url: str, jid: str, dl_dir: Path) -> dict:
+        from playwright.async_api import async_playwright
+        from playwright_stealth import Stealth 
+        import shutil
+        import os
+        
+        path_to_extension = "/root/stealth_bot_v13/uBOL-home-main/chromium"
+        user_data_dir = f"/tmp/pw_data_{jid}" 
+        
+        extracted_payload = {"url": None, "headers": {}, "cookie_str": "", "raw_cookies": []}
+        found_urls = []
+        capture_headers = {}
+        
+        async with async_playwright() as p:
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir,
+                headless=True,
+                channel="chromium", 
+                user_agent=USER_AGENT,
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-site-isolation-trials", # NEW: Disable OOPIF isolation
+                    "--disable-web-security",          # NEW: Allow cross-origin iframe scripting
+                    f"--disable-extensions-except={path_to_extension}",
+                    f"--load-extension={path_to_extension}"
+                ]
+            )
+            
+            page = context.pages[0]
+            await Stealth().apply_stealth_async(page)
+            await page.wait_for_timeout(2000) 
+
+            # ─── RESPONSE-BASED SNIFFER (CATCHES HIDDEN EXTENSIONS) ───
+            async def handle_response(response):
+                try:
+                    req = response.request
+                    url_lower = req.url.lower()
+                    content_type = response.headers.get("content-type", "").lower()
+                    
+                    bad_keywords = ["google", "analytics", "ad", "beacon", "vast", "blank", "trailer", "promo"]
+                    if any(bad in url_lower for bad in bad_keywords): return
+                    
+                    is_media = False
+                    vtype = "mp4"
+                    
+                    if "mpegurl" in content_type or ".m3u8" in url_lower:
+                        is_media = True
+                        vtype = "m3u8"
+                    elif "video/" in content_type or (".mp4" in url_lower):
+                        is_media = True
+                        vtype = "mp4"
+                        
+                    if is_media:
+                        found_urls.append({"type": vtype, "url": req.url})
+                        headers = await req.all_headers()
+                        capture_headers.update(headers)
+                except Exception:
+                    pass
+                    
+            page.on("response", handle_response)
+
+            # ─── SAFE UI ROUTER (SAVES BANDWIDTH) ───
+            async def handle_route(route):
+                if route.request.resource_type == "image":
+                    await route.abort()
+                else:
+                    try: await route.continue_()
+                    except Exception: pass
+
+            await page.route("**/*", handle_route)
+
+            try:
+                self.db.log_trace(jid, "Navigating to main target URL...")
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                
+                # ─── 1. SMART AGE GATE DEFEAT ───
+                try:
+                    age_gate = await page.wait_for_selector("a.av_btn.av_go[rel='yes']", state="visible", timeout=10000)
+                    if age_gate:
+                        self.db.log_trace(jid, "Age-gate detected. Clicking 'Yes'...")
+                        await age_gate.click()
+                        await page.wait_for_timeout(2000)
+                except Exception:
+                    pass
+
+                # ─── 2. SPAWN THE IFRAME (STAY ON PARENT PAGE) ───
+                try:
+                    fake_player = await page.wait_for_selector("div.vi-on, div.play", state="visible", timeout=5000)
+                    if fake_player:
+                        self.db.log_trace(jid, "Clicking fake player overlay to spawn iframe...")
+                        await fake_player.click()
+                        await page.wait_for_timeout(4000)
+                except Exception:
+                    self.db.log_trace(jid, "No fake player overlay found. Proceeding...")
+
+                # ─── 3. IFRAME INTERACTION & RAM RIPPER ───
+                try:
+                    self.db.log_trace(jid, f"Scanning {len(page.frames)} active frames for video players...")
+                    jw_url = None
+                    
+                    # ─── UNIVERSAL CENTER-SCREEN CLICKER ───
+                    # Physical clicks naturally pierce cross-origin boundaries without JS
+                    viewport = page.viewport_size
+                    center_x = viewport['width'] / 2
+                    center_y = viewport['height'] / 2
+                    
+                    await page.mouse.move(center_x, center_y)
+                    
+                    # Click 1: Give the iframe focus
+                    await page.mouse.down()
+                    await page.mouse.up()
+                    await page.wait_for_timeout(1500)
+                    
+                    # Click 2: Trigger Play inside the iframe
+                    await page.mouse.down()
+                    await page.mouse.up()
+                    
+                    await page.wait_for_timeout(6000) 
+                    
+                    # Rip RAM and Burn Ads from all cross-origin frames
+                    for frame in page.frames:
+                        if "google" in frame.url or "blank" in frame.url or "magsrv" in frame.url: continue
+                        
+                        try:
+                            await frame.evaluate("document.querySelectorAll('video').forEach(v => { v.muted = true; v.playbackRate = 16.0; });")
+                            
+                            res = await frame.evaluate('''() => {
+                                try {
+                                    const isBad = (url) => url.match(/trailer|promo|ad|blank|teaser/i);
+                                    if (typeof jwplayer === 'function') {
+                                        let pl = jwplayer().getPlaylist();
+                                        if (pl) {
+                                            for (let i = 0; i < pl.length; i++) {
+                                                if (pl[i].file && !isBad(pl[i].file) && pl[i].file.includes('.m3u8')) return pl[i].file;
+                                            }
+                                        }
+                                    }
+                                    let v = document.querySelector('video'); 
+                                    if (v && v.src && !v.src.startsWith('blob:') && !isBad(v.src)) return v.src;
+                                } catch(e) {}
+                                return null;
+                            }''')
+                            if res:
+                                jw_url = res
+                                break
+                        except Exception:
+                            pass
+                            
+                    if jw_url:
+                        self.db.log_trace(jid, "RAM Ripper successful from cross-origin iframe!")
+                        extracted_payload["url"] = jw_url
+                        
+                except Exception as e:
+                    self.db.log_trace(jid, f"Iframe simulation warning: {e}")
+
+                # ─── 4. BULLETPROOF PAYLOAD SELECTION ───
+                if not extracted_payload.get("url"):
+                    self.db.log_trace(jid, "RAM Ripper missed. Checking Network Sniffer logs...")
+                    m3u8s = [u["url"] for u in found_urls if u["type"] == "m3u8"]
+                    
+                    if m3u8s:
+                        extracted_payload["url"] = m3u8s[-1]
+                        self.db.log_trace(jid, "Sniffer successfully locked onto HLS Stream.")
+                    else:
+                        mp4s = [u["url"] for u in found_urls if u["type"] == "mp4"]
+                        if mp4s:
+                            extracted_payload["url"] = mp4s[-1]
+                            self.db.log_trace(jid, "Sniffer successfully locked onto MP4 Stream.")
+                        else:
+                            extracted_payload["url"] = url
+                            
+            except Exception as e:
+                self.db.log_trace(jid, f"Playwright critical failure: {e}")
+                try:
+                    await page.screenshot(path=str(dl_dir / f"{jid}_crash_screenshot.png"))
+                    html_content = await page.content()
+                    with open(dl_dir / f"{jid}_crash_dump.html", "w", encoding="utf-8") as f:
+                        f.write(html_content)
+                    self.db.log_trace(jid, "Crash screenshot and HTML saved.")
+                except Exception:
+                    pass
+
+            # ─── HEADER & COOKIE EXTRACTION ───
+            extracted_payload["headers"] = {
+                "Referer": url, 
+                "Origin": "/".join(url.split("/")[:3]),
+                "User-Agent": USER_AGENT,
+                "Accept": "*/*",
+                "Connection": "keep-alive"
+            }
+            
+            bad_headers = ["host", "accept-encoding", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "user-agent", "accept", "referer", "origin"]
+
+            for k, v in capture_headers.items():
+                if k.lower() not in bad_headers:
+                    extracted_payload["headers"][k] = v
+            
+            extracted_payload["headers"]["sec-ch-ua"] = '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"'
+            extracted_payload["headers"]["sec-ch-ua-mobile"] = "?0"
+            extracted_payload["headers"]["sec-ch-ua-platform"] = '"Windows"'
+            
+            cookies = await context.cookies()
+            extracted_payload["raw_cookies"] = cookies
+            extracted_payload["cookie_str"] = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+
+            await context.close()
+            try:
+                if os.path.exists(user_data_dir):
+                    shutil.rmtree(user_data_dir, ignore_errors=True)
+            except Exception as e:
+                self.db.log_trace(jid, f"Disk cleanup warning: {e}")
+
+            return extracted_payload
 
     async def _run_ffmpeg_capture(self, url: str, jid: str, dl_dir: Path, headers: dict, cookie_str: str) -> bool:
         out_file = dl_dir / f"{jid}.mp4"
