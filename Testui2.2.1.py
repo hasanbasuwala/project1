@@ -371,6 +371,18 @@ class DownloaderEngine:
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 await page.wait_for_timeout(8000) 
                 
+                # ─── INJECTED VISUAL DEBUG ───
+                try:
+                    # Dump the raw HTML
+                    html_content = await page.content()
+                    with open(dl_dir / f"{jid}_page_dump.html", "w", encoding="utf-8") as f:
+                        f.write(html_content)
+                    # Take a screenshot of the viewport
+                    await page.screenshot(path=str(dl_dir / f"{jid}_screenshot.png"))
+                except Exception as e:
+                    self.db.log_trace(jid, f"Debug dump failed: {e}")
+                # ─────────────────────────────
+                
                 # We will still run the clicker as a fallback for sites that don't use JWPlayer
                 viewport = page.viewport_size
                 center_x = viewport['width'] / 2
