@@ -378,8 +378,8 @@ class DownloaderEngine:
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-blink-features=AutomationControlled",
-                    "--disable-site-isolation-trials", # NEW: Disable OOPIF isolation
-                    "--disable-web-security",          # NEW: Allow cross-origin iframe scripting
+                    "--disable-site-isolation-trials", 
+                    "--disable-web-security",          
                     f"--disable-extensions-except={path_to_extension}",
                     f"--load-extension={path_to_extension}"
                 ]
@@ -388,35 +388,6 @@ class DownloaderEngine:
             page = context.pages[0]
             await Stealth().apply_stealth_async(page)
             await page.wait_for_timeout(2000) 
-
-            # ─── RESPONSE-BASED SNIFFER (CATCHES HIDDEN EXTENSIONS) ───
-            async def handle_response(response):
-                try:
-                    req = response.request
-                    url_lower = req.url.lower()
-                    content_type = response.headers.get("content-type", "").lower()
-                    
-                    bad_keywords = ["google", "analytics", "ad", "beacon", "vast", "blank", "trailer", "promo"]
-                    if any(bad in url_lower for bad in bad_keywords): return
-                    
-                    is_media = False
-                    vtype = "mp4"
-                    
-                    if "mpegurl" in content_type or ".m3u8" in url_lower:
-                        is_media = True
-                        vtype = "m3u8"
-                    elif "video/" in content_type or (".mp4" in url_lower):
-                        is_media = True
-                        vtype = "mp4"
-                        
-                    if is_media:
-                        found_urls.append({"type": vtype, "url": req.url})
-                        headers = await req.all_headers()
-                        capture_headers.update(headers)
-                except Exception:
-                    pass
-                    
-            page.on("response", handle_response)
 
             # ─── WIDENED RESPONSE-BASED SNIFFER ───
             async def handle_response(response):
@@ -450,6 +421,20 @@ class DownloaderEngine:
                     pass
                     
             page.on("response", handle_response)
+
+            # ─── SAFE UI ROUTER (SAVES BANDWIDTH) ───
+            async def handle_route(route):
+                if route.request.resource_type == "image":
+                    await route.abort()
+                else:
+                    try: await route.continue_()
+                    except Exception: pass
+
+            await page.route("**/*", handle_route)
+
+            try:
+                self.db.log_trace(jid, "Navigating to main target URL...")
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 
                 # ─── 1. SMART AGE GATE DEFEAT ───
                 try:
@@ -476,38 +461,25 @@ class DownloaderEngine:
                     self.db.log_trace(jid, f"Scanning main page and {len(page.frames)} child frames for video players...")
                     jw_url = None
                     
-            # ─── WIDENED RESPONSE-BASED SNIFFER ───
-            async def handle_response(response):
-                try:
-                    req = response.request
-                    url_lower = req.url.lower()
-                    content_type = response.headers.get("content-type", "").lower()
+                    # ─── UNIVERSAL CLICK-BOMB STRATEGY ───
+                    viewport = page.viewport_size
+                    cx = viewport['width'] / 2
+                    cy = viewport['height'] / 2
                     
-                    bad_keywords = ["google", "analytics", "ad", "beacon", "vast", "blank", "trailer", "promo"]
-                    if any(bad in url_lower for bad in bad_keywords): return
+                    # Target center, slightly below center, and bottom-left corner
+                    click_targets = [
+                        (cx, cy),          
+                        (cx, cy + 100),    
+                        (50, viewport['height'] - 50) 
+                    ]
                     
-                    is_media = False
-                    vtype = "mp4"
+                    for x, y in click_targets:
+                        await page.mouse.move(x, y)
+                        await page.mouse.down()
+                        await page.mouse.up()
+                        await page.wait_for_timeout(800)
                     
-                    if "mpegurl" in content_type or "application/x-mpegurl" in content_type or ".m3u8" in url_lower:
-                        is_media = True
-                        vtype = "m3u8"
-                    elif "video/" in content_type or ".mp4" in url_lower or ".ts" in url_lower:
-                        is_media = True
-                        vtype = "mp4"
-                    elif "application/octet-stream" in content_type and req.resource_type in ["media", "xhr", "fetch"]:
-                        # Catch obfuscated binary media streams
-                        is_media = True
-                        vtype = "mp4"
-                        
-                    if is_media:
-                        found_urls.append({"type": vtype, "url": req.url})
-                        headers = await req.all_headers()
-                        capture_headers.update(headers)
-                except Exception:
-                    pass
-                    
-            page.on("response", handle_response) 
+                    await page.wait_for_timeout(6000) 
                     
                     # Combine the main page and all child iframes into one search list
                     frames_to_search = [page.main_frame] + page.frames
