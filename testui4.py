@@ -699,6 +699,12 @@ class DownloaderEngine:
             def error(self, msg): pass
 
         def prog_hook(d):
+            # NEW: yt-dlp cancellation check[span_12](start_span)[span_12](end_span).
+            if jid in self.pipeline.cancelled:
+                import yt_dlp
+                raise yt_dlp.utils.DownloadError(f"Cancelled by user: {jid}")
+                
+            # ... rest of the existing prog_hook logic
             if d.get("status") == "downloading":
                 try: 
                     pct_str = re.sub(r"\x1b[^m]*m", "", d.get("_percent_str", "0.0%")).strip()
