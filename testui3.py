@@ -409,7 +409,6 @@ class DownloaderEngine:
                         is_media = True
                         vtype = "mp4"
                     elif "application/octet-stream" in content_type and req.resource_type in ["media", "xhr", "fetch"]:
-                        # Catch obfuscated binary media streams
                         is_media = True
                         vtype = "mp4"
                         
@@ -422,7 +421,6 @@ class DownloaderEngine:
                     
             page.on("response", handle_response)
 
-            # ─── SAFE UI ROUTER (SAVES BANDWIDTH) ───
             async def handle_route(route):
                 if route.request.resource_type == "image":
                     await route.abort()
@@ -436,6 +434,11 @@ class DownloaderEngine:
                 self.db.log_trace(jid, "Navigating to main target URL...")
                 await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 
+                # ─── VISUAL DIAGNOSTIC 1: INITIAL LOAD ───
+                try:
+                    await page.screenshot(path=str(dl_dir / f"{jid}_01_initial_load.png"))
+                except Exception: pass
+                
                 # ─── 1. SMART AGE GATE DEFEAT ───
                 try:
                     age_gate = await page.wait_for_selector("a.av_btn.av_go[rel='yes']", state="visible", timeout=10000)
@@ -445,6 +448,11 @@ class DownloaderEngine:
                         await page.wait_for_timeout(2000)
                 except Exception:
                     pass
+
+                # ─── VISUAL DIAGNOSTIC 2: POST-AGE GATE ───
+                try:
+                    await page.screenshot(path=str(dl_dir / f"{jid}_02_post_age_gate.png"))
+                except Exception: pass
 
                 # ─── 2. SPAWN THE IFRAME (STAY ON PARENT PAGE) ───
                 try:
@@ -456,6 +464,11 @@ class DownloaderEngine:
                 except Exception:
                     self.db.log_trace(jid, "No fake player overlay found. Proceeding...")
 
+                # ─── VISUAL DIAGNOSTIC 3: PRE-CLICK BOMB ───
+                try:
+                    await page.screenshot(path=str(dl_dir / f"{jid}_03_pre_click_bomb.png"))
+                except Exception: pass
+
                 # ─── 3. UNIVERSAL INTERACTION & RAM RIPPER ───
                 try:
                     self.db.log_trace(jid, f"Scanning main page and {len(page.frames)} child frames for video players...")
@@ -466,7 +479,6 @@ class DownloaderEngine:
                     cx = viewport['width'] / 2
                     cy = viewport['height'] / 2
                     
-                    # Target center, slightly below center, and bottom-left corner
                     click_targets = [
                         (cx, cy),          
                         (cx, cy + 100),    
@@ -481,15 +493,17 @@ class DownloaderEngine:
                     
                     await page.wait_for_timeout(6000) 
                     
-                    # Combine the main page and all child iframes into one search list
+                    # ─── VISUAL DIAGNOSTIC 4: POST-CLICK BOMB ───
+                    try:
+                        await page.screenshot(path=str(dl_dir / f"{jid}_04_post_click_bomb.png"))
+                    except Exception: pass
+                    
                     frames_to_search = [page.main_frame] + page.frames
                     
-                    # Rip RAM and Burn Ads from ALL frames
                     for frame in frames_to_search:
                         if "google" in frame.url or "blank" in frame.url or "magsrv" in frame.url: continue
                         
                         try:
-                            # Try to click native play buttons directly via JS
                             await frame.evaluate("document.querySelectorAll('.play-button, .vjs-big-play-button, video').forEach(b => b.click());")
                             await frame.evaluate("document.querySelectorAll('video').forEach(v => { v.muted = true; v.playbackRate = 16.0; });")
                             
