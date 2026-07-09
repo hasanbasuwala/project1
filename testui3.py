@@ -293,7 +293,18 @@ class DownloaderEngine:
         # ─── INJECTED PRE-DOWNLOAD VALIDATION GATE ───
         is_valid_url = await self._pre_download_validation(extracted_url, jid, headers, cookie_str)
         if not is_valid_url:
-             raise RuntimeError("Pre-Download Validation Failed: Target URL points to HTML/Text, not a media file.")
+            # ─── CACHE INVALIDATION ───
+            # Nuke the toxic payload cache so the next retry starts completely fresh
+            cache_file = self._get_payload_cache_path(dl_dir)
+            if cache_file and cache_file.exists():
+                try:
+                    import os
+                    os.remove(cache_file)
+                    self.db.log_trace(jid, "Toxic payload cache purged.")
+                except Exception:
+                    pass
+            # ──────────────────────────
+            raise RuntimeError("Pre-Download Validation Failed: Target URL points to HTML/Text, not a media file.")
         # ─────────────────────────────────────────────
 
         if ".m3u8" in extracted_url:
