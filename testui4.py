@@ -177,10 +177,10 @@ class LinkClassifier:
 # ──────────────────────────── SUBSYSTEM 3: ENGINES ──────────────────────
 
 class DownloaderEngine:
-    def __init__(self, scheduler: JobScheduler, app: Client):
+    def __init__(self, scheduler: JobScheduler, app: Client, pipeline: PipelineManager):
         self.db = scheduler
         self.app = app
-        self.procs = {}
+        self.pipeline = pipeline
 
     # ─── PAYLOAD CACHING HELPERS ───
     def _get_payload_cache_path(self, dl_dir: Path) -> Path:
