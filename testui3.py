@@ -1067,6 +1067,94 @@ class TelegramDispatcher:
                     break
                     
             self.edit_queue.task_done()
+            
+class UIAccumulator:
+    """
+    Monitors database state and accumulates UI updates. 
+    Strictly fires Telegram edits ONLY when a job's stage changes, 
+    progress jumps by >= 10%, or the active job pool changes.
+    """
+    def __init__(self, db: JobScheduler, dispatcher: TelegramDispatcher, pipeline: PipelineManager):
+        self.db = db
+        self.dispatcher = dispatcher
+        self.pipeline = pipeline
+        
+        self.last_stages = {}
+        self.last_pcts = {}
+        self.known_jids = set()
+        self.job_stats_history = {}
+
+    async def run_loop(self):
+        global _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab
+        while True:
+            await asyncio.sleep(4)  # Polling interval (does not cost API calls)
+            
+            try:
+                jobs = await self.db.get_active_jobs()
+                current_jids = {j['id'] for j in jobs}
+                
+                dashboard_needs_update = False
+                
+                # ─── POOL CHANGE DETECTION ───
+                # If a job was added, completed, or failed, we MUST refresh the dashboard
+                if current_jids != self.known_jids:
+                    dashboard_needs_update = True
+                    self.known_jids = current_jids
+                    
+                for job in jobs:
+                    jid = job['id']
+                    if not job.get('tracker_id'): continue
+                    
+                    raw_stage = job['stage']
+                    base_phase = raw_stage.split("|")[0].strip().lower() if "|" in raw_stage else raw_stage.strip().lower()
+                    
+                    last_phase = self.last_stages.get(jid, "")
+                    last_pct = self.last_pcts.get(jid, -10.0)
+                    current_pct = float(job.get('pct', 0.0) or 0.0)
+                    
+                    # Accumulate speed/eta history for smooth UI averages
+                    if jid not in self.job_stats_history:
+                        self.job_stats_history[jid] = {'speeds': [], 'etas': []}
+                    if "|" in raw_stage:
+                        parts = [p.strip() for p in raw_stage.split("|")]
+                        if len(parts) >= 3:
+                            self.job_stats_history[jid]['speeds'].append(_parse_speed(parts[1]))
+                            self.job_stats_history[jid]['etas'].append(_parse_eta(parts[2]))
+
+                    # ─── STRICT THRESHOLD EVALUATION ───
+                    stage_changed = (base_phase != last_phase)
+                    progression_jump = (current_pct - last_pct) >= 10.0
+                    
+                    if stage_changed or progression_jump:
+                        dashboard_needs_update = True
+                        
+                        hist = self.job_stats_history[jid]
+                        avg_s = _format_speed(sum(hist['speeds']) / len(hist['speeds'])) if hist['speeds'] else None
+                        avg_e = _format_eta(sum(hist['etas']) / len(hist['etas'])) if hist['etas'] else None
+
+                        kb = InlineKeyboardMarkup([
+                            [InlineKeyboardButton("📄 LOGS", callback_data=f"joblog|{jid}"), 
+                             InlineKeyboardButton("❌ KILL", callback_data=f"kill|{jid}")]
+                        ])
+                        
+                        # Queue the individual Job Card update
+                        await self.dispatcher.safe_edit_queued(job['chat_id'], job['tracker_id'], _job_tracker_text(job, avg_s, avg_e), kb)
+                        
+                        # Lock in the new state thresholds
+                        self.last_stages[jid] = base_phase
+                        self.last_pcts[jid] = current_pct
+                        self.job_stats_history[jid] = {'speeds': [], 'etas': []}
+                        
+                        # Sync to DB so restarts remember the UI state
+                        await self.db.update_job(jid, last_ui_pct=current_pct)
+                        
+                # ─── ACCUMULATED DASHBOARD UPDATE ───
+                if dashboard_needs_update and _dashboard_msg_id and _dashboard_chat_id:
+                    text, kb = await _get_dashboard_components(_dashboard_tab, self.db, self.pipeline)
+                    await self.dispatcher.safe_edit_queued(_dashboard_chat_id, _dashboard_msg_id, text, kb)
+                    
+            except Exception:
+                pass
 
 class PipelineManager:
     def __init__(self, app: Client, db: JobScheduler):
