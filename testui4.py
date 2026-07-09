@@ -744,9 +744,14 @@ class DownloaderEngine:
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=subprocess.DEVNULL
         )
-        self.procs[jid] = proc
+        self.pipeline.live_procs[jid] = proc
         try:
             while True:
+                # NEW: Check for cancellation during the read loop[span_13](start_span)[span_13](end_span).
+                if jid in self.pipeline.cancelled:
+                    proc.kill()
+                    raise CancelledJobError(jid)
+                    
                 chunk = await proc.stdout.readline()
                 if not chunk: break
                 chunk_str = chunk.decode("utf-8", errors="ignore").strip()
@@ -766,8 +771,10 @@ class DownloaderEngine:
                     else:
                         m2 = re.search(r"\((\d+)%\)", chunk_str)
                         if m2: await self.db.update_job(jid, pct=float(m2.group(1)))
+                # ... rest of aria2c processing loop
         finally:
-            await proc.wait(); self.procs.pop(jid, None)
+            await proc.wait()
+            self.pipeline.live_procs.pop(jid, None)
             
         valid_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".flv", ".php"]]
         if not valid_files: 
