@@ -1584,59 +1584,6 @@ def _format_eta(s: int) -> str:
 _last_ui_stage = {}
 _job_stats_history = {} 
 
-async def ui_throttle_loop(db: JobScheduler, dispatcher: TelegramDispatcher):
-    global _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab
-    while True:
-        # Throttle dashboard updates to every 5 seconds
-        await asyncio.sleep(5) 
-        
-        try:
-            for job in await db.get_active_jobs():
-                jid = job['id']
-                if not job['tracker_id']: continue
-                
-                raw_stage = job['stage']
-                base_phase = raw_stage.split("|")[0].strip().lower() if "|" in raw_stage else raw_stage.strip().lower()
-                last_phase = _last_ui_stage.get(jid, "")
-                
-                last_pct = float(job['last_ui_pct']) if job['last_ui_pct'] is not None else -10.0
-                current_pct = float(job['pct']) if job['pct'] is not None else 0.0
-
-                if jid not in _job_stats_history:
-                    _job_stats_history[jid] = {'speeds': [], 'etas': []}
-                
-                if "|" in raw_stage:
-                    parts = [p.strip() for p in raw_stage.split("|")]
-                    if len(parts) >= 3:
-                        _job_stats_history[jid]['speeds'].append(_parse_speed(parts[1]))
-                        _job_stats_history[jid]['etas'].append(_parse_eta(parts[2]))
-                
-                if (base_phase != last_phase) or (current_pct - last_pct) >= 10.0: 
-                    
-                    hist = _job_stats_history[jid]
-                    avg_s = _format_speed(sum(hist['speeds']) / len(hist['speeds'])) if hist['speeds'] else None
-                    avg_e = _format_eta(sum(hist['etas']) / len(hist['etas'])) if hist['etas'] else None
-
-                    kb = InlineKeyboardMarkup([
-                        [InlineKeyboardButton("📄 LOGS", callback_data=f"joblog|{jid}"), 
-                         InlineKeyboardButton("❌ KILL", callback_data=f"kill|{jid}")]
-                    ])
-                    
-                    # Route through the centralized sender queue
-                    await dispatcher.safe_edit_queued(job['chat_id'], job['tracker_id'], _job_tracker_text(job, avg_s, avg_e), kb)
-                    
-                    await db.update_job(jid, last_ui_pct=current_pct)
-                    _last_ui_stage[jid] = base_phase
-                    _job_stats_history[jid] = {'speeds': [], 'etas': []} 
-                    
-            if _dashboard_msg_id and _dashboard_chat_id:
-                text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline_ref)
-                # Route through the centralized sender queue
-                await dispatcher.safe_edit_queued(_dashboard_chat_id, _dashboard_msg_id, text, kb)
-                
-        except Exception: 
-            pass
-
 async def terminal_loop(db: JobScheduler, pipeline: PipelineManager):
     sys.stdout.write("\033[2J") 
     while True:
