@@ -951,6 +951,81 @@ class RecoveryManager:
 
 # ──────────────────────────── PIPELINE MANAGER (Orchestrator) ───────────
 
+class TelegramDispatcher:
+    """
+    Centralizes all Telegram API requests through a single sender queue.
+    Implements token-bucket rate limiting and merges UI updates to prevent FloodWaits.
+    """
+    def __init__(self, app: Client):
+        self.app = app
+        self.edit_queue = asyncio.Queue()
+        self.pending_edits = {}  
+        self.lock = asyncio.Lock()
+        
+        # Token-bucket rate limiting setup
+        self.tokens = 25.0
+        self.last_refill = time.time()
+        self.rate = 25.0  # Safe global limit
+
+    async def _consume_token(self):
+        """Ensures we never burst past Telegram's hard global limits."""
+        now = time.time()
+        elapsed = now - self.last_refill
+        self.tokens = min(30.0, self.tokens + elapsed * self.rate)
+        self.last_refill = now
+        
+        if self.tokens < 1.0:
+            await asyncio.sleep(1.0 / self.rate)
+            await self._consume_token()
+        else:
+            self.tokens -= 1.0
+
+    async def safe_edit_queued(self, chat_id: int, msg_id: int, text: str, kb: InlineKeyboardMarkup):
+        """
+        Puts an edit into the queue. If an edit is already pending for this message, 
+        it overwrites the old state, merging multiple UI updates into a single refresh.
+        """
+        async with self.lock:
+            key = (chat_id, msg_id)
+            is_new = key not in self.pending_edits
+            self.pending_edits[key] = (text, kb)
+            
+        if is_new:
+            await self.edit_queue.put(key)
+
+    async def sender_loop(self):
+        """The dedicated background worker that safely communicates with Telegram."""
+        while True:
+            key = await self.edit_queue.get()
+            
+            async with self.lock:
+                if key not in self.pending_edits:
+                    self.edit_queue.task_done()
+                    continue
+                text, kb = self.pending_edits.pop(key)
+            
+            retries = 0
+            backoff = 1
+            while retries < 5:
+                await self._consume_token()
+                try:
+                    await self.app.edit_message_text(key[0], key[1], text, reply_markup=kb)
+                    # Add a micro-sleep to prevent hammering the exact same chat ID too fast
+                    await asyncio.sleep(1.0)
+                    break
+                except MessageNotModified:
+                    break
+                except FloodWait as e:
+                    # Catch FloodWait exceptions, sleep for requested duration, apply exponential backoff
+                    sleep_time = e.value + backoff
+                    await asyncio.sleep(sleep_time)
+                    backoff *= 2
+                    retries += 1
+                except Exception:
+                    break
+                    
+            self.edit_queue.task_done()
+
 class PipelineManager:
     def __init__(self, app: Client, db: JobScheduler):
         self.app, self.db = app, db
@@ -1379,10 +1454,11 @@ def _format_eta(s: int) -> str:
 _last_ui_stage = {}
 _job_stats_history = {} 
 
-async def ui_throttle_loop(app: Client, db: JobScheduler):
+async def ui_throttle_loop(db: JobScheduler, dispatcher: TelegramDispatcher):
     global _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab
     while True:
-        await asyncio.sleep(3) 
+        # Throttle dashboard updates to every 5 seconds
+        await asyncio.sleep(5) 
         
         try:
             for job in await db.get_active_jobs():
@@ -1416,7 +1492,8 @@ async def ui_throttle_loop(app: Client, db: JobScheduler):
                          InlineKeyboardButton("❌ KILL", callback_data=f"kill|{jid}")]
                     ])
                     
-                    await safe_edit(app, job['chat_id'], job['tracker_id'], _job_tracker_text(job, avg_s, avg_e), kb)
+                    # Route through the centralized sender queue
+                    await dispatcher.safe_edit_queued(job['chat_id'], job['tracker_id'], _job_tracker_text(job, avg_s, avg_e), kb)
                     
                     await db.update_job(jid, last_ui_pct=current_pct)
                     _last_ui_stage[jid] = base_phase
@@ -1424,10 +1501,9 @@ async def ui_throttle_loop(app: Client, db: JobScheduler):
                     
             if _dashboard_msg_id and _dashboard_chat_id:
                 text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline_ref)
-                await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
+                # Route through the centralized sender queue
+                await dispatcher.safe_edit_queued(_dashboard_chat_id, _dashboard_msg_id, text, kb)
                 
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
         except Exception: 
             pass
 
@@ -1470,12 +1546,20 @@ async def main():
     app = Client("stealth_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
     db = JobScheduler(DB_PATH)
     pipeline = PipelineManager(app, db)
+    dispatcher = TelegramDispatcher(app) # Initialize the central queue
+    
     setup_router(app, db, pipeline)
 
     async with app:
         await RecoveryManager.scan_and_requeue(db, pipeline.dl_q, pipeline.enc_q, pipeline.up_q, app)
         pipeline.start_workers()
-        asyncio.create_task(ui_throttle_loop(app, db))
+        
+        # Start the dedicated rate-limited Telegram sender
+        asyncio.create_task(dispatcher.sender_loop()) 
+        
+        # Pass the dispatcher to the UI loop
+        asyncio.create_task(ui_throttle_loop(db, dispatcher)) 
+        
         asyncio.create_task(terminal_loop(db, pipeline))
         
         if OWNER_ID:
@@ -1483,7 +1567,7 @@ async def main():
             global _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab
             _dashboard_msg_id, _dashboard_chat_id = m.id, m.chat.id
             text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
-            await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
+            await dispatcher.safe_edit_queued(_dashboard_chat_id, _dashboard_msg_id, text, kb)
 
         while True: await asyncio.sleep(3600)
 
