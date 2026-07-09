@@ -1626,10 +1626,18 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         if cb.data.startswith("kill|"):
             jid = cb.data.split("|")[1]
             await pipeline_ref.db.log_trace(jid, "SYS_OP INITIATED MANUAL OVERRIDE: KILL COMMAND RECEIVED.")
-            await pipeline_ref.db.delete_job(jid)
             
-            job_dir = JOBS_DIR / f"JOB_{jid}"
-            shutil.rmtree(job_dir, ignore_errors=True)
+            # 1. Flag it so any stage-loop checking this id will stop itself[span_7](start_span)[span_7](end_span).
+            pipeline_ref.cancelled.add(jid)
+            
+            # 2. Kill whatever subprocess is currently attached to this job, if any[span_8](start_span)[span_8](end_span).
+            proc = pipeline_ref.live_procs.get(jid)
+            if proc and proc.returncode is None:
+                try: proc.kill()
+                except Exception: pass
+                
+            # 3. Mark the row CANCELLED instead of deleting it outright[span_9](start_span)[span_9](end_span).
+            await pipeline_ref.db.update_job(jid, stage="cancelled")
             
             if _dashboard_msg_id != cb.message.id:
                 try: await cb.message.edit_text(f"💀 **TASK TERMINATED:** `JOB_{jid}`", reply_markup=None)
@@ -1639,7 +1647,14 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
                     text, kb = await _get_dashboard_components(_dashboard_tab, pipeline_ref.db, pipeline_ref)
                     await cb.message.edit_text(text, reply_markup=kb)
                 except Exception: pass
-            await cb.answer("Process terminated and payload destroyed.", show_alert=True)
+            
+            await cb.answer("Kill signal sent.", show_alert=True)
+            
+            # 4. Give the running task a moment to notice the flag / process death, then clean up state and files[span_10](start_span)[span_10](end_span).
+            await asyncio.sleep(0.5)
+            await pipeline_ref.db.delete_job(jid)
+            pipeline_ref.cancelled.discard(jid)
+            shutil.rmtree(JOBS_DIR / f"JOB_{jid}", ignore_errors=True)
             return
 
 # ──────────────────────────── EVENT LOOPS ─────────────────────────────
