@@ -1676,7 +1676,10 @@ async def main():
     app = Client("stealth_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
     db = JobScheduler(DB_PATH)
     pipeline = PipelineManager(app, db)
-    dispatcher = TelegramDispatcher(app) # Initialize the central queue
+    dispatcher = TelegramDispatcher(app) 
+    
+    # Initialize the new Accumulator
+    ui_accumulator = UIAccumulator(db, dispatcher, pipeline)
     
     setup_router(app, db, pipeline)
 
@@ -1684,11 +1687,10 @@ async def main():
         await RecoveryManager.scan_and_requeue(db, pipeline.dl_q, pipeline.enc_q, pipeline.up_q, app)
         pipeline.start_workers()
         
-        # Start the dedicated rate-limited Telegram sender
         asyncio.create_task(dispatcher.sender_loop()) 
         
-        # Pass the dispatcher to the UI loop
-        asyncio.create_task(ui_throttle_loop(db, dispatcher)) 
+        # Start the Accumulator loop
+        asyncio.create_task(ui_accumulator.run_loop()) 
         
         asyncio.create_task(terminal_loop(db, pipeline))
         
