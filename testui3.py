@@ -265,17 +265,13 @@ class DownloaderEngine:
             await self._run_aria(url, jid, dl_dir)
             return
             
-        # ─── 11-PASS WATERFALL ESCALATION WITH STATE CACHING ───[span_1](start_span)[span_1](end_span)
-        
         playwright_data = self._load_cached_payload(dl_dir)
         
         if not playwright_data:
-            # PASS 1-4: yt-dlp Standard & Variants[span_2](start_span)[span_2](end_span)
             variant_success = await self._attempt_ytdlp_variants(url, jid, dl_dir)
             if variant_success:
                 return
 
-            # PASS 5-7: Playwright Deep Extraction (DOM, Network, HAR) & Cookie Export[span_3](start_span)[span_3](end_span)
             self.db.log_trace(jid, "yt-dlp variants failed. Escalating to Playwright extraction...")
             playwright_data = await self._run_playwright_extraction(url, jid, dl_dir)
             
@@ -294,20 +290,23 @@ class DownloaderEngine:
 
         self.db.log_trace(jid, "Delegating authorized payload downstream...")
 
-        # PASS 8: FFmpeg Direct Stream Capture[span_4](start_span)[span_4](end_span)
+        # ─── INJECTED PRE-DOWNLOAD VALIDATION GATE ───
+        is_valid_url = await self._pre_download_validation(extracted_url, jid, headers, cookie_str)
+        if not is_valid_url:
+             raise RuntimeError("Pre-Download Validation Failed: Target URL points to HTML/Text, not a media file.")
+        # ─────────────────────────────────────────────
+
         if ".m3u8" in extracted_url:
             self.db.log_trace(jid, "PASS 8: Attempting FFmpeg direct capture with exported cookies...")
             if await self._run_ffmpeg_capture(extracted_url, jid, dl_dir, headers, cookie_str):
                 return
             self.db.log_trace(jid, "PASS 8 FAILED: FFmpeg direct stream capture aborted.")
 
-        # PASS 9: yt-dlp with Exported Session Cookies (Netscape Format Bypass)[span_5](start_span)[span_5](end_span)
         self.db.log_trace(jid, "PASS 9: Attempting yt-dlp with exported Netscape cookiefile...")
         if await self._run_ytdlp_with_cookies(extracted_url, jid, dl_dir, headers, raw_cookies):
             return
         self.db.log_trace(jid, "PASS 9 FAILED: yt-dlp cookie authentication rejected.")
 
-        # PASS 10: Aria2c Full Header Replay[span_6](start_span)[span_6](end_span)
         self.db.log_trace(jid, "PASS 10: Attempting Aria2c full header replay bypass...")
         try:
             full_headers = headers.copy()
@@ -318,7 +317,6 @@ class DownloaderEngine:
         except Exception as e:
             self.db.log_trace(jid, f"PASS 10 FAILED: Aria2c bypass failed. Error: {e}")
             
-        # PASS 11: Final Fail Handler[span_7](start_span)[span_7](end_span)
         raise RuntimeError("PASS 11 FAILED: CDNs are blocking TLS signatures on all vectors.")
 
     async def _attempt_ytdlp_variants(self, url: str, jid: str, dl_dir: Path) -> bool:
