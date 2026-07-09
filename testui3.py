@@ -370,7 +370,7 @@ class DownloaderEngine:
             context = await p.chromium.launch_persistent_context(
                 user_data_dir,
                 headless=True,
-                channel="chromium", 
+                executable_path="/usr/bin/chromium",  # <--- INJECT SYSTEM CHROMIUM HERE
                 user_agent=USER_AGENT,
                 viewport={"width": 1920, "height": 1080},
                 locale="en-US",
