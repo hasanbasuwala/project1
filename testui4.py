@@ -40,6 +40,8 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 from pyrogram.errors import FloodWait, MessageNotModified
 from logging.handlers import RotatingFileHandler
 import config
+class CancelledJobError(Exception):
+    def __init__(self, jid): self.jid = jid
 
 # ──────────────────────────── CONFIGURATION ─────────────────────────────
 
