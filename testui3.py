@@ -452,35 +452,35 @@ class DownloaderEngine:
                 except Exception:
                     self.db.log_trace(jid, "No fake player overlay found. Proceeding...")
 
-                # ─── 3. IFRAME INTERACTION & RAM RIPPER ───
+                # ─── 3. UNIVERSAL INTERACTION & RAM RIPPER ───
                 try:
-                    self.db.log_trace(jid, f"Scanning {len(page.frames)} active frames for video players...")
+                    self.db.log_trace(jid, f"Scanning main page and {len(page.frames)} child frames for video players...")
                     jw_url = None
                     
                     # ─── UNIVERSAL CENTER-SCREEN CLICKER ───
-                    # Physical clicks naturally pierce cross-origin boundaries without JS
                     viewport = page.viewport_size
                     center_x = viewport['width'] / 2
                     center_y = viewport['height'] / 2
                     
                     await page.mouse.move(center_x, center_y)
-                    
-                    # Click 1: Give the iframe focus
                     await page.mouse.down()
                     await page.mouse.up()
                     await page.wait_for_timeout(1500)
-                    
-                    # Click 2: Trigger Play inside the iframe
                     await page.mouse.down()
                     await page.mouse.up()
                     
                     await page.wait_for_timeout(6000) 
                     
-                    # Rip RAM and Burn Ads from all cross-origin frames
-                    for frame in page.frames:
+                    # Combine the main page and all child iframes into one search list
+                    frames_to_search = [page.main_frame] + page.frames
+                    
+                    # Rip RAM and Burn Ads from ALL frames
+                    for frame in frames_to_search:
                         if "google" in frame.url or "blank" in frame.url or "magsrv" in frame.url: continue
                         
                         try:
+                            # Try to click native play buttons directly via JS
+                            await frame.evaluate("document.querySelectorAll('.play-button, .vjs-big-play-button, video').forEach(b => b.click());")
                             await frame.evaluate("document.querySelectorAll('video').forEach(v => { v.muted = true; v.playbackRate = 16.0; });")
                             
                             res = await frame.evaluate('''() => {
@@ -506,11 +506,11 @@ class DownloaderEngine:
                             pass
                             
                     if jw_url:
-                        self.db.log_trace(jid, "RAM Ripper successful from cross-origin iframe!")
+                        self.db.log_trace(jid, "RAM Ripper successful!")
                         extracted_payload["url"] = jw_url
                         
                 except Exception as e:
-                    self.db.log_trace(jid, f"Iframe simulation warning: {e}")
+                    self.db.log_trace(jid, f"Simulation warning: {e}")
 
                 # ─── 4. BULLETPROOF PAYLOAD SELECTION ───
                 if not extracted_payload.get("url"):
