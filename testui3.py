@@ -418,19 +418,38 @@ class DownloaderEngine:
                     
             page.on("response", handle_response)
 
-            # ─── SAFE UI ROUTER (SAVES BANDWIDTH) ───
-            async def handle_route(route):
-                if route.request.resource_type == "image":
-                    await route.abort()
-                else:
-                    try: await route.continue_()
-                    except Exception: pass
-
-            await page.route("**/*", handle_route)
-
-            try:
-                self.db.log_trace(jid, "Navigating to main target URL...")
-                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            # ─── WIDENED RESPONSE-BASED SNIFFER ───
+            async def handle_response(response):
+                try:
+                    req = response.request
+                    url_lower = req.url.lower()
+                    content_type = response.headers.get("content-type", "").lower()
+                    
+                    bad_keywords = ["google", "analytics", "ad", "beacon", "vast", "blank", "trailer", "promo"]
+                    if any(bad in url_lower for bad in bad_keywords): return
+                    
+                    is_media = False
+                    vtype = "mp4"
+                    
+                    if "mpegurl" in content_type or "application/x-mpegurl" in content_type or ".m3u8" in url_lower:
+                        is_media = True
+                        vtype = "m3u8"
+                    elif "video/" in content_type or ".mp4" in url_lower or ".ts" in url_lower:
+                        is_media = True
+                        vtype = "mp4"
+                    elif "application/octet-stream" in content_type and req.resource_type in ["media", "xhr", "fetch"]:
+                        # Catch obfuscated binary media streams
+                        is_media = True
+                        vtype = "mp4"
+                        
+                    if is_media:
+                        found_urls.append({"type": vtype, "url": req.url})
+                        headers = await req.all_headers()
+                        capture_headers.update(headers)
+                except Exception:
+                    pass
+                    
+            page.on("response", handle_response)
                 
                 # ─── 1. SMART AGE GATE DEFEAT ───
                 try:
@@ -457,19 +476,38 @@ class DownloaderEngine:
                     self.db.log_trace(jid, f"Scanning main page and {len(page.frames)} child frames for video players...")
                     jw_url = None
                     
-                    # ─── UNIVERSAL CENTER-SCREEN CLICKER ───
-                    viewport = page.viewport_size
-                    center_x = viewport['width'] / 2
-                    center_y = viewport['height'] / 2
+            # ─── WIDENED RESPONSE-BASED SNIFFER ───
+            async def handle_response(response):
+                try:
+                    req = response.request
+                    url_lower = req.url.lower()
+                    content_type = response.headers.get("content-type", "").lower()
                     
-                    await page.mouse.move(center_x, center_y)
-                    await page.mouse.down()
-                    await page.mouse.up()
-                    await page.wait_for_timeout(1500)
-                    await page.mouse.down()
-                    await page.mouse.up()
+                    bad_keywords = ["google", "analytics", "ad", "beacon", "vast", "blank", "trailer", "promo"]
+                    if any(bad in url_lower for bad in bad_keywords): return
                     
-                    await page.wait_for_timeout(6000) 
+                    is_media = False
+                    vtype = "mp4"
+                    
+                    if "mpegurl" in content_type or "application/x-mpegurl" in content_type or ".m3u8" in url_lower:
+                        is_media = True
+                        vtype = "m3u8"
+                    elif "video/" in content_type or ".mp4" in url_lower or ".ts" in url_lower:
+                        is_media = True
+                        vtype = "mp4"
+                    elif "application/octet-stream" in content_type and req.resource_type in ["media", "xhr", "fetch"]:
+                        # Catch obfuscated binary media streams
+                        is_media = True
+                        vtype = "mp4"
+                        
+                    if is_media:
+                        found_urls.append({"type": vtype, "url": req.url})
+                        headers = await req.all_headers()
+                        capture_headers.update(headers)
+                except Exception:
+                    pass
+                    
+            page.on("response", handle_response) 
                     
                     # Combine the main page and all child iframes into one search list
                     frames_to_search = [page.main_frame] + page.frames
