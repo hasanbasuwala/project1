@@ -999,26 +999,29 @@ class CrashCourier:
         job_dir = JOBS_DIR / f"JOB_{jid}"
         
         if job_dir.exists():
-            zip_target = JOBS_DIR / f"JOB_{jid}_diagnostic"
-            zip_file = f"{zip_target}.zip"
+            zip_target = JOBS_DIR / f"JOB_{jid}_diagnostic.zip"
             
             try:
-                # Zip the entire job directory (includes trace.log, HAR files, FFmpeg debugs)
-                shutil.make_archive(str(zip_target), 'zip', str(job_dir))
+                import zipfile
+                # Only bundle diagnostic files, NOT the corrupted video chunks
+                with zipfile.ZipFile(str(zip_target), 'w', zipfile.ZIP_DEFLATED) as zf:
+                    for root, dirs, files in os.walk(job_dir):
+                        for file in files:
+                            if file.endswith(('.log', '.html', '.json', '.png', '.txt')):
+                                file_path = os.path.join(root, file)
+                                arcname = os.path.relpath(file_path, job_dir)
+                                zf.write(file_path, arcname)
                 
-                # Push the diagnostic package to Telegram
-                await app.send_document(chat_id, document=zip_file, caption=cap)
+                await app.send_document(chat_id, document=str(zip_target), caption=cap)
                 
             except Exception as e:
-                # Failsafe: If zipping fails (e.g., file lock), attempt to just send the trace log
                 log_path = job_dir / "trace.log"
                 if log_path.exists():
                     try: await app.send_document(chat_id, document=str(log_path), caption=f"{cap}\n*(Failed to zip dir: {e})*")
                     except Exception: pass
             finally:
-                # Cleanup the diagnostic zip to prevent disk bloat
-                if os.path.exists(zip_file):
-                    try: os.remove(zip_file)
+                if os.path.exists(zip_target):
+                    try: os.remove(zip_target)
                     except Exception: pass
 
 class RecoveryManager:
