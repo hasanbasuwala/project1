@@ -204,6 +204,50 @@ class DownloaderEngine:
                 "raw_cookies": payload.get("raw_cookies", [])
             }
             json.dump(safe_payload, f)
+            
+    async def _pre_download_validation(self, url: str, jid: str, headers: dict, cookie_str: str) -> bool:
+        import aiohttp
+        self.db.log_trace(jid, "Performing pre-download HTTP validation...")
+        
+        req_headers = headers.copy() if headers else {}
+        if cookie_str:
+            req_headers['Cookie'] = cookie_str
+            
+        try:
+            # Use a GET request but stream it so we only read the headers, not the massive payload
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=req_headers, allow_redirects=True) as response:
+                    status = response.status
+                    content_type = response.headers.get("Content-Type", "").lower()
+                    content_length = int(response.headers.get("Content-Length", 0))
+                    final_url = str(response.url).lower()
+                    
+                    self.db.log_trace(jid, f"Pre-check: HTTP {status} | Type: {content_type} | Size: {content_length}")
+                    
+                    if status >= 400:
+                        self.db.log_trace(jid, f"Pre-check failed: HTTP {status}")
+                        return False
+                        
+                    # Redirect Validation
+                    if "login" in final_url or "captcha" in final_url:
+                        self.db.log_trace(jid, "Pre-check failed: Redirected to login/captcha page.")
+                        return False
+                        
+                    # MIME Type Validation
+                    invalid_types = ["text/html", "application/json", "text/plain"]
+                    if any(bad in content_type for bad in invalid_types):
+                        self.db.log_trace(jid, f"Pre-check failed: Invalid Content-Type '{content_type}'")
+                        return False
+                        
+                    # File Size Validation
+                    if content_length > 0 and content_length < 100000:
+                        self.db.log_trace(jid, "Pre-check failed: Content-Length suspiciously small (<100KB).")
+                        return False
+                        
+                    return True
+        except Exception as e:
+            self.db.log_trace(jid, f"Pre-check warning: Could not ping server ({e}). Proceeding to downloader anyway.")
+            return True
 
     async def execute(self, job_data: dict):
         jid, url, strategy, quality = job_data['id'], job_data['url'], job_data['strategy'], job_data['quality']
