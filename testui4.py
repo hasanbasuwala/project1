@@ -1240,7 +1240,16 @@ class PipelineManager:
     def __init__(self, app: Client, db: JobScheduler):
         self.app, self.db = app, db
         self.dl_q, self.enc_q, self.up_q = asyncio.Queue(), asyncio.Queue(), asyncio.Queue()
-        self.dl_engine, self.enc_engine, self.up_engine = DownloaderEngine(db, app), EncoderEngine(db), UploaderEngine(db, app)
+        
+        # ─── NEW: LIVE CANCELLATION STATE ───
+        self.cancelled: set[str] = set()
+        self.live_procs: dict[str, asyncio.subprocess.Process] = {}
+        # ────────────────────────────────────
+        
+        # Pass the pipeline reference to the engines so they can check the cancel flag
+        self.dl_engine = DownloaderEngine(db, app, self)
+        self.enc_engine = EncoderEngine(db, self)
+        self.up_engine = UploaderEngine(db, app, self)
 
     async def _worker_loop(self, queue: asyncio.Queue, engine, start_stage: Stage, success_stage: Stage, next_q: asyncio.Queue = None):
         while True:
@@ -1248,7 +1257,8 @@ class PipelineManager:
             job = await self.db.get_job(jid)
             retry = job.get('retries', 0)
 
-            if job.get('stage') == Stage.CANCELLED.value: 
+            # Check if job was cancelled before we even start
+            if not job or jid in self.cancelled or job.get('stage') == Stage.CANCELLED.value: 
                 queue.task_done()
                 continue
 
@@ -1256,10 +1266,12 @@ class PipelineManager:
                 await self.db.update_job(jid, stage=start_stage.value, retries=retry)
                 await engine.execute(job)
                 
-                # SYS_OP: Wipe the recovery tag upon successful completion of the phase
                 await self.db.update_job(jid, stage=success_stage.value, retries=0, recovered_at_stage=None)
-                
                 if next_q: await next_q.put(jid)
+                
+            except CancelledJobError:
+                # NEW: Don't retry, don't push to the next queue, just stop cleanly[span_5](start_span)[span_5](end_span).
+                await self.db.log_trace(jid, "Job cancelled mid-stage; halted cleanly.")
             except Exception as e:
                 retry += 1
                 if retry >= MAX_RETRIES: 
