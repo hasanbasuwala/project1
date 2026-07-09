@@ -959,20 +959,32 @@ class UploaderEngine:
         except Exception as e:
             self.db.log_trace(jid, f"Failed to push final completion card: {e}")
 
-        # ─── INJECTED DIAGNOSTIC DUMP ───
+        # ─── INJECTED DIAGNOSTIC DUMP (LIGHTWEIGHT) ───
         try:
-            self.db.log_trace(jid, "Zipping diagnostic data before cleanup...")
-            zip_target = JOBS_DIR / f"JOB_{jid}_diagnostic_success"
-            zip_file = f"{zip_target}.zip"
+            self.db.log_trace(jid, "Zipping lightweight diagnostic data before cleanup...")
+            zip_target = str(JOBS_DIR / f"JOB_{jid}_diagnostic_success.zip")
             
-            import shutil # Ensure this is imported at the top of your file
-            shutil.make_archive(str(zip_target), 'zip', str(job_dir))
+            # 1. Nuke any lingering zip file from previous runs to prevent appending
+            if os.path.exists(zip_target):
+                os.remove(zip_target)
             
-            cap = f"🕵️ **SUCCESS DEBUG**\nPayload captured for `{jid}`.\nAnalyze this zip to see what was actually downloaded."
-            await self.app.send_document(job_data['chat_id'], document=zip_file, caption=cap)
+            # 2. Build a fresh zip using strict file extension whitelisting
+            import zipfile
+            with zipfile.ZipFile(zip_target, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for root, dirs, files in os.walk(job_dir):
+                    for file in files:
+                        # STRICT FILTER: Ignore absolutely everything except these 5 extensions
+                        if file.lower().endswith(('.log', '.html', '.json', '.png', '.txt')):
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, job_dir)
+                            zf.write(file_path, arcname)
             
-            if os.path.exists(zip_file):
-                os.remove(zip_file)
+            cap = f"🕵️ **SUCCESS DEBUG**\nPayload captured for `{jid}`.\n(Video files excluded to save space)."
+            await self.app.send_document(job_data['chat_id'], document=zip_target, caption=cap)
+            
+            # 3. Clean up the zip after sending
+            if os.path.exists(zip_target):
+                os.remove(zip_target)
         except Exception as e:
             self.db.log_trace(jid, f"Failed to send success debug zip: {e}")
         # ────────────────────────────────
