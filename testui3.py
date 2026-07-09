@@ -672,13 +672,96 @@ class EncoderEngine:
     def __init__(self, scheduler: JobScheduler):
         self.db = scheduler
 
+    async def validate_media_file(self, file_path: Path, jid: str) -> bool:
+        """
+        Validates the downloaded file before handing it to FFmpeg.
+        Implements checks for size, HTML magic bytes, and ffprobe stream verification.
+        """
+        import json
+        
+        if not file_path.exists():
+            self.db.log_trace(jid, f"Validation failed: File does not exist at {file_path}")
+            return False
+
+        # ─── 1. FILE SIZE CHECK ───
+        size_bytes = file_path.stat().st_size
+        size_mb = size_bytes / (1024 * 1024)
+        self.db.log_trace(jid, f"Validation: File size is {size_mb:.2f} MB")
+        
+        # If it is less than 100KB, it is likely an error page or tiny broken payload
+        if size_bytes < 100000:  
+            self.db.log_trace(jid, "Validation failed: File is suspiciously small. Likely an HTML error page.")
+            return False
+
+        # ─── 2. MAGIC BYTES / HTML CHECK ───
+        try:
+            with open(file_path, 'rb') as f:
+                # Read the first 256 bytes to sniff the headers
+                header = f.read(256).lower()
+                if b'<!doctype html' in header or b'<html' in header:
+                    self.db.log_trace(jid, "Validation failed: File contains HTML magic bytes. Download aborted.")
+                    return False
+        except Exception as e:
+            self.db.log_trace(jid, f"Validation warning: Could not read magic bytes: {e}")
+
+        # ─── 3. FFPROBE STREAM VERIFICATION ───
+        self.db.log_trace(jid, "Validation: Running ffprobe stream analysis...")
+        try:
+            process = await asyncio.create_subprocess_exec(
+                'ffprobe',
+                '-v', 'error',
+                '-show_entries', 'format=duration:stream=codec_type',
+                '-of', 'json',
+                str(file_path),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                self.db.log_trace(jid, f"Validation failed: ffprobe rejected the file. Error: {stderr.decode().strip()}")
+                return False
+                
+            probe_data = json.loads(stdout.decode())
+            
+            # Save the ffprobe JSON alongside the download as recommended for diagnostics
+            probe_dump_path = file_path.with_suffix('.probe.json')
+            with open(probe_dump_path, 'w') as f:
+                json.dump(probe_data, f, indent=4)
+                
+            # Verify the file actually contains a video stream
+            streams = probe_data.get('streams', [])
+            has_video = any(s.get('codec_type') == 'video' for s in streams)
+            
+            if not has_video:
+                self.db.log_trace(jid, "Validation failed: ffprobe found no video streams.")
+                return False
+                
+            self.db.log_trace(jid, "Validation passed: Valid video stream confirmed.")
+            return True
+
+        except Exception as e:
+            self.db.log_trace(jid, f"Validation critical failure during ffprobe execution: {e}")
+            return False
+
     async def execute(self, job_data: dict):
         jid = job_data['id']
         dl_dir, enc_dir, thumb_dir = JOBS_DIR / f"JOB_{jid}" / "dl", JOBS_DIR / f"JOB_{jid}" / "enc", JOBS_DIR / f"JOB_{jid}" / "thumb"
         
         dl_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".flv", ".php"]]
+        
+        if not dl_files:
+            raise RuntimeError("Encoder failed: No downloaded files found to process.")
+            
         dl_file = max(dl_files, key=lambda p: p.stat().st_size)
         enc_file, thumb_file = enc_dir / f"{jid}.mp4", thumb_dir / f"{jid}.jpg"
+
+        # ─── INJECTED VALIDATION GATE ───
+        self.db.log_trace(jid, "Running Pre-FFmpeg Validation Gate...")
+        is_valid = await self.validate_media_file(dl_file, jid)
+        if not is_valid:
+            raise RuntimeError("Validation Gate Failed: The downloaded payload is not a valid media file. Discarding payload.")
+        # ────────────────────────────────
 
         self.db.log_trace(jid, "Entering FFmpeg Sandbox...")
         
