@@ -596,6 +596,7 @@ class DownloaderEngine:
             return extracted_payload
 
     async def _run_ffmpeg_capture(self, url: str, jid: str, dl_dir: Path, headers: dict, cookie_str: str) -> bool:
+        import re
         out_file = dl_dir / f"{jid}.mp4"
         debug_log_file = dl_dir / f"{jid}_ffmpeg_debug.log"
         
@@ -604,7 +605,6 @@ class DownloaderEngine:
         if cookie_str: 
             header_arg += f"Cookie: {cookie_str}\r\n"
         
-        # Injecting debug loglevel to monitor the HTTP handshake
         cmd = [
             "ffmpeg", "-y", 
             "-loglevel", "debug", 
@@ -612,24 +612,44 @@ class DownloaderEngine:
             "-i", url, "-c", "copy", "-bsf:a", "aac_adtstoasc", str(out_file)
         ]
         
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        _, stderr = await proc.communicate()
+        # Connect stderr to a pipe so we can read it in real-time
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        )
         
-        # Dump the raw stderr to a debug file for deep inspection
         with open(debug_log_file, "wb") as f:
-            f.write(stderr)
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    break
+                f.write(line) # Still save to debug log for troubleshooting
+                
+                line_str = line.decode('utf-8', errors='ignore')
+                
+                # Parse FFmpeg's real-time progress stream (e.g., size= 1280kB time=00:00:10.50 speed=1.02x)
+                if "size=" in line_str and "time=" in line_str:
+                    try:
+                        m_size = re.search(r"size=\s*([0-9A-Za-z]+)", line_str)
+                        m_speed = re.search(r"speed=\s*([0-9\.]+x)", line_str)
+                        
+                        size_val = m_size.group(1) if m_size else ""
+                        speed_val = m_speed.group(1) if m_speed else "1.0x"
+                        
+                        if size_val:
+                            # Push the live metrics to the database so the UI Accumulator catches it
+                            stage_str = f"downloading | {speed_val} speed | {size_val} DL"
+                            await self.db.update_job(jid, stage=stage_str)
+                            
+                            # Also update the local terminal bridge
+                            global _live_ui_text
+                            _live_ui_text[jid] = f"[ffmpeg] {size_val} at {speed_val}"
+                    except Exception:
+                        pass
+        
+        await proc.wait()
         
         if proc.returncode == 0 and out_file.exists() and out_file.stat().st_size > 1024:
             return True
-            
-        # Parse the error stream to surface the exact HTTP failure to the main orchestrator log
-        try:
-            err_text = stderr.decode('utf-8', errors='ignore')
-            http_errors = [line.strip() for line in err_text.split('\n') if 'HTTP' in line or '403' in line or 'Forbidden' in line]
-            if http_errors:
-                self.db.log_trace(jid, f"PASS 8 FFmpeg HTTP Trace: {http_errors[-1]}")
-        except Exception:
-            pass
             
         return False
 
