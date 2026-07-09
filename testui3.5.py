@@ -1011,27 +1011,35 @@ class CrashCourier:
         job_dir = JOBS_DIR / f"JOB_{jid}"
         
         if job_dir.exists():
-            zip_target = JOBS_DIR / f"JOB_{jid}_diagnostic.zip"
+            zip_target = str(JOBS_DIR / f"JOB_{jid}_diagnostic.zip")
+            
+            # 1. Nuke any lingering zip file from previous crashes
+            if os.path.exists(zip_target):
+                try: os.remove(zip_target)
+                except Exception: pass
             
             try:
+                # 2. Build a fresh zip using strict file extension whitelisting
                 import zipfile
-                # Only bundle diagnostic files, NOT the corrupted video chunks
-                with zipfile.ZipFile(str(zip_target), 'w', zipfile.ZIP_DEFLATED) as zf:
+                with zipfile.ZipFile(zip_target, 'w', zipfile.ZIP_DEFLATED) as zf:
                     for root, dirs, files in os.walk(job_dir):
                         for file in files:
-                            if file.endswith(('.log', '.html', '.json', '.png', '.txt')):
+                            # STRICT FILTER: Ignore absolutely everything except these 5 extensions
+                            if file.lower().endswith(('.log', '.html', '.json', '.png', '.txt')):
                                 file_path = os.path.join(root, file)
                                 arcname = os.path.relpath(file_path, job_dir)
                                 zf.write(file_path, arcname)
                 
-                await app.send_document(chat_id, document=str(zip_target), caption=cap)
+                await app.send_document(chat_id, document=zip_target, caption=cap)
                 
             except Exception as e:
+                # Fallback: Just send the raw trace.log if zipping fails entirely
                 log_path = job_dir / "trace.log"
                 if log_path.exists():
                     try: await app.send_document(chat_id, document=str(log_path), caption=f"{cap}\n*(Failed to zip dir: {e})*")
                     except Exception: pass
             finally:
+                # 3. Clean up the zip after sending
                 if os.path.exists(zip_target):
                     try: os.remove(zip_target)
                     except Exception: pass
