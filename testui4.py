@@ -781,8 +781,9 @@ class DownloaderEngine:
             raise RuntimeError("Aria2c failed: No media payloads found in output directory. The link might be dead or geo-blocked.")
 
 class EncoderEngine:
-    def __init__(self, scheduler: JobScheduler):
+    def __init__(self, scheduler: JobScheduler, pipeline: PipelineManager):
         self.db = scheduler
+        self.pipeline = pipeline
 
     async def validate_media_file(self, file_path: Path, jid: str) -> bool:
         """
@@ -819,15 +820,34 @@ class EncoderEngine:
         # ─── 3. FFPROBE STREAM VERIFICATION ───
         self.db.log_trace(jid, "Validation: Running ffprobe stream analysis...")
         try:
-            process = await asyncio.create_subprocess_exec(
-                'ffprobe',
-                '-v', 'error',
-                '-show_entries', 'format=duration:stream=codec_type',
-                '-of', 'json',
-                str(file_path),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
+           proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-nostdin", 
+            "-fflags", "+genpts", 
+            "-i", str(dl_file), 
+            "-c:v", "copy", 
+            "-c:a", "aac", 
+            "-avoid_negative_ts", "make_zero", 
+            "-movflags", "+faststart", 
+            str(enc_file), 
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        self.pipeline.live_procs[jid] = proc
+        try:
+            while True:
+                if jid in self.pipeline.cancelled:
+                    proc.kill()
+                    raise CancelledJobError(jid)
+                
+                line = await proc.stderr.readline()
+                if not line: break
+                
+        except CancelledJobError:
+            raise
+        except Exception:
+            proc.kill()
+            raise TimeoutError("FFmpeg Zombie Sandbox Timeout: Corrupted video headers caused process hang.")
+        finally:
+            self.pipeline.live_procs.pop(jid, None)
             stdout, stderr = await process.communicate()
             
             if process.returncode != 0:
