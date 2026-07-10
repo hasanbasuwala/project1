@@ -626,6 +626,16 @@ class DownloaderEngine:
             *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
         )
         
+        total_duration_sec = 0.0
+        
+        def parse_time_to_sec(time_str: str) -> float:
+            """Helper to convert HH:MM:SS.ms to total seconds."""
+            try:
+                h, m, s = time_str.split(':')
+                return float(h) * 3600 + float(m) * 60 + float(s)
+            except Exception:
+                return 0.0
+
         with open(debug_log_file, "wb") as f:
             while True:
                 line = await proc.stderr.readline()
@@ -635,23 +645,37 @@ class DownloaderEngine:
                 
                 line_str = line.decode('utf-8', errors='ignore')
                 
-                # Parse FFmpeg's real-time progress stream (e.g., size= 1280kB time=00:00:10.50 speed=1.02x)
+                # 1. Capture Total Duration from FFmpeg startup logs
+                if total_duration_sec == 0.0 and "Duration:" in line_str:
+                    m_dur = re.search(r"Duration:\s*([0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+)", line_str)
+                    if m_dur:
+                        total_duration_sec = parse_time_to_sec(m_dur.group(1))
+                
+                # 2. Parse live progress metrics
                 if "size=" in line_str and "time=" in line_str:
                     try:
                         m_size = re.search(r"size=\s*([0-9A-Za-z]+)", line_str)
+                        m_time = re.search(r"time=\s*([0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+)", line_str)
                         m_speed = re.search(r"speed=\s*([0-9\.]+x)", line_str)
                         
                         size_val = m_size.group(1) if m_size else ""
+                        time_str = m_time.group(1) if m_time else ""
                         speed_val = m_speed.group(1) if m_speed else "1.0x"
                         
                         if size_val:
-                            # Push the live metrics to the database so the UI Accumulator catches it
+                            # 3. Calculate percentage based on extracted duration and current time
+                            current_pct = 0.0
+                            if total_duration_sec > 0 and time_str:
+                                current_sec = parse_time_to_sec(time_str)
+                                current_pct = min((current_sec / total_duration_sec) * 100, 100.0)
+                            
+                            # Push the live metrics and calculated percentage to the database
                             stage_str = f"downloading | {speed_val} speed | {size_val} DL"
-                            await self.db.update_job(jid, stage=stage_str)
+                            await self.db.update_job(jid, stage=stage_str, pct=current_pct)
                             
                             # Also update the local terminal bridge
                             global _live_ui_text
-                            _live_ui_text[jid] = f"[ffmpeg] {size_val} at {speed_val}"
+                            _live_ui_text[jid] = f"[ffmpeg] {size_val} at {speed_val} ({current_pct:.1f}%)"
                     except Exception:
                         pass
         
