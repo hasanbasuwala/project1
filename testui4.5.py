@@ -642,7 +642,6 @@ class DownloaderEngine:
         out_file = dl_dir / f"{jid}.mp4"
         debug_log_file = dl_dir / f"{jid}_ffmpeg_debug.log"
         
-        # Assemble headers
         header_arg = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
         if cookie_str: 
             header_arg += f"Cookie: {cookie_str}\r\n"
@@ -654,7 +653,6 @@ class DownloaderEngine:
             "-i", url, "-c", "copy", "-bsf:a", "aac_adtstoasc", str(out_file)
         ]
         
-        # Connect stderr to a pipe so we can read it in real-time
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
         )
@@ -662,7 +660,6 @@ class DownloaderEngine:
         total_duration_sec = 0.0
         
         def parse_time_to_sec(time_str: str) -> float:
-            """Helper to convert HH:MM:SS.ms to total seconds."""
             try:
                 h, m, s = time_str.split(':')
                 return float(h) * 3600 + float(m) * 60 + float(s)
@@ -674,17 +671,15 @@ class DownloaderEngine:
                 line = await proc.stderr.readline()
                 if not line:
                     break
-                f.write(line) # Still save to debug log for troubleshooting
+                f.write(line)
                 
                 line_str = line.decode('utf-8', errors='ignore')
                 
-                # 1. Capture Total Duration from FFmpeg startup logs
                 if total_duration_sec == 0.0 and "Duration:" in line_str:
                     m_dur = re.search(r"Duration:\s*([0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+)", line_str)
                     if m_dur:
                         total_duration_sec = parse_time_to_sec(m_dur.group(1))
                 
-                # 2. Parse live progress metrics
                 if "size=" in line_str and "time=" in line_str:
                     try:
                         m_size = re.search(r"size=\s*([0-9A-Za-z]+)", line_str)
@@ -696,17 +691,14 @@ class DownloaderEngine:
                         speed_val = m_speed.group(1) if m_speed else "1.0x"
                         
                         if size_val:
-                            # 3. Calculate percentage based on extracted duration and current time
                             current_pct = 0.0
                             if total_duration_sec > 0 and time_str:
                                 current_sec = parse_time_to_sec(time_str)
                                 current_pct = min((current_sec / total_duration_sec) * 100, 100.0)
                             
-                            # Push the live metrics and calculated percentage to the database
                             stage_str = f"downloading | {speed_val} speed | {size_val} DL"
                             await self.db.update_job(jid, stage=stage_str, pct=current_pct)
                             
-                            # Also update the local terminal bridge
                             global _live_ui_text
                             _live_ui_text[jid] = f"[ffmpeg] {size_val} at {speed_val} ({current_pct:.1f}%)"
                     except Exception:
@@ -719,7 +711,7 @@ class DownloaderEngine:
             
         return False
 
-    async def _run_ytdlp_with_cookies(self, url: str, jid: str, dl_dir: Path, headers: dict, raw_cookies: list) -> bool:
+    async def _run_ytdlp_with_cookies(self, url: str, jid: str, dl_dir: Path, headers: dict, raw_cookies: list, proxy_url: str = None) -> bool:
         cookie_path = dl_dir / f"{jid}_cookies.txt"
         
         with open(cookie_path, "w", encoding="utf-8") as f:
@@ -734,14 +726,15 @@ class DownloaderEngine:
                 value = c.get("value", "")
                 f.write(f"{domain}\t{inc_sub}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
 
-        # ─── FIX: RE-ARMING CHROME TLS IMPERSONATION ───
         opts = {
             "http_headers": headers,
             "cookiefile": str(cookie_path),
             "impersonate": ImpersonateTarget(client="chrome"), 
-            "extractor_args": {"generic": ["impersonate"]} # Forces the generic extractor to mask its TLS
+            "extractor_args": {"generic": ["impersonate"]}
         }
-        # ───────────────────────────────────────────────
+        
+        if proxy_url:
+            opts["proxy"] = proxy_url
             
         try:
             await asyncio.to_thread(self._execute_ytdlp, url, jid, dl_dir, opts)
