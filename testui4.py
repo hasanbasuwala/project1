@@ -40,8 +40,6 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 from pyrogram.errors import FloodWait, MessageNotModified
 from logging.handlers import RotatingFileHandler
 import config
-class CancelledJobError(Exception):
-    def __init__(self, jid): self.jid = jid
 
 # ──────────────────────────── CONFIGURATION ─────────────────────────────
 
@@ -177,10 +175,10 @@ class LinkClassifier:
 # ──────────────────────────── SUBSYSTEM 3: ENGINES ──────────────────────
 
 class DownloaderEngine:
-    def __init__(self, scheduler: JobScheduler, app: Client, pipeline: PipelineManager):
+    def __init__(self, scheduler: JobScheduler, app: Client):
         self.db = scheduler
         self.app = app
-        self.pipeline = pipeline
+        self.procs = {}
 
     # ─── PAYLOAD CACHING HELPERS ───
     def _get_payload_cache_path(self, dl_dir: Path) -> Path:
@@ -699,12 +697,6 @@ class DownloaderEngine:
             def error(self, msg): pass
 
         def prog_hook(d):
-            # NEW: yt-dlp cancellation check[span_12](start_span)[span_12](end_span).
-            if jid in self.pipeline.cancelled:
-                import yt_dlp
-                raise yt_dlp.utils.DownloadError(f"Cancelled by user: {jid}")
-                
-            # ... rest of the existing prog_hook logic
             if d.get("status") == "downloading":
                 try: 
                     pct_str = re.sub(r"\x1b[^m]*m", "", d.get("_percent_str", "0.0%")).strip()
@@ -744,14 +736,9 @@ class DownloaderEngine:
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=subprocess.DEVNULL
         )
-        self.pipeline.live_procs[jid] = proc
+        self.procs[jid] = proc
         try:
             while True:
-                # NEW: Check for cancellation during the read loop[span_13](start_span)[span_13](end_span).
-                if jid in self.pipeline.cancelled:
-                    proc.kill()
-                    raise CancelledJobError(jid)
-                    
                 chunk = await proc.stdout.readline()
                 if not chunk: break
                 chunk_str = chunk.decode("utf-8", errors="ignore").strip()
@@ -771,19 +758,16 @@ class DownloaderEngine:
                     else:
                         m2 = re.search(r"\((\d+)%\)", chunk_str)
                         if m2: await self.db.update_job(jid, pct=float(m2.group(1)))
-                # ... rest of aria2c processing loop
         finally:
-            await proc.wait()
-            self.pipeline.live_procs.pop(jid, None)
+            await proc.wait(); self.procs.pop(jid, None)
             
         valid_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".flv", ".php"]]
         if not valid_files: 
             raise RuntimeError("Aria2c failed: No media payloads found in output directory. The link might be dead or geo-blocked.")
 
 class EncoderEngine:
-    def __init__(self, scheduler: JobScheduler, pipeline: PipelineManager):
+    def __init__(self, scheduler: JobScheduler):
         self.db = scheduler
-        self.pipeline = pipeline
 
     async def validate_media_file(self, file_path: Path, jid: str) -> bool:
         """
@@ -820,34 +804,15 @@ class EncoderEngine:
         # ─── 3. FFPROBE STREAM VERIFICATION ───
         self.db.log_trace(jid, "Validation: Running ffprobe stream analysis...")
         try:
-           proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-nostdin", 
-            "-fflags", "+genpts", 
-            "-i", str(dl_file), 
-            "-c:v", "copy", 
-            "-c:a", "aac", 
-            "-avoid_negative_ts", "make_zero", 
-            "-movflags", "+faststart", 
-            str(enc_file), 
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        self.pipeline.live_procs[jid] = proc
-        try:
-            while True:
-                if jid in self.pipeline.cancelled:
-                    proc.kill()
-                    raise CancelledJobError(jid)
-                
-                line = await proc.stderr.readline()
-                if not line: break
-                
-        except CancelledJobError:
-            raise
-        except Exception:
-            proc.kill()
-            raise TimeoutError("FFmpeg Zombie Sandbox Timeout: Corrupted video headers caused process hang.")
-        finally:
-            self.pipeline.live_procs.pop(jid, None)
+            process = await asyncio.create_subprocess_exec(
+                'ffprobe',
+                '-v', 'error',
+                '-show_entries', 'format=duration:stream=codec_type',
+                '-of', 'json',
+                str(file_path),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
             stdout, stderr = await process.communicate()
             
             if process.returncode != 0:
@@ -1273,16 +1238,7 @@ class PipelineManager:
     def __init__(self, app: Client, db: JobScheduler):
         self.app, self.db = app, db
         self.dl_q, self.enc_q, self.up_q = asyncio.Queue(), asyncio.Queue(), asyncio.Queue()
-        
-        # ─── NEW: LIVE CANCELLATION STATE ───
-        self.cancelled: set[str] = set()
-        self.live_procs: dict[str, asyncio.subprocess.Process] = {}
-        # ────────────────────────────────────
-        
-        # Pass the pipeline reference to the engines so they can check the cancel flag
-        self.dl_engine = DownloaderEngine(db, app, self)
-        self.enc_engine = EncoderEngine(db, self)
-        self.up_engine = UploaderEngine(db, app, self)
+        self.dl_engine, self.enc_engine, self.up_engine = DownloaderEngine(db, app), EncoderEngine(db), UploaderEngine(db, app)
 
     async def _worker_loop(self, queue: asyncio.Queue, engine, start_stage: Stage, success_stage: Stage, next_q: asyncio.Queue = None):
         while True:
@@ -1290,8 +1246,7 @@ class PipelineManager:
             job = await self.db.get_job(jid)
             retry = job.get('retries', 0)
 
-            # Check if job was cancelled before we even start
-            if not job or jid in self.cancelled or job.get('stage') == Stage.CANCELLED.value: 
+            if job.get('stage') == Stage.CANCELLED.value: 
                 queue.task_done()
                 continue
 
@@ -1299,12 +1254,10 @@ class PipelineManager:
                 await self.db.update_job(jid, stage=start_stage.value, retries=retry)
                 await engine.execute(job)
                 
+                # SYS_OP: Wipe the recovery tag upon successful completion of the phase
                 await self.db.update_job(jid, stage=success_stage.value, retries=0, recovered_at_stage=None)
-                if next_q: await next_q.put(jid)
                 
-            except CancelledJobError:
-                # NEW: Don't retry, don't push to the next queue, just stop cleanly[span_5](start_span)[span_5](end_span).
-                await self.db.log_trace(jid, "Job cancelled mid-stage; halted cleanly.")
+                if next_q: await next_q.put(jid)
             except Exception as e:
                 retry += 1
                 if retry >= MAX_RETRIES: 
@@ -1659,18 +1612,10 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         if cb.data.startswith("kill|"):
             jid = cb.data.split("|")[1]
             await pipeline_ref.db.log_trace(jid, "SYS_OP INITIATED MANUAL OVERRIDE: KILL COMMAND RECEIVED.")
+            await pipeline_ref.db.delete_job(jid)
             
-            # 1. Flag it so any stage-loop checking this id will stop itself[span_7](start_span)[span_7](end_span).
-            pipeline_ref.cancelled.add(jid)
-            
-            # 2. Kill whatever subprocess is currently attached to this job, if any[span_8](start_span)[span_8](end_span).
-            proc = pipeline_ref.live_procs.get(jid)
-            if proc and proc.returncode is None:
-                try: proc.kill()
-                except Exception: pass
-                
-            # 3. Mark the row CANCELLED instead of deleting it outright[span_9](start_span)[span_9](end_span).
-            await pipeline_ref.db.update_job(jid, stage="cancelled")
+            job_dir = JOBS_DIR / f"JOB_{jid}"
+            shutil.rmtree(job_dir, ignore_errors=True)
             
             if _dashboard_msg_id != cb.message.id:
                 try: await cb.message.edit_text(f"💀 **TASK TERMINATED:** `JOB_{jid}`", reply_markup=None)
@@ -1680,14 +1625,7 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
                     text, kb = await _get_dashboard_components(_dashboard_tab, pipeline_ref.db, pipeline_ref)
                     await cb.message.edit_text(text, reply_markup=kb)
                 except Exception: pass
-            
-            await cb.answer("Kill signal sent.", show_alert=True)
-            
-            # 4. Give the running task a moment to notice the flag / process death, then clean up state and files[span_10](start_span)[span_10](end_span).
-            await asyncio.sleep(0.5)
-            await pipeline_ref.db.delete_job(jid)
-            pipeline_ref.cancelled.discard(jid)
-            shutil.rmtree(JOBS_DIR / f"JOB_{jid}", ignore_errors=True)
+            await cb.answer("Process terminated and payload destroyed.", show_alert=True)
             return
 
 # ──────────────────────────── EVENT LOOPS ─────────────────────────────
