@@ -27,6 +27,8 @@ import sqlite3
 from enum import Enum
 from pathlib import Path
 import yt_dlp
+import aiohttp
+import random
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
 try:
@@ -171,6 +173,22 @@ class LinkClassifier:
         if "youtube.com" in u or "youtu.be" in u: return "YOUTUBE"
         if ".mp4" in u or "direct-mp4" in u: return "DIRECT_MP4"
         return "GENERIC_FALLBACK"
+
+async def get_random_free_proxy() -> str:
+    """Fetches a random HTTP proxy from the Proxifly GitHub repository."""
+    url = "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    text = await response.text()
+                    proxies = [line.strip() for line in text.split('\n') if line.strip()]
+                    if proxies:
+                        selected = random.choice(proxies)
+                        return f"http://{selected}"
+    except Exception as e:
+        print(f"Proxy fetch failed: {e}")
+    return ""
 
 # ──────────────────────────── SUBSYSTEM 3: ENGINES ──────────────────────
 
