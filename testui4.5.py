@@ -292,7 +292,9 @@ class DownloaderEngine:
             await self._run_aria(url, jid, dl_dir)
             return
             
+        # --- PHASE 1: EXTRACTION WITH PROXY CASCADING ---
         playwright_data = self._load_cached_payload(dl_dir)
+        used_proxy = None
         
         if not playwright_data:
             variant_success = await self._attempt_ytdlp_variants(url, jid, dl_dir)
@@ -300,8 +302,28 @@ class DownloaderEngine:
                 return
 
             self.db.log_trace(jid, "yt-dlp variants failed. Escalating to Playwright extraction...")
-            playwright_data = await self._run_playwright_extraction(url, jid, dl_dir)
             
+            # Try up to 3 different proxies before attempting a local fallback
+            for attempt in range(3):
+                proxy_url = await get_random_free_proxy()
+                self.db.log_trace(jid, f"Extraction attempt {attempt + 1}/3 using proxy: {proxy_url}")
+                
+                try:
+                    playwright_data = await self._run_playwright_extraction(url, jid, dl_dir, proxy_url)
+                    if playwright_data and playwright_data.get('url'):
+                        self.db.log_trace(jid, "Extraction successful via proxy.")
+                        used_proxy = proxy_url
+                        break
+                except Exception as e:
+                    self.db.log_trace(jid, f"Proxy attempt failed: {e}")
+            else:
+                # Absolute last resort fallback to local Wi-Fi
+                self.db.log_trace(jid, "All proxies exhausted. Falling back to direct local Wi-Fi for extraction...")
+                try:
+                    playwright_data = await self._run_playwright_extraction(url, jid, dl_dir, proxy_url=None)
+                except Exception as e:
+                    raise RuntimeError(f"PASS 11 FAILED: Target is completely unreachable. Error: {e}")
+
             if not playwright_data or not playwright_data.get('url'):
                 raise RuntimeError("PASS 11 FAILED: All extraction methods exhausted. Target is highly protected.")
             
@@ -317,11 +339,15 @@ class DownloaderEngine:
 
         self.db.log_trace(jid, "Delegating authorized payload downstream...")
 
-        # ─── INJECTED PRE-DOWNLOAD VALIDATION GATE ───
-        is_valid_url = await self._pre_download_validation(extracted_url, jid, headers, cookie_str)
+        # --- PHASE 2: INJECTED PRE-DOWNLOAD VALIDATION GATES ---
+        is_valid_url = await self._pre_download_validation(extracted_url, jid, headers, cookie_str, proxy_url=None)
+        
+        # Cross-validate through the extraction proxy (IP Binding issue check)
+        if not is_valid_url and used_proxy:
+            self.db.log_trace(jid, "Local validation failed. Retrying validation gate through the extraction proxy (Checking IP Binding)...")
+            is_valid_url = await self._pre_download_validation(extracted_url, jid, headers, cookie_str, proxy_url=used_proxy)
+
         if not is_valid_url:
-            # ─── CACHE INVALIDATION ───
-            # Nuke the toxic payload cache so the next retry starts completely fresh
             cache_file = self._get_payload_cache_path(dl_dir)
             if cache_file and cache_file.exists():
                 try:
@@ -330,22 +356,25 @@ class DownloaderEngine:
                     self.db.log_trace(jid, "Toxic payload cache purged.")
                 except Exception:
                     pass
-            # ──────────────────────────
             raise RuntimeError("Pre-Download Validation Failed: Target URL points to HTML/Text, not a media file.")
-        # ─────────────────────────────────────────────
 
+        # --- PHASE 3: DOWNSTREAM ENGINES ---
         if ".m3u8" in extracted_url:
-            self.db.log_trace(jid, "PASS 8: Attempting FFmpeg direct capture with exported cookies...")
+            self.db.log_trace(jid, "PASS 8: Attempting FFmpeg direct capture over local Wi-Fi...")
             if await self._run_ffmpeg_capture(extracted_url, jid, dl_dir, headers, cookie_str):
                 return
-            self.db.log_trace(jid, "PASS 8 FAILED: FFmpeg direct stream capture aborted.")
+            self.db.log_trace(jid, "PASS 8 FAILED: FFmpeg stream capture dropped.")
 
-        self.db.log_trace(jid, "PASS 9: Attempting yt-dlp with exported Netscape cookiefile...")
-        if await self._run_ytdlp_with_cookies(extracted_url, jid, dl_dir, headers, raw_cookies):
+        self.db.log_trace(jid, "PASS 9: Attempting yt-dlp cookie bypass over direct local connection...")
+        if await self._run_ytdlp_with_cookies(extracted_url, jid, dl_dir, headers, raw_cookies, proxy_url=None):
             return
-        self.db.log_trace(jid, "PASS 9 FAILED: yt-dlp cookie authentication rejected.")
 
-        self.db.log_trace(jid, "PASS 10: Attempting Aria2c full header replay bypass...")
+        if used_proxy:
+            self.db.log_trace(jid, f"PASS 9 (Retry): Local download failed. Tunneling yt-dlp through matching session proxy: {used_proxy}")
+            if await self._run_ytdlp_with_cookies(extracted_url, jid, dl_dir, headers, raw_cookies, proxy_url=used_proxy):
+                return
+
+        self.db.log_trace(jid, "PASS 10: Attempting Aria2c full header replay bypass locally...")
         try:
             full_headers = headers.copy()
             if cookie_str:
@@ -353,9 +382,9 @@ class DownloaderEngine:
             await self._run_aria(extracted_url, jid, dl_dir, headers=full_headers)
             return
         except Exception as e:
-            self.db.log_trace(jid, f"PASS 10 FAILED: Aria2c bypass failed. Error: {e}")
+            self.db.log_trace(jid, f"PASS 10 FAILED: Aria2c local bypass failed. Error: {e}")
             
-        raise RuntimeError("PASS 11 FAILED: CDNs are blocking TLS signatures on all vectors.")
+        raise RuntimeError("PASS 11 FAILED: CDNs are blocking signatures or dropping connections on all interface vectors.")
 
     async def _attempt_ytdlp_variants(self, url: str, jid: str, dl_dir: Path) -> bool:
         variants = [
