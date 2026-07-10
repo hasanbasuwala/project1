@@ -403,7 +403,7 @@ class DownloaderEngine:
                 self.db.log_trace(jid, f"{pass_name} FAILED: {str(e)[:100]}")
         return False
 
-    async def _run_playwright_extraction(self, url: str, jid: str, dl_dir: Path) -> dict:
+    async def _run_playwright_extraction(self, url: str, jid: str, dl_dir: Path, proxy_url: str = None) -> dict:
         from playwright.async_api import async_playwright
         from playwright_stealth import Stealth 
         import shutil
@@ -415,12 +415,15 @@ class DownloaderEngine:
         extracted_payload = {"url": None, "headers": {}, "cookie_str": "", "raw_cookies": []}
         found_urls = []
         capture_headers = {}
+
+        proxy_config = {"server": proxy_url} if proxy_url else None
         
         async with async_playwright() as p:
             context = await p.chromium.launch_persistent_context(
                 user_data_dir,
                 headless=True,
-                executable_path="/usr/bin/chromium",  # <--- INJECT SYSTEM CHROMIUM HERE
+                proxy=proxy_config,
+                executable_path="/usr/bin/chromium",
                 user_agent=USER_AGENT,
                 viewport={"width": 1920, "height": 1080},
                 locale="en-US",
@@ -439,7 +442,6 @@ class DownloaderEngine:
             await Stealth().apply_stealth_async(page)
             await page.wait_for_timeout(2000) 
 
-            # ─── WIDENED RESPONSE-BASED SNIFFER ───
             async def handle_response(response):
                 try:
                     req = response.request
@@ -484,12 +486,10 @@ class DownloaderEngine:
                 self.db.log_trace(jid, "Navigating to main target URL...")
                 await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 
-                # ─── VISUAL DIAGNOSTIC 1: INITIAL LOAD ───
                 try:
                     await page.screenshot(path=str(dl_dir / f"{jid}_01_initial_load.png"))
                 except Exception: pass
                 
-                # ─── 1. SMART AGE GATE DEFEAT ───
                 try:
                     age_gate = await page.wait_for_selector("a.av_btn.av_go[rel='yes']", state="visible", timeout=10000)
                     if age_gate:
@@ -499,12 +499,10 @@ class DownloaderEngine:
                 except Exception:
                     pass
 
-                # ─── VISUAL DIAGNOSTIC 2: POST-AGE GATE ───
                 try:
                     await page.screenshot(path=str(dl_dir / f"{jid}_02_post_age_gate.png"))
                 except Exception: pass
 
-                # ─── 2. SPAWN THE IFRAME (STAY ON PARENT PAGE) ───
                 try:
                     fake_player = await page.wait_for_selector("div.vi-on, div.play", state="visible", timeout=5000)
                     if fake_player:
@@ -514,17 +512,14 @@ class DownloaderEngine:
                 except Exception:
                     self.db.log_trace(jid, "No fake player overlay found. Proceeding...")
 
-                # ─── VISUAL DIAGNOSTIC 3: PRE-CLICK BOMB ───
                 try:
                     await page.screenshot(path=str(dl_dir / f"{jid}_03_pre_click_bomb.png"))
                 except Exception: pass
 
-                # ─── 3. UNIVERSAL INTERACTION & RAM RIPPER ───
                 try:
                     self.db.log_trace(jid, f"Scanning main page and {len(page.frames)} child frames for video players...")
                     jw_url = None
                     
-                    # ─── UNIVERSAL CLICK-BOMB STRATEGY ───
                     viewport = page.viewport_size
                     cx = viewport['width'] / 2
                     cy = viewport['height'] / 2
@@ -543,7 +538,6 @@ class DownloaderEngine:
                     
                     await page.wait_for_timeout(6000) 
                     
-                    # ─── VISUAL DIAGNOSTIC 4: POST-CLICK BOMB ───
                     try:
                         await page.screenshot(path=str(dl_dir / f"{jid}_04_post_click_bomb.png"))
                     except Exception: pass
@@ -586,7 +580,6 @@ class DownloaderEngine:
                 except Exception as e:
                     self.db.log_trace(jid, f"Simulation warning: {e}")
 
-                # ─── 4. BULLETPROOF PAYLOAD SELECTION ───
                 if not extracted_payload.get("url"):
                     self.db.log_trace(jid, "RAM Ripper missed. Checking Network Sniffer logs...")
                     m3u8s = [u["url"] for u in found_urls if u["type"] == "m3u8"]
@@ -613,7 +606,6 @@ class DownloaderEngine:
                 except Exception:
                     pass
 
-            # ─── HEADER & COOKIE EXTRACTION ───
             extracted_payload["headers"] = {
                 "Referer": url, 
                 "Origin": "/".join(url.split("/")[:3]),
