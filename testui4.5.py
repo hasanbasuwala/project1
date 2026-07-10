@@ -223,7 +223,7 @@ class DownloaderEngine:
             }
             json.dump(safe_payload, f)
             
-    async def _pre_download_validation(self, url: str, jid: str, headers: dict, cookie_str: str) -> bool:
+    async def _pre_download_validation(self, url: str, jid: str, headers: dict, cookie_str: str, proxy_url: str = None) -> bool:
         from curl_cffi.requests import AsyncSession
         self.db.log_trace(jid, "Performing pre-download hardened TLS validation via curl_cffi...")
         
@@ -231,9 +231,10 @@ class DownloaderEngine:
         if cookie_str:
             req_headers['Cookie'] = cookie_str
             
+        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+        
         try:
-            # impersonate="chrome" forces the underlying socket to use Chrome's exact JA3 TLS footprint
-            async with AsyncSession(impersonate="chrome") as session:
+            async with AsyncSession(impersonate="chrome", proxies=proxies) as session:
                 response = await session.get(url, headers=req_headers, allow_redirects=True, stream=True)
                 
                 status = response.status_code
@@ -243,36 +244,29 @@ class DownloaderEngine:
                 
                 self.db.log_trace(jid, f"Pre-check: HTTP {status} | Type: {content_type} | Size: {content_length}")
                 
-                # --- THE SOFT-FAIL BYPASS ---
-                # If the CDN still blocks us, do not kill the payload. Pass it to yt-dlp/aria2c.
                 if status == 403:
                     self.db.log_trace(jid, "Pre-check warning: HTTP 403 detected despite TLS impersonation. Overriding gate for downstream engines.")
                     return True
                 
-                # Hard fail for actual broken links or server errors
                 if status >= 400 and status != 403:
                     self.db.log_trace(jid, f"Pre-check failed: HTTP {status}")
                     return False
                     
-                # Redirect Validation
                 if "login" in final_url or "captcha" in final_url:
                     self.db.log_trace(jid, "Pre-check failed: Redirected to login/captcha page.")
                     return False
                     
-                # MIME Type Validation
                 invalid_types = ["text/html", "application/json", "text/plain"]
                 if any(bad in content_type for bad in invalid_types):
                     self.db.log_trace(jid, f"Pre-check failed: Invalid Content-Type '{content_type}'")
                     return False
                     
-                # File Size Validation
                 if content_length > 0 and content_length < 100000:
                     self.db.log_trace(jid, "Pre-check failed: Content-Length suspiciously small (<100KB).")
                     return False
                     
                 return True
         except Exception as e:
-            # Catch-all to prevent the gate from crashing the pipeline on timeouts or proxy errors
             self.db.log_trace(jid, f"Pre-check warning: Hardened ping encounter ({e}). Passing downstream to engine.")
             return True
 
