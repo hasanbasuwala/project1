@@ -206,47 +206,56 @@ class DownloaderEngine:
             json.dump(safe_payload, f)
             
     async def _pre_download_validation(self, url: str, jid: str, headers: dict, cookie_str: str) -> bool:
-        import aiohttp
-        self.db.log_trace(jid, "Performing pre-download HTTP validation...")
+        from curl_cffi.requests import AsyncSession
+        self.db.log_trace(jid, "Performing pre-download hardened TLS validation via curl_cffi...")
         
         req_headers = headers.copy() if headers else {}
         if cookie_str:
             req_headers['Cookie'] = cookie_str
             
         try:
-            # Use a GET request but stream it so we only read the headers, not the massive payload
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=req_headers, allow_redirects=True) as response:
-                    status = response.status
-                    content_type = response.headers.get("Content-Type", "").lower()
-                    content_length = int(response.headers.get("Content-Length", 0))
-                    final_url = str(response.url).lower()
-                    
-                    self.db.log_trace(jid, f"Pre-check: HTTP {status} | Type: {content_type} | Size: {content_length}")
-                    
-                    if status >= 400:
-                        self.db.log_trace(jid, f"Pre-check failed: HTTP {status}")
-                        return False
-                        
-                    # Redirect Validation
-                    if "login" in final_url or "captcha" in final_url:
-                        self.db.log_trace(jid, "Pre-check failed: Redirected to login/captcha page.")
-                        return False
-                        
-                    # MIME Type Validation
-                    invalid_types = ["text/html", "application/json", "text/plain"]
-                    if any(bad in content_type for bad in invalid_types):
-                        self.db.log_trace(jid, f"Pre-check failed: Invalid Content-Type '{content_type}'")
-                        return False
-                        
-                    # File Size Validation
-                    if content_length > 0 and content_length < 100000:
-                        self.db.log_trace(jid, "Pre-check failed: Content-Length suspiciously small (<100KB).")
-                        return False
-                        
+            # impersonate="chrome" forces the underlying socket to use Chrome's exact JA3 TLS footprint
+            async with AsyncSession(impersonate="chrome") as session:
+                response = await session.get(url, headers=req_headers, allow_redirects=True, stream=True)
+                
+                status = response.status_code
+                content_type = response.headers.get("Content-Type", "").lower()
+                content_length = int(response.headers.get("Content-Length", 0))
+                final_url = str(response.url).lower()
+                
+                self.db.log_trace(jid, f"Pre-check: HTTP {status} | Type: {content_type} | Size: {content_length}")
+                
+                # --- THE SOFT-FAIL BYPASS ---
+                # If the CDN still blocks us, do not kill the payload. Pass it to yt-dlp/aria2c.
+                if status == 403:
+                    self.db.log_trace(jid, "Pre-check warning: HTTP 403 detected despite TLS impersonation. Overriding gate for downstream engines.")
                     return True
+                
+                # Hard fail for actual broken links or server errors
+                if status >= 400 and status != 403:
+                    self.db.log_trace(jid, f"Pre-check failed: HTTP {status}")
+                    return False
+                    
+                # Redirect Validation
+                if "login" in final_url or "captcha" in final_url:
+                    self.db.log_trace(jid, "Pre-check failed: Redirected to login/captcha page.")
+                    return False
+                    
+                # MIME Type Validation
+                invalid_types = ["text/html", "application/json", "text/plain"]
+                if any(bad in content_type for bad in invalid_types):
+                    self.db.log_trace(jid, f"Pre-check failed: Invalid Content-Type '{content_type}'")
+                    return False
+                    
+                # File Size Validation
+                if content_length > 0 and content_length < 100000:
+                    self.db.log_trace(jid, "Pre-check failed: Content-Length suspiciously small (<100KB).")
+                    return False
+                    
+                return True
         except Exception as e:
-            self.db.log_trace(jid, f"Pre-check warning: Could not ping server ({e}). Proceeding to downloader anyway.")
+            # Catch-all to prevent the gate from crashing the pipeline on timeouts or proxy errors
+            self.db.log_trace(jid, f"Pre-check warning: Hardened ping encounter ({e}). Passing downstream to engine.")
             return True
 
     async def execute(self, job_data: dict):
