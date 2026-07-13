@@ -1577,9 +1577,16 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         title = msg.caption.strip() if msg.caption else "Direct Media Upload"
         file_id = msg.video.file_id if msg.video else msg.document.file_id
         
-        tracker = await msg.reply(f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]]))
-        await db.create_job({"id": jid, "url": file_id, "title": title, "source": "telegram", "strategy": "TELEGRAM", "chat_id": msg.chat.id, "tracker_id": tracker.id})
-        await pipeline.dl_q.put(jid)
+        tracker = await msg.reply(
+            f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ 🎯 ] ＳＥＬＥＣＴ ＭＯＤＥ :`", 
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📥 ONLY DOWNLOAD", callback_data=f"setmode|{jid}|DL_ONLY")],
+                [InlineKeyboardButton("⚙️ DL + PROCESS", callback_data=f"setmode|{jid}|DL_ENC")],
+                [InlineKeyboardButton("🚀 FULL PIPELINE", callback_data=f"setmode|{jid}|FULL")],
+                [InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]
+            ])
+        )
+        await db.create_job({"id": jid, "url": file_id, "title": title, "source": "telegram", "strategy": "TELEGRAM", "chat_id": msg.chat.id, "tracker_id": tracker.id, "stage": Stage.AWAITING_MODE.value})
         try: await msg.delete()
         except: pass
 
@@ -1605,10 +1612,16 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         if url:
             jid = str(uuid.uuid4())[:8]
             title = msg.text.replace(url, "").strip() or url[:40]
-            tracker = await msg.reply(f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]]))
-            
-            await db.create_job({"id": jid, "url": url, "title": title, "source": "Direct", "quality": "auto", "strategy": LinkClassifier.classify(url), "chat_id": msg.chat.id, "tracker_id": tracker.id})
-            await pipeline.dl_q.put(jid)
+            tracker = await msg.reply(
+                f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ 🎯 ] ＳＥＬＥＣＴ ＭＯＤＥ :`", 
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📥 ONLY DOWNLOAD", callback_data=f"setmode|{jid}|DL_ONLY")],
+                    [InlineKeyboardButton("⚙️ DL + PROCESS", callback_data=f"setmode|{jid}|DL_ENC")],
+                    [InlineKeyboardButton("🚀 FULL PIPELINE", callback_data=f"setmode|{jid}|FULL")],
+                    [InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]
+                ])
+            )
+            await db.create_job({"id": jid, "url": url, "title": title, "source": "Direct", "quality": "auto", "strategy": LinkClassifier.classify(url), "chat_id": msg.chat.id, "tracker_id": tracker.id, "stage": Stage.AWAITING_MODE.value})
 
     @app.on_callback_query()
     async def _router(client: Client, cb: CallbackQuery):
@@ -1616,6 +1629,38 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         
         if cb.data == "noop":
             await cb.answer()
+            return
+            
+        if cb.data.startswith("setmode|"):
+            _, jid, mode = cb.data.split("|")
+            job = await pipeline_ref.db.get_job(jid)
+            
+            await pipeline_ref.db.update_job(jid, target_stage=mode, stage="queued")
+            await pipeline_ref.dl_q.put(jid)
+            
+            text = f"`[ ⚡ ] ＴＡＳＫ :` `{job['title'][:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED`"
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
+            await safe_edit(client, cb.message.chat.id, cb.message.id, text, kb)
+            await cb.answer("Task Queued and Pipeline Mode Locked!")
+            return
+
+        if cb.data.startswith("resume|"):
+            _, jid, next_q_name, new_target = cb.data.split("|")
+            await pipeline_ref.db.update_job(jid, target_stage=new_target)
+            await pipeline_ref.db.log_trace(jid, f"Manual Resume Triggered. New Target: {new_target}")
+            
+            if next_q_name == "enc":
+                await pipeline_ref.db.update_job(jid, stage="downloaded")
+                await pipeline_ref.enc_q.put(jid)
+            elif next_q_name == "up":
+                await pipeline_ref.db.update_job(jid, stage="encoded")
+                await pipeline_ref.up_q.put(jid)
+            
+            await cb.answer("Pipeline Resumed!", show_alert=True)
+            try:
+                text, kb = await _get_dashboard_components(_dashboard_tab, pipeline_ref.db, pipeline_ref)
+                await cb.message.edit_text(text, reply_markup=kb)
+            except Exception: pass
             return
 
         if cb.data.startswith("delmsg|"):
