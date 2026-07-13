@@ -1585,6 +1585,35 @@ async def safe_edit(app: Client, chat_id: int, msg_id: int, text: str, kb: Inlin
 
 pipeline_ref = None
 
+async def _monitor_batch_completion(db: JobScheduler, chat_id: int, app: Client):
+    global _hold_uploads, _mass_upload_active
+    while _hold_uploads:
+        await asyncio.sleep(5)
+        active_jobs = await db.get_active_jobs()
+        
+        # Check if any job is still in a pre-upload phase
+        pending_stages = ["queued", "downloading", "downloaded", "encoding", "process"]
+        is_processing = any(
+            any(stage in j.get('stage', '').lower() for stage in pending_stages) 
+            for j in active_jobs
+        )
+        
+        if not is_processing and active_jobs:
+            _hold_uploads = False
+            _mass_upload_active = True
+            try:
+                await app.send_message(chat_id, "✅ **BATCH PROCESSED**\nAll downloads and encodings complete. Initiating mass upload sequence...")
+            except Exception:
+                pass
+            
+            # Wait for mass upload to finish to reset UI state
+            while _mass_upload_active:
+                await asyncio.sleep(5)
+                jobs = await db.get_active_jobs()
+                if not jobs:
+                    _mass_upload_active = False
+            break
+
 def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
     global pipeline_ref
     pipeline_ref = pipeline
@@ -1598,6 +1627,54 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         except Exception: pass
         text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
         await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
+
+    @app.on_message(filters.command(["go"]) & filters.user(OWNER_ID))
+    async def batch_go(_, msg: Message):
+        global _batch_mode, _batch_links, _hold_uploads, _mass_upload_active
+        _batch_mode = True
+        _batch_links = []
+        _hold_uploads = True
+        _mass_upload_active = False
+        await msg.reply("🟢 **BATCH MODE INITIATED**\nPaste your URLs one by one. Send `/end` when finished.")
+        if _dashboard_msg_id:
+            text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
+            await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
+
+    @app.on_message(filters.command(["end"]) & filters.user(OWNER_ID))
+    async def batch_end(_, msg: Message):
+        global _batch_mode, _batch_links, _hold_uploads, _dashboard_msg_id, _dashboard_chat_id
+        if not _batch_mode:
+            return await msg.reply("⚠️ Not in batch mode. Use `/go` first.")
+            
+        _batch_mode = False
+        if not _batch_links:
+            _hold_uploads = False
+            return await msg.reply("⚠️ No links were collected. Batch cancelled.")
+
+        await msg.reply(f"🚀 **PROCESSING BATCH**\nQueuing {len(_batch_links)} tasks. Uploads will be held until all are encoded.")
+        
+        for url_data in _batch_links:
+            url, title, chat_id = url_data
+            jid = str(uuid.uuid4())[:8]
+            tracker = await msg.reply(
+                f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (BATCH)`", 
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
+            )
+            
+            await db.create_job({
+                "id": jid, "url": url, "title": title, "source": "Direct", 
+                "quality": "auto", "strategy": LinkClassifier.classify(url), 
+                "chat_id": chat_id, "tracker_id": tracker.id
+            })
+            await pipeline.dl_q.put(jid)
+            
+        _batch_links.clear()
+        
+        asyncio.create_task(_monitor_batch_completion(db, msg.chat.id, app))
+        
+        if _dashboard_msg_id:
+            text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
+            await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
 
     @app.on_message((filters.video | filters.document) & filters.user(OWNER_ID))
     async def auto_catch_media(_, msg: Message):
@@ -1613,7 +1690,7 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         try: await msg.delete()
         except: pass
 
-    @app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["start", "dashboard"]))
+    @app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["start", "dashboard", "go", "end"]))
     async def url_catcher(_, msg: Message):
         if msg.reply_to_message and msg.reply_to_message.text and "RENAME TASK" in msg.reply_to_message.text:
             try:
@@ -1633,12 +1710,21 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
 
         url = next((w for w in msg.text.split() if w.startswith("http") or w.startswith("magnet:?")), None)
         if url:
-            jid = str(uuid.uuid4())[:8]
             title = msg.text.replace(url, "").strip() or url[:40]
-            tracker = await msg.reply(f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]]))
             
-            await db.create_job({"id": jid, "url": url, "title": title, "source": "Direct", "quality": "auto", "strategy": LinkClassifier.classify(url), "chat_id": msg.chat.id, "tracker_id": tracker.id})
-            await pipeline.dl_q.put(jid)
+            global _batch_mode, _batch_links
+            if _batch_mode:
+                _batch_links.append((url, title, msg.chat.id))
+                await msg.reply(f"✅ Added to batch. Total: {len(_batch_links)}. Send `/end` to process.", quote=True)
+                if _dashboard_msg_id:
+                    text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
+                    await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
+            else:
+                jid = str(uuid.uuid4())[:8]
+                tracker = await msg.reply(f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]]))
+                
+                await db.create_job({"id": jid, "url": url, "title": title, "source": "Direct", "quality": "auto", "strategy": LinkClassifier.classify(url), "chat_id": msg.chat.id, "tracker_id": tracker.id})
+                await pipeline.dl_q.put(jid)
 
     @app.on_callback_query()
     async def _router(client: Client, cb: CallbackQuery):
@@ -1646,6 +1732,17 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         
         if cb.data == "noop":
             await cb.answer()
+            return
+            
+        if cb.data == "force_release":
+            global _hold_uploads, _mass_upload_active
+            _hold_uploads = False
+            _mass_upload_active = True
+            await cb.answer("🔓 Uploads released! Processing mass upload...", show_alert=True)
+            try:
+                text, kb = await _get_dashboard_components(_dashboard_tab, pipeline_ref.db, pipeline_ref)
+                await cb.message.edit_text(text, reply_markup=kb)
+            except Exception: pass
             return
 
         if cb.data.startswith("delmsg|"):
