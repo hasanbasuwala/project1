@@ -71,6 +71,12 @@ for d in (JOBS_DIR, DONE_DIR): d.mkdir(parents=True, exist_ok=True)
 
 MAX_DL_WORKERS, MAX_RETRIES = 20, 3
 
+# ──────────────────────────── BATCH CONFIGURATION ─────────────────────
+_batch_mode = False
+_batch_links = []
+_hold_uploads = False
+_mass_upload_active = False
+
 C_CYAN, C_YELLOW, C_RED, C_GREEN, C_RESET, C_BOLD = "\033[36m", "\033[33m", "\033[31m", "\033[32m", "\033[0m", "\033[1m"
 
 def make_bar(percent: float, width: int = 10) -> str:
@@ -1327,10 +1333,40 @@ class PipelineManager:
             finally:
                 queue.task_done()
 
+    async def _upload_worker_loop(self, queue: asyncio.Queue, engine, start_stage: Stage, success_stage: Stage):
+        global _hold_uploads
+        while True:
+            # Pause consumption if we are holding uploads for a batch
+            while _hold_uploads:
+                await asyncio.sleep(2)
+                
+            jid = await queue.get()
+            job = await self.db.get_job(jid)
+            retry = job.get('retries', 0)
+
+            if job.get('stage') == Stage.CANCELLED.value: 
+                queue.task_done()
+                continue
+
+            try:
+                await self.db.update_job(jid, stage=start_stage.value, retries=retry)
+                await engine.execute(job)
+                await self.db.update_job(jid, stage=success_stage.value, retries=0, recovered_at_stage=None)
+            except Exception as e:
+                retry += 1
+                if retry >= MAX_RETRIES: 
+                    await CrashCourier.push_fault(self.app, self.db, jid, e)
+                else: 
+                    await self.db.update_job(jid, stage=job['stage'], retries=retry)
+                    await queue.put(jid)
+            finally:
+                queue.task_done()
+
     def start_workers(self):
         for _ in range(MAX_DL_WORKERS): asyncio.create_task(self._worker_loop(self.dl_q, self.dl_engine, Stage.DOWNLOADING, Stage.DOWNLOADED, self.enc_q))
         asyncio.create_task(self._worker_loop(self.enc_q, self.enc_engine, Stage.ENCODING, Stage.ENCODED, self.up_q))
-        asyncio.create_task(self._worker_loop(self.up_q, self.up_engine, Stage.UPLOADING, Stage.COMPLETED, None))
+        # Use the specialized upload loop
+        asyncio.create_task(self._upload_worker_loop(self.up_q, self.up_engine, Stage.UPLOADING, Stage.COMPLETED))
 
 # ──────────────────────────── UI & COMMAND ROUTER ───────────────────────
 
@@ -1427,10 +1463,21 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
 
     sync_stat = "`RECOVERY AUDIT ACTIVE`" if recovery_pool else "`SYSTEM NORMAL`"
     
+    global _batch_mode, _batch_links, _hold_uploads, _mass_upload_active
+    
+    if _batch_mode:
+        stat_str = f"🟡 BATCH COLLECTION ({len(_batch_links)} ITEMS QUEUED)"
+    elif _hold_uploads:
+        stat_str = "🔵 BATCH PROCESSING (UPLOADS LOCKED)"
+    elif _mass_upload_active:
+        stat_str = "🟢 MASS UPLOAD SEQUENCE ACTIVE"
+    else:
+        stat_str = "ONLINE & SECURE"
+    
     text = (
-        f"💻 **STEALTH MAINFRAME v14**\n"
+        f"💻 **STEALTH MAINFRAME v14.5**\n"
         f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
-        f"`[⚡] STAT :` `ONLINE & SECURE`\n"
+        f"`[⚡] STAT :` `{stat_str}`\n"
         f"`[⚠️] SYNC :` {sync_stat}\n"
         f"`[💾] DISK :` `{total_storage:.2f} GB`\n"
         f"{act_string}\n"
@@ -1440,6 +1487,9 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
     )
 
     kb_lines = []
+    
+    if _hold_uploads:
+        kb_lines.append([InlineKeyboardButton("🔓 FORCE UPLOAD RELEASE", callback_data="force_release")])
 
     def build_dropdown(target_stage: str, label: str, icon: str, job_list: list, parent_tab: str = "root"):
         is_stage_open = (stage_tab == target_stage)
