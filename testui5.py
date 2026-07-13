@@ -96,8 +96,8 @@ async def extract_video_metadata(file_path: Path) -> tuple[int, int, int]:
 # ──────────────────────────── SUBSYSTEM 1: DATABASE ─────────────────────
 
 class Stage(str, Enum):
-    AWAITING_MODE, QUEUED, DOWNLOADING, DOWNLOADED, ENCODING, ENCODED, UPLOADING, COMPLETED, FAILED, CANCELLED = (
-        "awaiting_mode", "queued", "downloading", "downloaded", "encoding", "encoded", "uploading", "completed", "failed", "cancelled"
+    QUEUED, DOWNLOADING, DOWNLOADED, ENCODING, ENCODED, UPLOADING, COMPLETED, FAILED, CANCELLED = (
+        "queued", "downloading", "downloaded", "encoding", "encoded", "uploading", "completed", "failed", "cancelled"
     )
 
 class JobScheduler:
@@ -108,25 +108,27 @@ class JobScheduler:
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
+            # 1. Create the table if it's a completely fresh install
             conn.execute('''CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY, url TEXT, title TEXT, source TEXT, quality TEXT, strategy TEXT,
                 stage TEXT, pct REAL, last_ui_pct REAL, retries INTEGER, chat_id INTEGER, tracker_id INTEGER,
-                recovered_at_stage TEXT DEFAULT NULL, target_stage TEXT DEFAULT 'FULL'
+                recovered_at_stage TEXT DEFAULT NULL
             )''')
             
-            try: conn.execute('ALTER TABLE jobs ADD COLUMN recovered_at_stage TEXT DEFAULT NULL')
-            except sqlite3.OperationalError: pass
-            
-            try: conn.execute('ALTER TABLE jobs ADD COLUMN target_stage TEXT DEFAULT "FULL"')
-            except sqlite3.OperationalError: pass
+            # 2. Patch existing databases that are missing the new column
+            try:
+                conn.execute('ALTER TABLE jobs ADD COLUMN recovered_at_stage TEXT DEFAULT NULL')
+            except sqlite3.OperationalError:
+                # If the column already exists, SQLite throws an error. We just ignore it.
+                pass
 
     async def create_job(self, data: dict):
         async with self.lock:
             with sqlite3.connect(self.db_path) as conn:
-                conn.execute('''INSERT INTO jobs (id, url, title, source, quality, strategy, stage, pct, last_ui_pct, retries, chat_id, tracker_id, target_stage)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
+                conn.execute('''INSERT INTO jobs (id, url, title, source, quality, strategy, stage, pct, last_ui_pct, retries, chat_id, tracker_id)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
                              (data['id'], data['url'], data['title'], data['source'], data.get('quality', 'auto'), data.get('strategy', 'GENERIC'), 
-                              data.get('stage', Stage.QUEUED.value), 0.0, -10.0, 0, data['chat_id'], data['tracker_id'], data.get('target_stage', 'FULL')))
+                              Stage.QUEUED.value, 0.0, -10.0, 0, data['chat_id'], data['tracker_id']))
                 
         root = JOBS_DIR / f"JOB_{data['id']}"
         for d in (root, root / "dl", root / "enc", root / "thumb"): d.mkdir(parents=True, exist_ok=True)
@@ -1311,23 +1313,10 @@ class PipelineManager:
                 await self.db.update_job(jid, stage=start_stage.value, retries=retry)
                 await engine.execute(job)
                 
+                # SYS_OP: Wipe the recovery tag upon successful completion of the phase
                 await self.db.update_job(jid, stage=success_stage.value, retries=0, recovered_at_stage=None)
                 
-                # Check for Pipeline Pausing
-                updated_job = await self.db.get_job(jid)
-                target = updated_job.get('target_stage', 'FULL')
-                
-                should_pause = False
-                if success_stage == Stage.DOWNLOADED and target == "DL_ONLY":
-                    should_pause = True
-                elif success_stage == Stage.ENCODED and target in ["DL_ONLY", "DL_ENC"]:
-                    should_pause = True
-                
-                if next_q and not should_pause: 
-                    await next_q.put(jid)
-                elif should_pause:
-                    self.db.log_trace(jid, f"Target stage [{target}] reached. Pipeline paused successfully.")
-                    
+                if next_q: await next_q.put(jid)
             except Exception as e:
                 retry += 1
                 if retry >= MAX_RETRIES: 
@@ -1488,22 +1477,13 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
                         InlineKeyboardButton("✏️ RENAME", callback_data=f"rename|{jid}"),
                         InlineKeyboardButton("⏭ FORCE UP", callback_data=f"forceup|{jid}")
                     ])
-                    
-                    # Inject Dynamic Pipeline Controls
-                    base_stage = _base(raw_stage)
-                    target = j.get('target_stage', 'FULL')
-                    
-                    if base_stage == "downloaded" and target == "DL_ONLY":
-                        kb_lines.append([
-                            InlineKeyboardButton("▶️ START PROCESSING", callback_data=f"resume|{jid}|enc|DL_ENC"),
-                            InlineKeyboardButton("🚀 FULL RESUME", callback_data=f"resume|{jid}|enc|FULL")
-                        ])
-                    elif base_stage == "encoded" and target in ["DL_ONLY", "DL_ENC"]:
-                        kb_lines.append([
-                            InlineKeyboardButton("▶️ START UPLOAD", callback_data=f"resume|{jid}|up|FULL")
-                        ])
-                        
                     kb_lines.append([InlineKeyboardButton("🔙 CLOSE CARD", callback_data=f"dash|{target_stage}")])
+                else:
+                    pct = j.get('pct', 0.0)
+                    kb_lines.append([
+                        InlineKeyboardButton(f" ├ ⚡ {title}.. | {pct:.1f}%", callback_data=f"dash|{target_stage}:{jid}"),
+                        InlineKeyboardButton("❌", callback_data=f"kill|{jid}")
+                    ])
 
     if recovery_pool:
         is_rec_open = stage_tab in ["recovery", "rec_dl", "rec_enc", "rec_up"]
@@ -1577,16 +1557,9 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         title = msg.caption.strip() if msg.caption else "Direct Media Upload"
         file_id = msg.video.file_id if msg.video else msg.document.file_id
         
-        tracker = await msg.reply(
-            f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ 🎯 ] ＳＥＬＥＣＴ ＭＯＤＥ :`", 
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📥 ONLY DOWNLOAD", callback_data=f"setmode|{jid}|DL_ONLY")],
-                [InlineKeyboardButton("⚙️ DL + PROCESS", callback_data=f"setmode|{jid}|DL_ENC")],
-                [InlineKeyboardButton("🚀 FULL PIPELINE", callback_data=f"setmode|{jid}|FULL")],
-                [InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]
-            ])
-        )
-        await db.create_job({"id": jid, "url": file_id, "title": title, "source": "telegram", "strategy": "TELEGRAM", "chat_id": msg.chat.id, "tracker_id": tracker.id, "stage": Stage.AWAITING_MODE.value})
+        tracker = await msg.reply(f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]]))
+        await db.create_job({"id": jid, "url": file_id, "title": title, "source": "telegram", "strategy": "TELEGRAM", "chat_id": msg.chat.id, "tracker_id": tracker.id})
+        await pipeline.dl_q.put(jid)
         try: await msg.delete()
         except: pass
 
@@ -1612,16 +1585,10 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         if url:
             jid = str(uuid.uuid4())[:8]
             title = msg.text.replace(url, "").strip() or url[:40]
-            tracker = await msg.reply(
-                f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ 🎯 ] ＳＥＬＥＣＴ ＭＯＤＥ :`", 
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📥 ONLY DOWNLOAD", callback_data=f"setmode|{jid}|DL_ONLY")],
-                    [InlineKeyboardButton("⚙️ DL + PROCESS", callback_data=f"setmode|{jid}|DL_ENC")],
-                    [InlineKeyboardButton("🚀 FULL PIPELINE", callback_data=f"setmode|{jid}|FULL")],
-                    [InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]
-                ])
-            )
-            await db.create_job({"id": jid, "url": url, "title": title, "source": "Direct", "quality": "auto", "strategy": LinkClassifier.classify(url), "chat_id": msg.chat.id, "tracker_id": tracker.id, "stage": Stage.AWAITING_MODE.value})
+            tracker = await msg.reply(f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]]))
+            
+            await db.create_job({"id": jid, "url": url, "title": title, "source": "Direct", "quality": "auto", "strategy": LinkClassifier.classify(url), "chat_id": msg.chat.id, "tracker_id": tracker.id})
+            await pipeline.dl_q.put(jid)
 
     @app.on_callback_query()
     async def _router(client: Client, cb: CallbackQuery):
@@ -1629,38 +1596,6 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         
         if cb.data == "noop":
             await cb.answer()
-            return
-            
-        if cb.data.startswith("setmode|"):
-            _, jid, mode = cb.data.split("|")
-            job = await pipeline_ref.db.get_job(jid)
-            
-            await pipeline_ref.db.update_job(jid, target_stage=mode, stage="queued")
-            await pipeline_ref.dl_q.put(jid)
-            
-            text = f"`[ ⚡ ] ＴＡＳＫ :` `{job['title'][:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED`"
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
-            await safe_edit(client, cb.message.chat.id, cb.message.id, text, kb)
-            await cb.answer("Task Queued and Pipeline Mode Locked!")
-            return
-
-        if cb.data.startswith("resume|"):
-            _, jid, next_q_name, new_target = cb.data.split("|")
-            await pipeline_ref.db.update_job(jid, target_stage=new_target)
-            await pipeline_ref.db.log_trace(jid, f"Manual Resume Triggered. New Target: {new_target}")
-            
-            if next_q_name == "enc":
-                await pipeline_ref.db.update_job(jid, stage="downloaded")
-                await pipeline_ref.enc_q.put(jid)
-            elif next_q_name == "up":
-                await pipeline_ref.db.update_job(jid, stage="encoded")
-                await pipeline_ref.up_q.put(jid)
-            
-            await cb.answer("Pipeline Resumed!", show_alert=True)
-            try:
-                text, kb = await _get_dashboard_components(_dashboard_tab, pipeline_ref.db, pipeline_ref)
-                await cb.message.edit_text(text, reply_markup=kb)
-            except Exception: pass
             return
 
         if cb.data.startswith("delmsg|"):
