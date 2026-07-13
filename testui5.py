@@ -1484,7 +1484,7 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
                         InlineKeyboardButton("📄 LOGS", callback_data=f"joblog|{jid}"),
                         InlineKeyboardButton("❌ KILL", callback_data=f"kill|{jid}")
                     ])
-                                        kb_lines.append([
+                    kb_lines.append([
                         InlineKeyboardButton("✏️ RENAME", callback_data=f"rename|{jid}"),
                         InlineKeyboardButton("⏭ FORCE UP", callback_data=f"forceup|{jid}")
                     ])
