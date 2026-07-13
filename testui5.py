@@ -1311,10 +1311,23 @@ class PipelineManager:
                 await self.db.update_job(jid, stage=start_stage.value, retries=retry)
                 await engine.execute(job)
                 
-                # SYS_OP: Wipe the recovery tag upon successful completion of the phase
                 await self.db.update_job(jid, stage=success_stage.value, retries=0, recovered_at_stage=None)
                 
-                if next_q: await next_q.put(jid)
+                # Check for Pipeline Pausing
+                updated_job = await self.db.get_job(jid)
+                target = updated_job.get('target_stage', 'FULL')
+                
+                should_pause = False
+                if success_stage == Stage.DOWNLOADED and target == "DL_ONLY":
+                    should_pause = True
+                elif success_stage == Stage.ENCODED and target in ["DL_ONLY", "DL_ENC"]:
+                    should_pause = True
+                
+                if next_q and not should_pause: 
+                    await next_q.put(jid)
+                elif should_pause:
+                    self.db.log_trace(jid, f"Target stage [{target}] reached. Pipeline paused successfully.")
+                    
             except Exception as e:
                 retry += 1
                 if retry >= MAX_RETRIES: 
