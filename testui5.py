@@ -1,5 +1,5 @@
 """
-stealth_bot.py - v3
+stealth_bot.py - v5
 ───────────────────────────────────────────────────────────────
 ARCHITECTURE:
   • Single-file Micro-Orchestration (Classes).
