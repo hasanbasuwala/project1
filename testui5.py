@@ -1484,17 +1484,26 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
                         InlineKeyboardButton("📄 LOGS", callback_data=f"joblog|{jid}"),
                         InlineKeyboardButton("❌ KILL", callback_data=f"kill|{jid}")
                     ])
-                    kb_lines.append([
+                                        kb_lines.append([
                         InlineKeyboardButton("✏️ RENAME", callback_data=f"rename|{jid}"),
                         InlineKeyboardButton("⏭ FORCE UP", callback_data=f"forceup|{jid}")
                     ])
+                    
+                    # Inject Dynamic Pipeline Controls
+                    base_stage = _base(raw_stage)
+                    target = j.get('target_stage', 'FULL')
+                    
+                    if base_stage == "downloaded" and target == "DL_ONLY":
+                        kb_lines.append([
+                            InlineKeyboardButton("▶️ START PROCESSING", callback_data=f"resume|{jid}|enc|DL_ENC"),
+                            InlineKeyboardButton("🚀 FULL RESUME", callback_data=f"resume|{jid}|enc|FULL")
+                        ])
+                    elif base_stage == "encoded" and target in ["DL_ONLY", "DL_ENC"]:
+                        kb_lines.append([
+                            InlineKeyboardButton("▶️ START UPLOAD", callback_data=f"resume|{jid}|up|FULL")
+                        ])
+                        
                     kb_lines.append([InlineKeyboardButton("🔙 CLOSE CARD", callback_data=f"dash|{target_stage}")])
-                else:
-                    pct = j.get('pct', 0.0)
-                    kb_lines.append([
-                        InlineKeyboardButton(f" ├ ⚡ {title}.. | {pct:.1f}%", callback_data=f"dash|{target_stage}:{jid}"),
-                        InlineKeyboardButton("❌", callback_data=f"kill|{jid}")
-                    ])
 
     if recovery_pool:
         is_rec_open = stage_tab in ["recovery", "rec_dl", "rec_enc", "rec_up"]
