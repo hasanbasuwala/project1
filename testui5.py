@@ -96,8 +96,8 @@ async def extract_video_metadata(file_path: Path) -> tuple[int, int, int]:
 # ──────────────────────────── SUBSYSTEM 1: DATABASE ─────────────────────
 
 class Stage(str, Enum):
-    QUEUED, DOWNLOADING, DOWNLOADED, ENCODING, ENCODED, UPLOADING, COMPLETED, FAILED, CANCELLED = (
-        "queued", "downloading", "downloaded", "encoding", "encoded", "uploading", "completed", "failed", "cancelled"
+    AWAITING_MODE, QUEUED, DOWNLOADING, DOWNLOADED, ENCODING, ENCODED, UPLOADING, COMPLETED, FAILED, CANCELLED = (
+        "awaiting_mode", "queued", "downloading", "downloaded", "encoding", "encoded", "uploading", "completed", "failed", "cancelled"
     )
 
 class JobScheduler:
