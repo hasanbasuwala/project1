@@ -1761,6 +1761,82 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         await pipeline.dl_q.put(jid)
         try: await msg.delete()
         except: pass
+          
+    @app.on_message(filters.command(["update"]) & filters.user(OWNER_ID))
+    async def update_command(_, msg: Message):
+        await msg.reply(
+            "🔄 **UPDATE SEQUENCE**\nEnter the script name (e.g., `testui5.1`):",
+            reply_markup=ForceReply(selective=True)
+        )
+
+    @app.on_message(filters.text & filters.user(OWNER_ID) & filters.reply)
+    async def update_catcher(_, msg: Message):
+        # Intercept the ForceReply for the update command
+        if msg.reply_to_message and "UPDATE SEQUENCE" in msg.reply_to_message.text:
+            input_name = msg.text.strip()
+            
+            # Automatically append .py if you didn't type it
+            script_name = f"{input_name}.py" if not input_name.endswith(".py") else input_name
+
+            if not os.path.exists(script_name):
+                return await msg.reply(f"❌ File `{script_name}` not found in the Debian directory.")
+
+            # The initial "updating" ping
+            progress = await msg.reply(f"🔄 Updating to `{script_name}`... Suspending current processes.")
+
+            # 1. Stop the current client to release the Pyrogram session.session lock
+            await app.stop()
+
+            import subprocess
+            try:
+                # 2. Launch the new script using Python 3.13
+                proc = subprocess.Popen(
+                    ["python3.13", script_name],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+
+                # 3. Wait 6 seconds to monitor for initialization crashes
+                try:
+                    outs, errs = proc.communicate(timeout=6)
+                    crashed = True
+                    exit_code = proc.returncode
+                except subprocess.TimeoutExpired:
+                    # If it didn't exit within 6 seconds, the bot loop is running safely.
+                    crashed = False
+
+                if crashed:
+                    # 4a. ROLLBACK: Reclaim the session and report the failure
+                    await app.start()
+                    error_log = errs.strip()[-3500:] if errs else "No traceback available (Immediate Exit)."
+                    
+                    await progress.edit_text(
+                        f"❌ **Update Failed! Rolled back to previous version.**\n"
+                        f"**Target:** `{script_name}` | **Exit Code:** `{exit_code}`\n\n"
+                        f"**Error Logs:**\n```{error_log}```"
+                    )
+                else:
+                    # 4b. SUCCESS: Edit the message via REST to bypass session lock, then die.
+                    import aiohttp
+                    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
+                    payload = {
+                        "chat_id": msg.chat.id,
+                        "message_id": progress.id,
+                        "text": f"✅ **Updated to `{script_name}`.** The new mainframe instance is now online."
+                    }
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(url, json=payload)
+
+                    # Terminate the old process completely, leaving the new one running in Termux
+                    os._exit(0)
+
+            except Exception as e:
+                # Failsafe if the subprocess fails to spawn
+                await app.start()
+                await progress.edit_text(f"🚨 **Critical Execution Error during Update:**\n`{str(e)}`")
+            
+            return # Prevent this reply from falling through to the normal url_catcher
 
     @app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["start", "dashboard", "go", "end"]))
     async def url_catcher(_, msg: Message):
