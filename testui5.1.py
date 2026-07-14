@@ -1670,6 +1670,48 @@ async def _batch_runner(db: JobScheduler, pipeline: PipelineManager, app: Client
         
         # 5. Mark batch as complete, move to Batch 2 (if queued)
         _pending_batches.task_done()
+        
+async def _resume_interrupted_batches(db: JobScheduler, pipeline: PipelineManager, batch_jids: list):
+    # 1. Isolate the jobs that still need to be downloaded
+    dl_jids = []
+    for jid in batch_jids:
+        job = await db.get_job(jid)
+        if job and job.get('stage') == "queued":
+            dl_jids.append(jid)
+            
+    # 2. Feed the queued downloads one by one
+    for jid in dl_jids:
+        await pipeline.dl_q.put(jid)
+        while True:
+            await asyncio.sleep(2)
+            job = await db.get_job(jid)
+            if not job: 
+                break
+            base_stage = job.get('stage', '').split('|')[0].strip().lower()
+            if base_stage not in ["queued", "downloading"]: 
+                break
+                
+    # 3. Wait for ALL items in this recovered batch to finish encoding
+    while True:
+        await asyncio.sleep(3)
+        all_done = True
+        for jid in batch_jids:
+            job = await db.get_job(jid)
+            if job:
+                base_stage = job.get('stage', '').split('|')[0].strip().lower()
+                if base_stage in ["queued", "downloading", "downloaded", "encoding", "process"]:
+                    all_done = False
+                    break
+        if all_done:
+            break
+            
+    # 4. Dump to uploader
+    for jid in batch_jids:
+        job = await db.get_job(jid)
+        if job:
+            base_stage = job.get('stage', '').split('|')[0].strip().lower()
+            if base_stage == "encoded":
+                await pipeline.up_q.put(jid)
 
 def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
     global pipeline_ref
