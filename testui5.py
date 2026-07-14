@@ -73,10 +73,8 @@ MAX_DL_WORKERS, MAX_RETRIES = 20, 3
 
 # ──────────────────────────── BATCH CONFIGURATION ─────────────────────
 _batch_mode = False
-_batch_links = []
-_hold_uploads = False
-_mass_upload_active = False
-_batch_dl_lock = asyncio.Lock()
+_batch_collection = []
+_pending_batches = asyncio.Queue()
 
 C_CYAN, C_YELLOW, C_RED, C_GREEN, C_RESET, C_BOLD = "\033[36m", "\033[33m", "\033[31m", "\033[32m", "\033[0m", "\033[1m"
 
