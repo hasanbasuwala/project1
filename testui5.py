@@ -1589,6 +1589,71 @@ async def _monitor_batch_completion(db: JobScheduler, chat_id: int, app: Client)
                 if not jobs:
                     _mass_upload_active = False
             break
+            
+async def _batch_runner(db: JobScheduler, pipeline: PipelineManager, app: Client):
+    batch_counter = 0
+    while True:
+        # 1. Wait for a batch to be submitted via /end
+        batch = await _pending_batches.get()
+        batch_counter += 1
+        batch_source = f"Batch_{batch_counter}"
+        batch_jids = []
+        
+        # 2. Sequential DL Feed (Wait for DL 1 to finish before submitting DL 2)
+        for url, title, chat_id in batch:
+            jid = str(uuid.uuid4())[:8]
+            batch_jids.append(jid)
+            
+            tracker = await app.send_message(
+                chat_id, 
+                f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (BATCH {batch_counter})`", 
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
+            )
+            
+            await db.create_job({
+                "id": jid, "url": url, "title": title, "source": batch_source, 
+                "quality": "auto", "strategy": LinkClassifier.classify(url), 
+                "chat_id": chat_id, "tracker_id": tracker.id
+            })
+            
+            # Submit ONE item to download
+            await pipeline.dl_q.put(jid)
+            
+            # Wait for this specific item to clear the download stage
+            while True:
+                await asyncio.sleep(2)
+                job = await db.get_job(jid)
+                if not job: 
+                    break # Job was killed, move on
+                base_stage = job.get('stage', '').split('|')[0].strip().lower()
+                # Once it hits "downloaded" (or encoding), we break and submit the next link
+                if base_stage not in ["queued", "downloading"]: 
+                    break
+        
+        # 3. Wait for ALL items in this batch to finish processing
+        while True:
+            await asyncio.sleep(3)
+            all_done = True
+            for jid in batch_jids:
+                job = await db.get_job(jid)
+                if job:
+                    base_stage = job.get('stage', '').split('|')[0].strip().lower()
+                    if base_stage in ["queued", "downloading", "downloaded", "encoding", "process"]:
+                        all_done = False
+                        break
+            if all_done:
+                break
+                
+        # 4. Mass Upload Sequence (Dump all finished encodings into the Uploader)
+        for jid in batch_jids:
+            job = await db.get_job(jid)
+            if job:
+                base_stage = job.get('stage', '').split('|')[0].strip().lower()
+                if base_stage == "encoded":
+                    await pipeline.up_q.put(jid)
+        
+        # 5. Mark batch as complete, move to Batch 2 (if queued)
+        _pending_batches.task_done()
 
 def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
     global pipeline_ref
