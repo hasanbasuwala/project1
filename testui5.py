@@ -1304,40 +1304,6 @@ class PipelineManager:
         self.dl_q, self.enc_q, self.up_q = asyncio.Queue(), asyncio.Queue(), asyncio.Queue()
         self.dl_engine, self.enc_engine, self.up_engine = DownloaderEngine(db, app), EncoderEngine(db), UploaderEngine(db, app)
 
-    async def _dl_worker_loop(self, queue: asyncio.Queue, engine, start_stage: Stage, success_stage: Stage, next_q: asyncio.Queue):
-        global _hold_uploads, _batch_dl_lock
-        while True:
-            jid = await queue.get()
-            job = await self.db.get_job(jid)
-            retry = job.get('retries', 0)
-
-            if job.get('stage') == Stage.CANCELLED.value: 
-                queue.task_done()
-                continue
-
-            try:
-                await self.db.update_job(jid, stage=start_stage.value, retries=retry)
-                
-                # If a batch is processing, strictly limit downloads to ONE at a time.
-                if _hold_uploads:
-                    async with _batch_dl_lock:
-                        await engine.execute(job)
-                else:
-                    # Normal mode: Run concurrently up to MAX_DL_WORKERS
-                    await engine.execute(job)
-                    
-                await self.db.update_job(jid, stage=success_stage.value, retries=0, recovered_at_stage=None)
-                if next_q: await next_q.put(jid)
-            except Exception as e:
-                retry += 1
-                if retry >= MAX_RETRIES: 
-                    await CrashCourier.push_fault(self.app, self.db, jid, e)
-                else: 
-                    await self.db.update_job(jid, stage=job['stage'], retries=retry)
-                    await queue.put(jid)
-            finally:
-                queue.task_done()
-
     async def _worker_loop(self, queue: asyncio.Queue, engine, start_stage: Stage, success_stage: Stage, next_q: asyncio.Queue = None):
         while True:
             jid = await queue.get()
@@ -1352,36 +1318,17 @@ class PipelineManager:
                 await self.db.update_job(jid, stage=start_stage.value, retries=retry)
                 await engine.execute(job)
                 await self.db.update_job(jid, stage=success_stage.value, retries=0, recovered_at_stage=None)
-                if next_q: await next_q.put(jid)
-            except Exception as e:
-                retry += 1
-                if retry >= MAX_RETRIES: 
-                    await CrashCourier.push_fault(self.app, self.db, jid, e)
-                else: 
-                    await self.db.update_job(jid, stage=job['stage'], retries=retry)
-                    await queue.put(jid)
-            finally:
-                queue.task_done()
-
-    async def _upload_worker_loop(self, queue: asyncio.Queue, engine, start_stage: Stage, success_stage: Stage):
-        global _hold_uploads
-        while True:
-            # Check the global block before attempting to upload
-            while _hold_uploads:
-                await asyncio.sleep(2)
                 
-            jid = await queue.get()
-            job = await self.db.get_job(jid)
-            retry = job.get('retries', 0)
-
-            if job.get('stage') == Stage.CANCELLED.value: 
-                queue.task_done()
-                continue
-
-            try:
-                await self.db.update_job(jid, stage=start_stage.value, retries=retry)
-                await engine.execute(job)
-                await self.db.update_job(jid, stage=success_stage.value, retries=0, recovered_at_stage=None)
+                if next_q: 
+                    # ─── BATCH GATEKEEPER ───
+                    # If this is the Encoder passing to the Uploader, check if it's a batch task.
+                    # Normal tasks pass through instantly. Batch tasks are held back.
+                    updated_job = await self.db.get_job(jid)
+                    if next_q == self.up_q and updated_job and str(updated_job.get('source', '')).startswith('Batch_'):
+                        pass # The Batch Orchestrator will manually release this later
+                    else:
+                        await next_q.put(jid)
+                        
             except Exception as e:
                 retry += 1
                 if retry >= MAX_RETRIES: 
@@ -1393,15 +1340,9 @@ class PipelineManager:
                 queue.task_done()
 
     def start_workers(self):
-        # 1. Start DL workers (They throttle themselves to 1-by-1 if a batch is active)
-        for _ in range(MAX_DL_WORKERS): 
-            asyncio.create_task(self._dl_worker_loop(self.dl_q, self.dl_engine, Stage.DOWNLOADING, Stage.DOWNLOADED, self.enc_q))
-        
-        # 2. Start exactly ONE encoder worker (Native 1-by-1 processing)
+        for _ in range(MAX_DL_WORKERS): asyncio.create_task(self._worker_loop(self.dl_q, self.dl_engine, Stage.DOWNLOADING, Stage.DOWNLOADED, self.enc_q))
         asyncio.create_task(self._worker_loop(self.enc_q, self.enc_engine, Stage.ENCODING, Stage.ENCODED, self.up_q))
-        
-        # 3. Start exactly ONE uploader worker (Respects batch holds, native 1-by-1 processing)
-        asyncio.create_task(self._upload_worker_loop(self.up_q, self.up_engine, Stage.UPLOADING, Stage.COMPLETED))
+        asyncio.create_task(self._worker_loop(self.up_q, self.up_engine, Stage.UPLOADING, Stage.COMPLETED, None))
 
 # ──────────────────────────── UI & COMMAND ROUTER ───────────────────────
 
