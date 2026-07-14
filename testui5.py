@@ -1930,6 +1930,9 @@ async def main():
         await RecoveryManager.scan_and_requeue(db, pipeline.dl_q, pipeline.enc_q, pipeline.up_q, app)
         pipeline.start_workers()
         
+        # Launch the dedicated Batch Orchestrator
+        asyncio.create_task(_batch_runner(db, pipeline, app))
+        
         asyncio.create_task(dispatcher.sender_loop()) 
         
         # Start the Accumulator loop
