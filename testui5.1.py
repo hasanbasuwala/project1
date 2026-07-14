@@ -1985,18 +1985,17 @@ async def main():
     setup_router(app, db, pipeline)
 
     async with app:
-        await RecoveryManager.scan_and_requeue(db, pipeline.dl_q, pipeline.enc_q, pipeline.up_q, app)
+        recovering_batch_jids = await RecoveryManager.scan_and_requeue(db, pipeline.dl_q, pipeline.enc_q, pipeline.up_q, app)
         pipeline.start_workers()
         
-        # Launch the dedicated Batch Orchestrator
-        asyncio.create_task(_batch_runner(db, pipeline, app))
-        
         asyncio.create_task(dispatcher.sender_loop()) 
-        
-        # Start the Accumulator loop
         asyncio.create_task(ui_accumulator.run_loop()) 
-        
         asyncio.create_task(terminal_loop(db, pipeline))
+        
+        # ─── BATCH ORCHESTRATORS ───
+        asyncio.create_task(_batch_runner(db, pipeline, app))
+        if recovering_batch_jids:
+            asyncio.create_task(_resume_interrupted_batches(db, pipeline, recovering_batch_jids))
         
         if OWNER_ID:
             m = await app.send_message(OWNER_ID, "🟢 Mainframe Systems Online.")
