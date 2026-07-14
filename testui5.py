@@ -1671,60 +1671,33 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
 
     @app.on_message(filters.command(["go"]) & filters.user(OWNER_ID))
     async def batch_go(_, msg: Message):
-        global _batch_mode, _batch_links, _hold_uploads, _mass_upload_active
+        global _batch_mode, _batch_collection
         _batch_mode = True
-        _batch_links = []
-        _hold_uploads = True
-        _mass_upload_active = False
+        _batch_collection = []
         await msg.reply("🟢 **BATCH MODE INITIATED**\nPaste your URLs one by one. Send `/end` when finished.")
-        if _dashboard_msg_id:
-            text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
-            await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
 
     @app.on_message(filters.command(["end"]) & filters.user(OWNER_ID))
     async def batch_end(_, msg: Message):
-        global _batch_mode, _batch_links, _hold_uploads, _dashboard_msg_id, _dashboard_chat_id
+        global _batch_mode, _batch_collection, _pending_batches
         if not _batch_mode:
             return await msg.reply("⚠️ Not in batch mode. Use `/go` first.")
             
         _batch_mode = False
-        if not _batch_links:
-            _hold_uploads = False
+        if not _batch_collection:
             return await msg.reply("⚠️ No links were collected. Batch cancelled.")
 
-        await msg.reply(f"🚀 **PROCESSING BATCH**\nQueuing {len(_batch_links)} tasks. Uploads will be held until all are encoded.")
+        await msg.reply(f"🚀 **BATCH SUBMITTED**\nSent {len(_batch_collection)} tasks to the Orchestrator.")
         
-        for url_data in _batch_links:
-            url, title, chat_id = url_data
-            jid = str(uuid.uuid4())[:8]
-            tracker = await msg.reply(
-                f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (BATCH)`", 
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
-            )
-            
-            await db.create_job({
-                "id": jid, "url": url, "title": title, "source": "Direct", 
-                "quality": "auto", "strategy": LinkClassifier.classify(url), 
-                "chat_id": chat_id, "tracker_id": tracker.id
-            })
-            await pipeline.dl_q.put(jid)
-            
-        _batch_links.clear()
-        
-        asyncio.create_task(_monitor_batch_completion(db, msg.chat.id, app))
-        
-        if _dashboard_msg_id:
-            text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
-            await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
+        # Put the entire list of URLs into the processing queue
+        await _pending_batches.put(list(_batch_collection))
+        _batch_collection.clear()
 
     @app.on_message((filters.video | filters.document) & filters.user(OWNER_ID))
     async def auto_catch_media(_, msg: Message):
         if msg.document and msg.document.mime_type and not msg.document.mime_type.startswith("video/"): return
-        
         jid = str(uuid.uuid4())[:8]
         title = msg.caption.strip() if msg.caption else "Direct Media Upload"
         file_id = msg.video.file_id if msg.video else msg.document.file_id
-        
         tracker = await msg.reply(f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]]))
         await db.create_job({"id": jid, "url": file_id, "title": title, "source": "telegram", "strategy": "TELEGRAM", "chat_id": msg.chat.id, "tracker_id": tracker.id})
         await pipeline.dl_q.put(jid)
@@ -1738,14 +1711,11 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
                 jid = re.search(r"`([a-zA-Z0-9_]+)`", msg.reply_to_message.text).group(1)
                 new_title = msg.text.strip()
                 await db.update_job(jid, title=new_title)
-                
                 await msg.reply_to_message.delete()
                 await msg.delete()
-                
                 if _dashboard_msg_id:
                     text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
                     await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
-                    
             except Exception: pass
             return
 
@@ -1753,19 +1723,20 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         if url:
             title = msg.text.replace(url, "").strip() or url[:40]
             
-            global _batch_mode, _batch_links
+            global _batch_mode, _batch_collection
             if _batch_mode:
-                _batch_links.append((url, title, msg.chat.id))
-                await msg.reply(f"✅ Added to batch. Total: {len(_batch_links)}. Send `/end` to process.", quote=True)
-                if _dashboard_msg_id:
-                    text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
-                    await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
+                # Add to holding list without triggering processing
+                _batch_collection.append((url, title, msg.chat.id))
+                await msg.reply(f"✅ Added to batch. Total: {len(_batch_collection)}. Send `/end` to process.", quote=True)
             else:
+                # NORMAL LINK: Processes instantly, completely bypassing the batch holds
                 jid = str(uuid.uuid4())[:8]
                 tracker = await msg.reply(f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]]))
                 
                 await db.create_job({"id": jid, "url": url, "title": title, "source": "Direct", "quality": "auto", "strategy": LinkClassifier.classify(url), "chat_id": msg.chat.id, "tracker_id": tracker.id})
                 await pipeline.dl_q.put(jid)
+
+    # Note: Keep your existing @app.on_callback_query() exactly as it was originally.
 
     @app.on_callback_query()
     async def _router(client: Client, cb: CallbackQuery):
