@@ -1455,19 +1455,20 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
 
     sync_stat = "`RECOVERY AUDIT ACTIVE`" if recovery_pool else "`SYSTEM NORMAL`"
     
-    global _batch_mode, _batch_links, _hold_uploads, _mass_upload_active
+    global _batch_mode, _batch_collection
+    
+    # Dynamically check if any active jobs belong to a batch
+    batch_active = any(str(j.get('source', '')).startswith('Batch_') for j in standard_jobs)
     
     if _batch_mode:
-        stat_str = f"🟡 BATCH COLLECTION ({len(_batch_links)} ITEMS QUEUED)"
-    elif _hold_uploads:
-        stat_str = "🔵 BATCH PROCESSING (UPLOADS LOCKED)"
-    elif _mass_upload_active:
-        stat_str = "🟢 MASS UPLOAD SEQUENCE ACTIVE"
+        stat_str = f"🟡 BATCH COLLECTION ({len(_batch_collection)} ITEMS QUEUED)"
+    elif batch_active:
+        stat_str = "🔵 BATCH PROCESSING ACTIVE"
     else:
         stat_str = "ONLINE & SECURE"
     
     text = (
-        f"💻 **STEALTH MAINFRAME v14.5**\n"
+        f"💻 **STEALTH MAINFRAME v5.1**\n"
         f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
         f"`[⚡] STAT :` `{stat_str}`\n"
         f"`[⚠️] SYNC :` {sync_stat}\n"
@@ -1480,8 +1481,8 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
 
     kb_lines = []
     
-    if _hold_uploads:
-        kb_lines.append([InlineKeyboardButton("🔓 FORCE UPLOAD RELEASE", callback_data="force_release")])
+    # (Note: The old "FORCE UPLOAD RELEASE" button was removed here because 
+    # the new Orchestrator handles the uploader dumps automatically and safely.)
 
     def build_dropdown(target_stage: str, label: str, icon: str, job_list: list, parent_tab: str = "root"):
         is_stage_open = (stage_tab == target_stage)
