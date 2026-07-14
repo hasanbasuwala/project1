@@ -1113,25 +1113,41 @@ class RecoveryManager:
     async def scan_and_requeue(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.Queue, up_q: asyncio.Queue, app: Client):
         active = await db.get_active_jobs()
         resumed = []
+        recovering_batch_jids = []
+
         for job in active:
             jid, stage, title = job['id'], job['stage'], job['title'][:25]
+            is_batch = str(job.get('source', '')).startswith('Batch_')
             
             if stage in [Stage.QUEUED.value, Stage.DOWNLOADING.value] or "download" in stage:
                 await db.update_job(jid, stage=Stage.QUEUED.value, recovered_at_stage=stage)
-                dl_q.put_nowait(jid)
-                resumed.append(f"  ├ `[DL]` `{title}`")
+                if is_batch: 
+                    recovering_batch_jids.append(jid)
+                    resumed.append(f"  ├ `[BATCH DL HOLD]` `{title}`")
+                else: 
+                    dl_q.put_nowait(jid)
+                    resumed.append(f"  ├ `[DL]` `{title}`")
+            
             elif stage in [Stage.DOWNLOADED.value, Stage.ENCODING.value] or "enc" in stage:
                 await db.update_job(jid, stage=Stage.DOWNLOADED.value, recovered_at_stage=stage)
                 enc_q.put_nowait(jid)
                 resumed.append(f"  ├ `[ENC]` `{title}`")
+                if is_batch: recovering_batch_jids.append(jid)
+                
             elif stage in [Stage.ENCODED.value, Stage.UPLOADING.value] or "upload" in stage:
                 await db.update_job(jid, stage=Stage.ENCODED.value, recovered_at_stage=stage)
-                up_q.put_nowait(jid)
-                resumed.append(f"  ├ `[UP]` `{title}`")
+                if is_batch: 
+                    recovering_batch_jids.append(jid)
+                    resumed.append(f"  ├ `[BATCH UP HOLD]` `{title}`")
+                else: 
+                    up_q.put_nowait(jid)
+                    resumed.append(f"  ├ `[UP]` `{title}`")
 
         if resumed and OWNER_ID:
             try: await app.send_message(OWNER_ID, "🔄 **RESUME AUDITOR**\n" + "\n".join(resumed))
             except Exception: pass
+            
+        return recovering_batch_jids
 
 # ──────────────────────────── PIPELINE MANAGER (Orchestrator) ───────────
 
