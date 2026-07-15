@@ -413,9 +413,13 @@ class DownloaderEngine:
         from playwright_stealth import Stealth 
         import shutil
         import os
+        import time
         
         path_to_extension = "/root/stealth_bot_v13/uBOL-home-main/chromium"
-        user_data_dir = f"/tmp/pw_data_{jid}" 
+        
+        # 1. CRITICAL FIX: Add a timestamp to guarantee a 100% clean browser profile per attempt.
+        # This prevents bad proxies from corrupting the local Wi-Fi fallback.
+        user_data_dir = f"/tmp/pw_data_{jid}_{int(time.time())}" 
         
         extracted_payload = {"url": None, "headers": {}, "cookie_str": "", "raw_cookies": []}
         found_urls = []
@@ -423,6 +427,21 @@ class DownloaderEngine:
 
         proxy_config = {"server": proxy_url} if proxy_url else None
         
+        # 2. Base arguments
+        args = [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-site-isolation-trials", 
+            "--disable-web-security",          
+            f"--disable-extensions-except={path_to_extension}",
+            f"--load-extension={path_to_extension}"
+        ]
+        
+        # 3. CRITICAL FIX: Explicitly block system/cached proxies when running on local Wi-Fi
+        if not proxy_url:
+            args.append("--no-proxy-server")
+            
         async with async_playwright() as p:
             context = await p.chromium.launch_persistent_context(
                 user_data_dir,
@@ -432,20 +451,14 @@ class DownloaderEngine:
                 user_agent=USER_AGENT,
                 viewport={"width": 1920, "height": 1080},
                 locale="en-US",
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-site-isolation-trials", 
-                    "--disable-web-security",          
-                    f"--disable-extensions-except={path_to_extension}",
-                    f"--load-extension={path_to_extension}"
-                ]
+                args=args
             )
             
             page = context.pages[0]
             await Stealth().apply_stealth_async(page)
             await page.wait_for_timeout(2000) 
+            
+            # ... (Keep the rest of your handle_response, handle_route, and extraction logic exactly the same below this point) ... 
 
             async def handle_response(response):
                 try:
