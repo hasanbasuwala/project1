@@ -411,13 +411,13 @@ class DownloaderEngine:
     async def _run_playwright_extraction(self, url: str, jid: str, dl_dir: Path, proxy_url: str = None) -> dict:
         from playwright.async_api import async_playwright
         from playwright_stealth import Stealth 
+        from urllib.parse import urlparse
         import shutil
         import os
         import time
         
         path_to_extension = "/root/stealth_bot_v13/uBOL-home-main/chromium"
         
-        # Ensures a 100% clean browser profile per attempt to prevent proxy bleed
         user_data_dir = f"/tmp/pw_data_{jid}_{int(time.time())}" 
         
         extracted_payload = {"url": None, "headers": {}, "cookie_str": "", "raw_cookies": []}
@@ -436,7 +436,6 @@ class DownloaderEngine:
             f"--load-extension={path_to_extension}"
         ]
         
-        # Explicitly block system/cached proxies when running on local Wi-Fi
         if not proxy_url:
             args.append("--no-proxy-server")
             
@@ -462,7 +461,6 @@ class DownloaderEngine:
                     url_lower = req.url.lower()
                     content_type = response.headers.get("content-type", "").lower()
                     
-                    # CRITICAL FIX 1: Strict boundaries on "ad" to prevent false positives
                     bad_keywords = ["google", "analytics", "/ad/", "/ads/", "?ad=", "&ad=", "beacon", "vast", "blank", "trailer", "promo"]
                     if any(bad in url_lower for bad in bad_keywords): return
                     
@@ -476,7 +474,6 @@ class DownloaderEngine:
                         is_media = True
                         vtype = "mp4"
                     elif "application/octet-stream" in content_type and req.resource_type in ["media", "xhr", "fetch"]:
-                        # Heuristic: If octet-stream is large (>100kb), it's likely a media chunk
                         cl = int(response.headers.get("content-length", 0))
                         if cl > 100000: 
                             is_media = True
@@ -491,68 +488,59 @@ class DownloaderEngine:
                     
             page.on("response", handle_response)
 
-            # CRITICAL FIX 2: Removed the handle_route image blocker entirely.
-            # Video players rely on poster image 'onload' events to initialize the media streams.
-
             try:
                 self.db.log_trace(jid, "Navigating to main target URL...")
                 await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 
                 try:
-                    await page.screenshot(path=str(dl_dir / f"{jid}_01_initial_load.png"))
-                except Exception: pass
-                
-                try:
-                    age_gate = await page.wait_for_selector("a.av_btn.av_go[rel='yes']", state="visible", timeout=10000)
-                    if age_gate:
-                        self.db.log_trace(jid, "Age-gate detected. Clicking 'Yes'...")
-                        await age_gate.click()
-                        await page.wait_for_timeout(2000)
+                    await page.evaluate("""() => {
+                        const keywords = ['yes', 'enter', 'agree', '18', 'warning'];
+                        document.querySelectorAll('a, button, div').forEach(el => {
+                            if(el.innerText && keywords.some(k => el.innerText.toLowerCase().includes(k))) {
+                                if(el.offsetHeight > 10 && el.offsetHeight < 100) {
+                                    try { el.click(); } catch(e){}
+                                }
+                            }
+                        });
+                    }""")
+                    await page.wait_for_timeout(1500)
                 except Exception:
                     pass
 
                 try:
-                    await page.screenshot(path=str(dl_dir / f"{jid}_02_post_age_gate.png"))
-                except Exception: pass
-
-                try:
-                    fake_player = await page.wait_for_selector("div.vi-on, div.play", state="visible", timeout=5000)
+                    fake_player = await page.wait_for_selector("div.vi-on, div.play, .play-button", state="visible", timeout=3000)
                     if fake_player:
-                        self.db.log_trace(jid, "Clicking fake player overlay to spawn iframe...")
+                        self.db.log_trace(jid, "Clicking fake player overlay...")
                         await fake_player.click()
-                        await page.wait_for_timeout(4000)
+                        await page.wait_for_timeout(3000)
                 except Exception:
-                    self.db.log_trace(jid, "No fake player overlay found. Proceeding...")
-
-                try:
-                    await page.screenshot(path=str(dl_dir / f"{jid}_03_pre_click_bomb.png"))
-                except Exception: pass
+                    pass
 
                 try:
                     self.db.log_trace(jid, f"Scanning main page and {len(page.frames)} child frames for video players...")
                     jw_url = None
                     
+                    iframes = await page.query_selector_all("iframe")
+                    for iframe in iframes:
+                        try:
+                            await iframe.scroll_into_view_if_needed()
+                            box = await iframe.bounding_box()
+                            if box and box["width"] > 100 and box["height"] > 100:
+                                await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                                await page.wait_for_timeout(1000)
+                        except Exception:
+                            pass
+                    
                     viewport = page.viewport_size
                     cx = viewport['width'] / 2
                     cy = viewport['height'] / 2
-                    
-                    click_targets = [
-                        (cx, cy),          
-                        (cx, cy + 100),    
-                        (50, viewport['height'] - 50) 
-                    ]
+                    click_targets = [(cx, cy), (cx, cy + 100), (50, viewport['height'] - 50)]
                     
                     for x, y in click_targets:
-                        await page.mouse.move(x, y)
-                        await page.mouse.down()
-                        await page.mouse.up()
+                        await page.mouse.click(x, y)
                         await page.wait_for_timeout(800)
                     
                     await page.wait_for_timeout(6000) 
-                    
-                    try:
-                        await page.screenshot(path=str(dl_dir / f"{jid}_04_post_click_bomb.png"))
-                    except Exception: pass
                     
                     frames_to_search = [page.main_frame] + page.frames
                     
@@ -577,10 +565,9 @@ class DownloaderEngine:
                                     let v = document.querySelector('video'); 
                                     if (v && v.src && !v.src.startsWith('blob:') && !isBad(v.src)) return v.src;
                                     
-                                    // Aggressive scraping for direct download buttons
-                                    let dl = document.querySelector('a[href*=".mp4"], a.download-btn');
+                                    let dls = Array.from(document.querySelectorAll('a'));
+                                    let dl = dls.find(a => (a.href && a.href.includes('.mp4')) || (a.innerText && a.innerText.toLowerCase().includes('download')));
                                     if (dl && dl.href && !isBad(dl.href)) return dl.href;
-                                    
                                 } catch(e) {}
                                 return null;
                             }''')
@@ -610,27 +597,21 @@ class DownloaderEngine:
                             extracted_payload["url"] = mp4s[-1]
                             self.db.log_trace(jid, "Sniffer successfully locked onto MP4 Stream.")
                         else:
-                            # CRITICAL FIX 3: Do NOT fallback to the webpage URL. It will crash the validation gate.
                             self.db.log_trace(jid, "Sniffer logs are empty. Extraction completely failed.")
                             
             except Exception as e:
                 self.db.log_trace(jid, f"Playwright critical failure: {e}")
-                try:
-                    await page.screenshot(path=str(dl_dir / f"{jid}_crash_screenshot.png"))
-                    html_content = await page.content()
-                    with open(dl_dir / f"{jid}_crash_dump.html", "w", encoding="utf-8") as f:
-                        f.write(html_content)
-                    self.db.log_trace(jid, "Crash screenshot and HTML saved.")
-                except Exception:
-                    pass
 
-            # IF we still don't have a URL, don't return a bad payload
-            if not extracted_payload.get("url"):
+            media_url = extracted_payload.get("url")
+            if not media_url:
+                await context.close()
                 return extracted_payload
 
+            # CRITICAL FIX: Cross-Origin CDN Protection
+            main_domain = urlparse(url).netloc.replace("www.", "")
+            media_domain = urlparse(media_url).netloc.replace("www.", "")
+
             extracted_payload["headers"] = {
-                "Referer": url, 
-                "Origin": "/".join(url.split("/")[:3]),
                 "User-Agent": USER_AGENT,
                 "Accept": "*/*",
                 "Connection": "keep-alive"
@@ -647,8 +628,23 @@ class DownloaderEngine:
             extracted_payload["headers"]["sec-ch-ua-platform"] = '"Windows"'
             
             cookies = await context.cookies()
-            extracted_payload["raw_cookies"] = cookies
-            extracted_payload["cookie_str"] = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+
+            if main_domain not in media_domain and media_domain not in main_domain:
+                self.db.log_trace(jid, f"Cross-Origin CDN detected ({media_domain}). Purging toxic cookies and overriding Referer.")
+                extracted_payload["cookie_str"] = ""
+                extracted_payload["raw_cookies"] = []
+                
+                if "twimg.com" in media_domain:
+                    extracted_payload["headers"]["Referer"] = "https://twitter.com/"
+                    extracted_payload["headers"]["Origin"] = "https://twitter.com"
+                else:
+                    extracted_payload["headers"]["Referer"] = f"https://{media_domain}/"
+                    extracted_payload["headers"]["Origin"] = f"https://{media_domain}"
+            else:
+                extracted_payload["headers"]["Referer"] = url
+                extracted_payload["headers"]["Origin"] = "/".join(url.split("/")[:3])
+                extracted_payload["raw_cookies"] = cookies
+                extracted_payload["cookie_str"] = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
 
             await context.close()
             try:
