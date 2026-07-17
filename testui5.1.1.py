@@ -190,7 +190,8 @@ async def get_random_free_proxy() -> str:
                     proxies = [line.strip() for line in text.split('\n') if line.strip()]
                     if proxies:
                         selected = random.choice(proxies)
-                        return f"http://{selected}"
+                        # Fix: Prevent double-scheme formatting
+                        return selected if selected.startswith("http") else f"http://{selected}"
     except Exception as e:
         print(f"Proxy fetch failed: {e}")
     return ""
