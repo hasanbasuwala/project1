@@ -1423,7 +1423,6 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
         "up": [j for j in standard_jobs if _base(j['stage']) == "uploading"]
     }
 
-    # ─── NEW: DYNAMIC ACT LIST BUILDER ───
     act_text_blocks = []
     if not buckets['dl'] and not buckets['enc'] and not buckets['up']:
         act_text_blocks.append("`[🔄] ACT  :` `0 DL | 0 PR | 0 UP`")
@@ -1433,7 +1432,7 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
         
         if buckets['dl']:
             act_text_blocks.append(f"`  {counter}. DL ({len(buckets['dl'])})`")
-            for i, j in enumerate(buckets['dl'][:5]): # Capped at 5 for UI safety
+            for i, j in enumerate(buckets['dl'][:5]):
                 pct = float(j.get('pct', 0.0) or 0.0)
                 act_text_blocks.append(f"`     {chr(97+i)}. {j['title'][:12]}.. [{make_bar(pct, 8)}] {pct:.1f}%`")
             counter += 1
@@ -1452,13 +1451,10 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
                 act_text_blocks.append(f"`     {chr(97+i)}. {j['title'][:12]}.. [{make_bar(pct, 8)}] {pct:.1f}%`")
                 
     act_string = "\n".join(act_text_blocks)
-    # ─────────────────────────────────────
 
     sync_stat = "`RECOVERY AUDIT ACTIVE`" if recovery_pool else "`SYSTEM NORMAL`"
     
     global _batch_mode, _batch_collection
-    
-    # Dynamically check if any active jobs belong to a batch
     batch_active = any(str(j.get('source', '')).startswith('Batch_') for j in standard_jobs)
     
     if _batch_mode:
@@ -1469,7 +1465,7 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
         stat_str = "ONLINE & SECURE"
     
     text = (
-        f"💻 **STEALTH MAINFRAME v5.1**\n"
+        f"💻 **MAINFRAME v5.1.2**\n"
         f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
         f"`[⚡] STAT :` `{stat_str}`\n"
         f"`[⚠️] SYNC :` {sync_stat}\n"
@@ -1481,10 +1477,43 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
     )
 
     kb_lines = []
-    
-    # (Note: The old "FORCE UPLOAD RELEASE" button was removed here because 
-    # the new Orchestrator handles the uploader dumps automatically and safely.)
 
+    # Helper for Batch Dropdowns
+    def build_batch_dropdown(target_stage: str, label: str, icon: str, job_list: list, parent_tab: str = "root"):
+        batch_jobs = [j for j in job_list if str(j.get('source', '')).startswith('Batch_')]
+        if not batch_jobs: return
+
+        batches = {}
+        for j in batch_jobs:
+            src = j['source']
+            if src not in batches: batches[src] = []
+            batches[src].append(j)
+
+        is_stage_open = (stage_tab == target_stage)
+        prefix = "[-]" if is_stage_open else "[+]"
+        parent_nav = parent_tab if is_stage_open and target_stage != "root" else ("root" if is_stage_open else target_stage)
+        
+        kb_lines.append([InlineKeyboardButton(f"{prefix} {icon} {label} ({len(batches)} BATCHES)", callback_data=f"dash|{parent_nav}")])
+        
+        if is_stage_open:
+            for b_name, b_jobs in batches.items():
+                is_this_batch_open = (expanded_jid == b_name)
+                b_prefix = "[-]" if is_this_batch_open else "[+]"
+                
+                next_cb = f"dash|{target_stage}" if is_this_batch_open else f"dash|{target_stage}:{b_name}"
+                kb_lines.append([InlineKeyboardButton(f" └ {b_prefix} 📦 {b_name} ({len(b_jobs)} Active)", callback_data=next_cb)])
+                
+                if is_this_batch_open:
+                    for j in b_jobs[:10]:
+                        title = j['title'][:10]
+                        pct = float(j.get('pct', 0.0) or 0.0)
+                        stage_short = _base(j.get('stage', ''))[:4].upper()
+                        kb_lines.append([
+                            InlineKeyboardButton(f"      ├ [{stage_short}] {title}.. | {pct:.1f}%", callback_data="noop"),
+                            InlineKeyboardButton("❌", callback_data=f"kill|{j['id']}")
+                        ])
+
+    # Helper for Standard Dropdowns
     def build_dropdown(target_stage: str, label: str, icon: str, job_list: list, parent_tab: str = "root"):
         is_stage_open = (stage_tab == target_stage)
         prefix = "[-]" if is_stage_open else "[+]"
@@ -1530,7 +1559,7 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
                     ])
 
     if recovery_pool:
-        is_rec_open = stage_tab in ["recovery", "rec_dl", "rec_enc", "rec_up"]
+        is_rec_open = stage_tab in ["recovery", "rec_dl", "rec_enc", "rec_up", "rec_batches"]
         kb_lines.append([InlineKeyboardButton(f"{'[-]' if is_rec_open else '[+]'} 🚨 RECOVERY POOL ({len(recovery_pool)})", callback_data=f"dash|{'root' if is_rec_open else 'recovery'}")])
         
         if is_rec_open:
@@ -1538,11 +1567,17 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
             rec_enc = [j for j in recovery_pool if _base(j['recovered_at_stage']) in ["encoding", "encoded"]]
             rec_up = [j for j in recovery_pool if _base(j['recovered_at_stage']) == "uploading"]
             
+            # Subsystem Batch injection in Recovery
+            build_batch_dropdown("rec_batches", "STALLED BATCHES", "📦", recovery_pool, parent_tab="recovery")
+            
             build_dropdown("rec_dl", "STALLED DOWNLOADS", "📥", rec_dl, parent_tab="recovery")
             build_dropdown("rec_enc", "STALLED PROCESSING", "⚙️", rec_enc, parent_tab="recovery")
             build_dropdown("rec_up", "STALLED UPLOADS", "📤", rec_up, parent_tab="recovery")
             
             kb_lines.append([InlineKeyboardButton("🗑️ PURGE ALL RECOVERED", callback_data="purge_recovery")])
+
+    # Subsystem Batch injection in Main Dashboard
+    build_batch_dropdown("main_batches", "ACTIVE BATCHES", "📦", standard_jobs, parent_tab="root")
 
     build_dropdown("dl", "DOWNLOADING", "📥", buckets["dl"])
     build_dropdown("dl_done", "WAITING PROC", "⏳", buckets["dl_done"])
