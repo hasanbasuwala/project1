@@ -2105,6 +2105,8 @@ async def main():
         asyncio.create_task(ui_accumulator.run_loop()) 
         asyncio.create_task(terminal_loop(db, pipeline))
         
+        # ... [Keep previous bootstrap code in main()] ...
+        
         # ─── BATCH ORCHESTRATORS ───
         asyncio.create_task(_batch_runner(db, pipeline, app))
         if recovering_batch_jids:
@@ -2112,6 +2114,14 @@ async def main():
         
         if OWNER_ID:
             m = await app.send_message(OWNER_ID, "🟢 Mainframe Systems Online.")
+            
+            # --- Auto-Pin Logic Added Here ---
+            try:
+                await m.pin(disable_notification=True)
+            except Exception:
+                pass
+            # ---------------------------------
+            
             global _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab
             _dashboard_msg_id, _dashboard_chat_id = m.id, m.chat.id
             text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
