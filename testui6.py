@@ -1,5 +1,5 @@
 """
-stealth_bot.py - v5.1
+stealth_bot.py - v6
 ───────────────────────────────────────────────────────────────
 ARCHITECTURE:
   • Single-file Micro-Orchestration (Classes).
@@ -1648,7 +1648,7 @@ async def _process_single_batch(batch_items: list, batch_counter: int, db: JobSc
     batch_source = f"Batch_{batch_counter}"
     batch_jids = []
     
-    # 1. Sequential DL Feed (Wait for DL 1 to finish before submitting DL 2)
+    # 1. Register ALL items in the batch to the database IMMEDIATELY (Reboot-proofing)
     for url, title, chat_id in batch_items:
         jid = str(uuid.uuid4())[:8]
         batch_jids.append(jid)
@@ -1665,6 +1665,8 @@ async def _process_single_batch(batch_items: list, batch_counter: int, db: JobSc
             "chat_id": chat_id, "tracker_id": tracker.id
         })
         
+    # 2. Sequential DL Feed (Wait for DL 1 to finish before submitting DL 2)
+    for jid in batch_jids:
         # Submit ONE item to download
         await pipeline.dl_q.put(jid)
         
@@ -1679,7 +1681,7 @@ async def _process_single_batch(batch_items: list, batch_counter: int, db: JobSc
             if base_stage not in ["queued", "downloading"]: 
                 break
     
-    # 2. Wait for ALL items in THIS specific batch to finish processing
+    # 3. Wait for ALL items in THIS specific batch to finish processing
     while True:
         await asyncio.sleep(3)
         all_done = True
@@ -1693,7 +1695,7 @@ async def _process_single_batch(batch_items: list, batch_counter: int, db: JobSc
         if all_done:
             break
             
-    # 3. Mass Upload Sequence (Dump finished encodings for THIS batch to the Uploader)
+    # 4. Mass Upload Sequence (Dump finished encodings for THIS batch to the Uploader)
     for jid in batch_jids:
         job = await db.get_job(jid)
         if job:
