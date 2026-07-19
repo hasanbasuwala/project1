@@ -74,6 +74,7 @@ MAX_DL_WORKERS, MAX_RETRIES = 20, 3
 # ──────────────────────────── BATCH CONFIGURATION ─────────────────────
 _batch_mode = False
 _batch_collection = []
+_current_batch_name = None
 _pending_batches = asyncio.Queue()
 
 C_CYAN, C_YELLOW, C_RED, C_GREEN, C_RESET, C_BOLD = "\033[36m", "\033[33m", "\033[31m", "\033[32m", "\033[0m", "\033[1m"
