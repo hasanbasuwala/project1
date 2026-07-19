@@ -1400,8 +1400,20 @@ def _job_tracker_text(job: dict, avg_speed: str = None, avg_eta: str = None) -> 
 async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: PipelineManager) -> tuple[str, InlineKeyboardMarkup]:
     global _last_completed
     
-    stage_tab = tab.split(":")[0] if ":" in tab else tab
-    expanded_jid = tab.split(":")[1] if ":" in tab else None
+    parts = tab.split(":")
+    stage_tab = parts[0]
+    
+    expanded_batch = None
+    expanded_jid = None
+    
+    if len(parts) == 2:
+        if parts[1].startswith("Batch_"):
+            expanded_batch = parts[1]
+        else:
+            expanded_jid = parts[1]
+    elif len(parts) == 3:
+        expanded_batch = parts[1]
+        expanded_jid = parts[2]
 
     total_storage = sum(f.stat().st_size for f in JOBS_DIR.rglob("*") if f.is_file()) / (1024 ** 3)
     jobs = await db.get_active_jobs()
