@@ -1684,64 +1684,56 @@ async def _monitor_batch_completion(db: JobScheduler, chat_id: int, app: Client)
             break
             
 async def _process_single_batch(batch_items: list, batch_counter: int, db: JobScheduler, pipeline: PipelineManager, app: Client):
-    """Handles the lifecycle of a single batch independently of other batches."""
+    """Handles the lifecycle of a single batch independently, showing only one active job card at a time."""
     batch_source = f"Batch_{batch_counter}"
     batch_jids = []
     
-    # 1. Register ALL items in the batch to the database IMMEDIATELY (Reboot-proofing)
+    # 1. Register ALL items in the database IMMEDIATELY (Reboot-proofing)
+    # But notice: We DO NOT create Telegram tracker messages here anymore!
     for url, title, chat_id in batch_items:
         jid = str(uuid.uuid4())[:8]
         batch_jids.append(jid)
         
-        tracker = await app.send_message(
-            chat_id, 
-            f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (BATCH {batch_counter})`", 
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
-        )
-        
         await db.create_job({
             "id": jid, "url": url, "title": title, "source": batch_source, 
             "quality": "auto", "strategy": LinkClassifier.classify(url), 
-            "chat_id": chat_id, "tracker_id": tracker.id
+            "chat_id": chat_id, "tracker_id": None  # Managed dynamically below
         })
         
-    # 2. Sequential DL Feed (Wait for DL 1 to finish before submitting DL 2)
-    for jid in batch_jids:
-        # Submit ONE item to download
-        await pipeline.dl_q.put(jid)
-        
-        # Wait for this specific item to clear the download stage
-        while True:
-            await asyncio.sleep(2)
-            job = await db.get_job(jid)
-            if not job: 
-                break # Job was killed, move on
-            base_stage = job.get('stage', '').split('|')[0].strip().lower()
-            # Once it hits "downloaded" (or encoding), we break and submit the next link
-            if base_stage not in ["queued", "downloading"]: 
-                break
-    
-    # 3. Wait for ALL items in THIS specific batch to finish processing
-    while True:
-        await asyncio.sleep(3)
-        all_done = True
-        for jid in batch_jids:
-            job = await db.get_job(jid)
-            if job:
-                base_stage = job.get('stage', '').split('|')[0].strip().lower()
-                if base_stage in ["queued", "downloading", "downloaded", "encoding", "process"]:
-                    all_done = False
-                    break
-        if all_done:
-            break
-            
-    # 4. Mass Upload Sequence (Dump finished encodings for THIS batch to the Uploader)
+    # 2. Sequential Processing & Rolling UI Card Allocation
     for jid in batch_jids:
         job = await db.get_job(jid)
-        if job:
-            base_stage = job.get('stage', '').split('|')[0].strip().lower()
-            if base_stage == "encoded":
-                await pipeline.up_q.put(jid)
+        if not job:
+            continue
+            
+        # Spawn ONE single tracker message right before the job starts processing
+        tracker = await app.send_message(
+            job['chat_id'], 
+            f"`[ ⚡ ] ＴＡＳＫ :` `{job['title'][:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `PROCESSING (BATCH {batch_counter})`", 
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
+        )
+        # Link the dynamic tracker ID to the active job
+        await db.update_job(jid, tracker_id=tracker.id)
+        
+        # Submit the item to download
+        await pipeline.dl_q.put(jid)
+        
+        # Wait for this specific item to clear the processing pipeline entirely (Download + Encode)
+        while True:
+            await asyncio.sleep(2)
+            current_job = await db.get_job(jid)
+            if not current_job: 
+                break # Job was killed, break loop
+                
+            base_stage = current_job.get('stage', '').split('|')[0].strip().lower()
+            # Wait until it finishes encoding (or hits completed/failed) before releasing the loop
+            if base_stage in ["encoded", "completed", "failed", "cancelled"]: 
+                break
+                
+        # Send to the uploader queue immediately since this item finished processing
+        updated_job = await db.get_job(jid)
+        if updated_job and updated_job.get('stage') == "encoded":
+            await pipeline.up_q.put(jid)
     
     # Mark this specific batch as fully dispatched
     _pending_batches.task_done()
