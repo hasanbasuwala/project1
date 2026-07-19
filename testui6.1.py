@@ -1478,7 +1478,7 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
         stat_str = "ONLINE & SECURE"
     
     text = (
-        f"💻 **MAINFRAME v5.1.2**\n"
+        f"💻 **MAINFRAME v6.1**\n"
         f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
         f"`[⚡] STAT :` `{stat_str}`\n"
         f"`[⚠️] SYNC :` {sync_stat}\n"
@@ -1683,14 +1683,15 @@ async def _monitor_batch_completion(db: JobScheduler, chat_id: int, app: Client)
                 if not jobs:
                     _mass_upload_active = False
             break
-            
-async def _process_single_batch(batch_items: list, batch_counter: int, db: JobScheduler, pipeline: PipelineManager, app: Client):
+
+async def _process_single_batch(batch_items: list, batch_counter: int, custom_name: str, db: JobScheduler, pipeline: PipelineManager, app: Client):
     """Handles the lifecycle of a single batch independently, showing only one active job card at a time."""
-    batch_source = f"Batch_{batch_counter}"
+    # Use the custom name if provided, otherwise default to the counter
+    actual_name = custom_name if custom_name else str(batch_counter)
+    batch_source = f"Batch_{actual_name}"
     batch_jids = []
     
     # 1. Register ALL items in the database IMMEDIATELY (Reboot-proofing)
-    # But notice: We DO NOT create Telegram tracker messages here anymore!
     for url, title, chat_id in batch_items:
         jid = str(uuid.uuid4())[:8]
         batch_jids.append(jid)
@@ -1698,7 +1699,7 @@ async def _process_single_batch(batch_items: list, batch_counter: int, db: JobSc
         await db.create_job({
             "id": jid, "url": url, "title": title, "source": batch_source, 
             "quality": "auto", "strategy": LinkClassifier.classify(url), 
-            "chat_id": chat_id, "tracker_id": None  # Managed dynamically below
+            "chat_id": chat_id, "tracker_id": None
         })
         
     # 2. Sequential Processing & Rolling UI Card Allocation
@@ -1707,12 +1708,13 @@ async def _process_single_batch(batch_items: list, batch_counter: int, db: JobSc
         if not job:
             continue
             
-        # Spawn ONE single tracker message right before the job starts processing
         tracker = await app.send_message(
             job['chat_id'], 
-            f"`[ ⚡ ] ＴＡＳＫ :` `{job['title'][:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `PROCESSING (BATCH {batch_counter})`", 
+            f"`[ ⚡ ] ＴＡＳＫ :` `{job['title'][:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `PROCESSING (BATCH {actual_name})`", 
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
         )
+        
+# ... [Keep the rest of _process_single_batch exactly as it was] ...
         # Link the dynamic tracker ID to the active job
         await db.update_job(jid, tracker_id=tracker.id)
         
@@ -1744,12 +1746,12 @@ async def _batch_runner(db: JobScheduler, pipeline: PipelineManager, app: Client
     """Dispatches incoming batches to independent asynchronous workers."""
     batch_counter = 0
     while True:
-        # Wait for a batch to be submitted via /end
-        batch_items = await _pending_batches.get()
+        # Unpack the custom name and items from the queue
+        custom_name, batch_items = await _pending_batches.get()
         batch_counter += 1
         
-        # Spawn a concurrent task for this batch so it doesn't block future batches
-        asyncio.create_task(_process_single_batch(batch_items, batch_counter, db, pipeline, app))
+        # Pass the custom name into the processor
+        asyncio.create_task(_process_single_batch(batch_items, batch_counter, custom_name, db, pipeline, app))
         
 async def _resume_interrupted_batches(db: JobScheduler, pipeline: PipelineManager, batch_jids: list):
     # 1. Isolate the jobs that still need to be downloaded
