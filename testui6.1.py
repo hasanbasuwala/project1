@@ -1809,8 +1809,11 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         global _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab
         m = await msg.reply("🟢 Booting Mainframe...")
         _dashboard_msg_id, _dashboard_chat_id = m.id, m.chat.id
-        try: await m.pin(disable_notification=True)
-        except Exception: pass
+        try: 
+            await app.unpin_all_chat_messages(m.chat.id)
+            await m.pin(disable_notification=True, both_sides=True)
+        except Exception: 
+            pass
         text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
         await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
 
@@ -2167,7 +2170,8 @@ async def main():
             
             # --- Auto-Pin Logic Added Here ---
             try:
-                await m.pin(disable_notification=True)
+                await app.unpin_all_chat_messages(m.chat.id)
+                await m.pin(disable_notification=True, both_sides=True)
             except Exception:
                 pass
             # ---------------------------------
