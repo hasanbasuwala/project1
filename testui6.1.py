@@ -1509,7 +1509,7 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
         
         if is_stage_open:
             for b_name, b_jobs in batches.items():
-                is_this_batch_open = (expanded_jid == b_name)
+                is_this_batch_open = (expanded_batch == b_name)
                 b_prefix = "[-]" if is_this_batch_open else "[+]"
                 
                 next_cb = f"dash|{target_stage}" if is_this_batch_open else f"dash|{target_stage}:{b_name}"
@@ -1517,13 +1517,41 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
                 
                 if is_this_batch_open:
                     for j in b_jobs[:10]:
+                        jid = j['id']
                         title = j['title'][:10]
-                        pct = float(j.get('pct', 0.0) or 0.0)
-                        stage_short = _base(j.get('stage', ''))[:4].upper()
-                        kb_lines.append([
-                            InlineKeyboardButton(f"      ├ [{stage_short}] {title}.. | {pct:.1f}%", callback_data="noop"),
-                            InlineKeyboardButton("❌", callback_data=f"kill|{j['id']}")
-                        ])
+                        is_job_expanded = (expanded_jid == jid)
+                        
+                        if is_job_expanded:
+                            raw_stage = j.get('stage', '')
+                            speed, eta = "—", "—"
+                            if "|" in raw_stage:
+                                p = [p.strip() for p in raw_stage.split("|")]
+                                if len(p) >= 3: speed, eta = p[1], p[2]
+                                
+                            pct = float(j.get('pct', 0.0) or 0.0)
+                            bar = make_bar(pct, 8)
+                            
+                            kb_lines.append([InlineKeyboardButton(f"🪪 ISOLATED JOB CARD: {jid}", callback_data="noop")])
+                            kb_lines.append([InlineKeyboardButton(f"📁 {title}...", callback_data="noop")])
+                            kb_lines.append([InlineKeyboardButton(f"⚡ {speed}  |  ⏳ {eta}", callback_data="noop")])
+                            kb_lines.append([InlineKeyboardButton(f"📊 [{bar}] {pct:.1f}%", callback_data="noop")])
+                            kb_lines.append([
+                                InlineKeyboardButton("📄 LOGS", callback_data=f"joblog|{jid}"),
+                                InlineKeyboardButton("❌ KILL", callback_data=f"kill|{jid}")
+                            ])
+                            kb_lines.append([
+                                InlineKeyboardButton("✏️ RENAME", callback_data=f"rename|{jid}"),
+                                InlineKeyboardButton("⏭ FORCE UP", callback_data=f"forceup|{jid}")
+                            ])
+                            kb_lines.append([InlineKeyboardButton("🔙 CLOSE CARD", callback_data=f"dash|{target_stage}:{b_name}")])
+                        else:
+                            pct = float(j.get('pct', 0.0) or 0.0)
+                            stage_short = _base(j.get('stage', ''))[:4].upper()
+                            # Updated callback data to include target, batch name, and job id
+                            kb_lines.append([
+                                InlineKeyboardButton(f"      ├ [{stage_short}] {title}.. | {pct:.1f}%", callback_data=f"dash|{target_stage}:{b_name}:{jid}"),
+                                InlineKeyboardButton("❌", callback_data=f"kill|{j['id']}")
+                            ])
 
     # Helper for Standard Dropdowns
     def build_dropdown(target_stage: str, label: str, icon: str, job_list: list, parent_tab: str = "root"):
