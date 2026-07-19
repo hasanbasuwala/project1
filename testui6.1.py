@@ -1812,14 +1812,20 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
 
     @app.on_message(filters.command(["go"]) & filters.user(OWNER_ID))
     async def batch_go(_, msg: Message):
-        global _batch_mode, _batch_collection
+        global _batch_mode, _batch_collection, _current_batch_name
         _batch_mode = True
         _batch_collection = []
-        await msg.reply("🟢 **BATCH MODE INITIATED**\nPaste your URLs one by one. Send `/end` when finished.")
+        
+        # Extract custom name if provided (e.g., "/go Marvel_Movies")
+        args = msg.text.split(maxsplit=1)
+        _current_batch_name = args[1].strip() if len(args) > 1 else None
+        
+        display_name = _current_batch_name or "Auto-generated Number"
+        await msg.reply(f"🟢 **BATCH MODE INITIATED**\n🏷️ **Name:** `{display_name}`\nPaste your URLs one by one. Send `/end` when finished.")
 
     @app.on_message(filters.command(["end"]) & filters.user(OWNER_ID))
     async def batch_end(_, msg: Message):
-        global _batch_mode, _batch_collection, _pending_batches
+        global _batch_mode, _batch_collection, _pending_batches, _current_batch_name
         if not _batch_mode:
             return await msg.reply("⚠️ Not in batch mode. Use `/go` first.")
             
@@ -1829,9 +1835,10 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
 
         await msg.reply(f"🚀 **BATCH SUBMITTED**\nSent {len(_batch_collection)} tasks to the Orchestrator.")
         
-        # Put the entire list of URLs into the processing queue
-        await _pending_batches.put(list(_batch_collection))
+        # Put the items AND the custom name into the processing queue
+        await _pending_batches.put((_current_batch_name, list(_batch_collection)))
         _batch_collection.clear()
+        _current_batch_name = None
 
     @app.on_message((filters.video | filters.document) & filters.user(OWNER_ID))
     async def auto_catch_media(_, msg: Message):
