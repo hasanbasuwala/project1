@@ -506,6 +506,36 @@ class DownloaderEngine:
                 self.db.log_trace(jid, "Navigating to main target URL...")
                 await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 
+                # --- ADDED: VK PLAYWRIGHT AUTHENTICATION ---
+                if "vk.com" in url:
+                    # Look for the Sign In button shown in the error screenshot
+                    sign_in_btn = page.locator("a:has-text('Sign in'), button:has-text('Sign in')").first
+                    if await sign_in_btn.is_visible():
+                        self.db.log_trace(jid, "VK Auth Wall detected. Injecting Playwright credentials...")
+                        try:
+                            await sign_in_btn.click()
+                            await page.wait_for_timeout(3000)
+
+                            # Fill Phone/Email
+                            user_input = page.locator("input[name='login']")
+                            if await user_input.is_visible() and VK_USERNAME:
+                                await user_input.fill(VK_USERNAME)
+                                await page.keyboard.press("Enter")
+                                await page.wait_for_timeout(3000)
+
+                            # Fill Password
+                            pass_input = page.locator("input[name='password']")
+                            if await pass_input.is_visible() and VK_PASSWORD:
+                                await pass_input.fill(VK_PASSWORD)
+                                await page.keyboard.press("Enter")
+                                await page.wait_for_timeout(5000)
+
+                            self.db.log_trace(jid, "Playwright auth sequence executed. Returning to target wall...")
+                            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                        except Exception as e:
+                            self.db.log_trace(jid, f"VK Auth automation failed: {e}")
+                # -------------------------------------------
+
                 try:
                     await page.screenshot(path=str(dl_dir / f"{jid}_01_initial_load.png"))
                 except Exception: pass
