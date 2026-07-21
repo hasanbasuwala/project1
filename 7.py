@@ -1519,7 +1519,7 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
         stat_str = "ONLINE & SECURE"
     
     text = (
-        f"💻 **MAINFRAME v6.1**\n"
+        f"💻 **MAINFRAME v7**\n"
         f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
         f"`[⚡] STAT :` `{stat_str}`\n"
         f"`[⚠️] SYNC :` {sync_stat}\n"
