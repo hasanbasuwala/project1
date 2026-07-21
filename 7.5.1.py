@@ -235,6 +235,20 @@ class DownloaderEngine:
             }
             json.dump(safe_payload, f)
             
+    async def _is_proxy_alive(self, proxy_url: str, timeout_seconds: int = 5) -> bool:
+        """Pings a lightweight endpoint to verify proxy health before deployment."""
+        try:
+            from curl_cffi import requests
+            proxies = {"http": proxy_url, "https": proxy_url}
+            
+            # Use a fast 5-second timeout. If a proxy takes longer than 5s to ping, 
+            # it's too slow for video extraction anyway.
+            async with requests.AsyncSession(proxies=proxies) as session:
+                response = await session.get("http://clients3.google.com/generate_204", timeout=timeout_seconds)
+                return response.status_code == 204
+        except Exception:
+            return False
+            
     async def _pre_download_validation(self, url: str, jid: str, headers: dict, cookie_str: str, proxy_url: str = None) -> bool:
         from curl_cffi.requests import AsyncSession
         self.db.log_trace(jid, "Performing pre-download hardened TLS validation via curl_cffi...")
