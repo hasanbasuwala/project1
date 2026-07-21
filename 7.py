@@ -492,8 +492,7 @@ class DownloaderEngine:
                 else:
                     try: await route.continue_()
                     except Exception: pass
-
-            await page.route("**/*", handle_route)
+                    await page.route("**/*", handle_route)
 
                 try:
                 self.db.log_trace(jid, "Navigating to main target URL...")
