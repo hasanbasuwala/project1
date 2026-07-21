@@ -64,12 +64,6 @@ logging.getLogger("pyrogram").setLevel(logging.ERROR)
 
 API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID = config.API_ID, config.API_HASH, config.BOT_TOKEN, config.CHANNEL_ID
 OWNER_ID = int(config.OWNER_ID) if hasattr(config, "OWNER_ID") else 0
-
-# --- ADD THESE TWO LINES ---
-VK_USERNAME = getattr(config, "VK_USERNAME", None)
-VK_PASSWORD = getattr(config, "VK_PASSWORD", None)
-# ---------------------------
-
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 JOBS_DIR, DONE_DIR = BASE_DIR / "jobs", BASE_DIR / "completed"
@@ -492,53 +486,16 @@ class DownloaderEngine:
                 else:
                     try: await route.continue_()
                     except Exception: pass
-                    await page.route("**/*", handle_route)
 
-                try:
+            await page.route("**/*", handle_route)
+
+            try:
                 self.db.log_trace(jid, "Navigating to main target URL...")
                 await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 
-                # --- ADDED: VK PLAYWRIGHT AUTHENTICATION ---
-                if "vk.com" in url or "vkvideo.ru" in url:
-                    try:
-                        # Wait a moment for dynamic elements to settle
-                        await page.wait_for_timeout(3000)
-                        
-                        # Language-agnostic: look for the login input field directly
-                        login_input = page.locator("input[name='login']")
-                        if await login_input.count() > 0 and await login_input.first.is_visible():
-                            self.db.log_trace(jid, "VK Auth Wall detected. Injecting Playwright credentials...")
-                            
-                            if VK_USERNAME:
-                                await login_input.first.fill(VK_USERNAME)
-                                await page.keyboard.press("Enter")
-                                await page.wait_for_timeout(3000)
-
-                            # Fill Password (VK often loads this dynamically after the email)
-                            pass_input = page.locator("input[name='password']")
-                            if await pass_input.count() > 0 and await pass_input.first.is_visible() and VK_PASSWORD:
-                                await pass_input.first.fill(VK_PASSWORD)
-                                await page.keyboard.press("Enter")
-                                await page.wait_for_timeout(5000)
-
-                            self.db.log_trace(jid, "Playwright auth sequence executed. Returning to target wall...")
-                            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    except Exception as e:
-                        self.db.log_trace(jid, f"VK Auth automation bypassed or failed: {e}")
-                # -------------------------------------------
-
                 try:
                     await page.screenshot(path=str(dl_dir / f"{jid}_01_initial_load.png"))
                 except Exception: pass
-                
-                try:
-                    age_gate = await page.wait_for_selector("a.av_btn.av_go[rel='yes']", state="visible", timeout=10000)
-                    if age_gate:
-                        self.db.log_trace(jid, "Age-gate detected. Clicking 'Yes'...")
-                        await age_gate.click()
-                        await page.wait_for_timeout(2000)
-                except Exception:
-                    pass
                 
                 try:
                     age_gate = await page.wait_for_selector("a.av_btn.av_go[rel='yes']", state="visible", timeout=10000)
@@ -806,11 +763,20 @@ class DownloaderEngine:
             def error(self, msg): pass
 
         def prog_hook(d):
-            # ... (keep the existing prog_hook logic exactly as is) ...
             if d.get("status") == "downloading":
                 try: 
                     pct_str = re.sub(r"\x1b[^m]*m", "", d.get("_percent_str", "0.0%")).strip()
-                    # ... (rest of prog_hook)
+                    speed = re.sub(r"\x1b[^m]*m", "", d.get("_speed_str", "~")).strip()
+                    eta = re.sub(r"\x1b[^m]*m", "", d.get("_eta_str", "~")).strip()
+                    tot_str = re.sub(r"\x1b[^m]*m", "", d.get("_total_bytes_str", d.get("_total_bytes_estimate_str", "~"))).strip()
+                    
+                    val = float(re.search(r"[\d.]+", pct_str).group()) if re.search(r"[\d.]+", pct_str) else 0.0
+                    
+                    global _live_ui_text
+                    _live_ui_text[jid] = f"[yt-dlp] {pct_str} of {tot_str} at {speed} ETA {eta}"
+
+                    stage_str = f"downloading | {speed} | {eta}"
+                    asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val, stage=stage_str), loop)
                 except Exception: pass
         
         opts = {
@@ -822,13 +788,6 @@ class DownloaderEngine:
             "logger": SilentLogger(),
             "compat_opts": {"allow-unsafe-ext"}
         }
-
-        # --- ADD THIS BLOCK FOR VK AUTHENTICATION ---
-        if "vk.com" in url.lower() and VK_USERNAME and VK_PASSWORD:
-            opts["username"] = VK_USERNAME
-            opts["password"] = VK_PASSWORD
-        # --------------------------------------------
-
         if custom_opts: opts.update(custom_opts)
             
         with yt_dlp.YoutubeDL(opts) as ydl: ydl.extract_info(url, download=True)
