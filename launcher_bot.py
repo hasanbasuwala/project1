@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 
 import config
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -402,21 +402,18 @@ async def _handle_callback(cq: CallbackQuery, data: str):
 
 
 async def _startup():
-    await app.start()
-    print("🚀 Launcher Online!!")
-    try:
-        await app.send_message(
-            OWNER_ID,
-            "🚀 **Launcher Online!!**\n\n" + status_text(),
-            reply_markup=build_menu(),
-        )
-    except Exception as e:
-        print(f"Could not DM owner on startup: {e}")
-
-    from pyrogram import idle
-    await idle()
-    await app.stop()
+    async with app:
+        print("🚀 Launcher Online!!")
+        try:
+            await app.send_message(
+                OWNER_ID,
+                "🚀 **Launcher Online!!**\n\n" + status_text(),
+                reply_markup=build_menu(),
+            )
+        except Exception as e:
+            print(f"Could not DM owner on startup: {e}")
+        await idle()
 
 
 if __name__ == "__main__":
-    asyncio.run(_startup())
+    app.run(_startup())
