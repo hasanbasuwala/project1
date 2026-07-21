@@ -457,6 +457,26 @@ class DownloaderEngine:
                 ]
             )
             
+            # --- ADDED: PLAYWRIGHT BROWSER COOKIE INJECTION ---
+            if "vk.com" in url and VK_COOKIES:
+                pw_cookies = []
+                for item in VK_COOKIES.strip().split(';'):
+                    if '=' in item:
+                        k, v = item.strip().split('=', 1)
+                        pw_cookies.append({
+                            "name": k,
+                            "value": v,
+                            "domain": ".vk.com",
+                            "path": "/"
+                        })
+                if pw_cookies:
+                    try:
+                        await context.add_cookies(pw_cookies)
+                        self.db.log_trace(jid, "Injected VIP session cookies directly into Playwright browser context.")
+                    except Exception as e:
+                        self.db.log_trace(jid, f"Failed to inject cookies into Playwright: {e}")
+            # --------------------------------------------------
+            
             page = context.pages[0]
             await Stealth().apply_stealth_async(page)
             await page.wait_for_timeout(2000) 
@@ -836,11 +856,11 @@ class DownloaderEngine:
             try:
                 with open(cookie_path, "w", encoding="utf-8") as f:
                     f.write("# Netscape HTTP Cookie File\n")
-                    for item in VK_COOKIES.split(';'):
+                    for item in VK_COOKIES.strip().split(';'):
                         if '=' in item:
                             k, v = item.strip().split('=', 1)
-                            # Domain, IncludeSubdomains, Path, Secure, Expiry, Name, Value
-                            f.write(f".vk.com\tTRUE\t/\tTRUE\t0\t{k}\t{v}\n")
+                            # Changed expiry from 0 to 2147483647 (Year 2038) so yt-dlp keeps them
+                            f.write(f".vk.com\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n")
                 opts["cookiefile"] = str(cookie_path)
             except Exception:
                 pass
