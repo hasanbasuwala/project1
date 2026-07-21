@@ -285,13 +285,6 @@ class DownloaderEngine:
 
     async def execute(self, job_data: dict):
         jid, url, strategy, quality = job_data['id'], job_data['url'], job_data['strategy'], job_data['quality']
-        
-        # --- ADD URL NORMALIZATION HERE ---
-        if "vk.ru" in url.lower():
-            url = url.replace("vk.ru", "vk.com").replace("VK.RU", "vk.com")
-            self.db.log_trace(jid, f"Normalized vk.ru alias to {url}")
-        # ----------------------------------
-
         dl_dir = JOBS_DIR / f"JOB_{jid}" / "dl"
         
         self.db.log_trace(jid, f"Download Orchestrator engaged. Strategy: {strategy}")
@@ -502,43 +495,51 @@ class DownloaderEngine:
 
             await page.route("**/*", handle_route)
 
-            try:
+                try:
                 self.db.log_trace(jid, "Navigating to main target URL...")
                 await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 
                 # --- ADDED: VK PLAYWRIGHT AUTHENTICATION ---
-                if "vk.com" in url:
-                    # Look for the Sign In button shown in the error screenshot
-                    sign_in_btn = page.locator("a:has-text('Sign in'), button:has-text('Sign in')").first
-                    if await sign_in_btn.is_visible():
-                        self.db.log_trace(jid, "VK Auth Wall detected. Injecting Playwright credentials...")
-                        try:
-                            await sign_in_btn.click()
-                            await page.wait_for_timeout(3000)
-
-                            # Fill Phone/Email
-                            user_input = page.locator("input[name='login']")
-                            if await user_input.is_visible() and VK_USERNAME:
-                                await user_input.fill(VK_USERNAME)
+                if "vk.com" in url or "vkvideo.ru" in url:
+                    try:
+                        # Wait a moment for dynamic elements to settle
+                        await page.wait_for_timeout(3000)
+                        
+                        # Language-agnostic: look for the login input field directly
+                        login_input = page.locator("input[name='login']")
+                        if await login_input.count() > 0 and await login_input.first.is_visible():
+                            self.db.log_trace(jid, "VK Auth Wall detected. Injecting Playwright credentials...")
+                            
+                            if VK_USERNAME:
+                                await login_input.first.fill(VK_USERNAME)
                                 await page.keyboard.press("Enter")
                                 await page.wait_for_timeout(3000)
 
-                            # Fill Password
+                            # Fill Password (VK often loads this dynamically after the email)
                             pass_input = page.locator("input[name='password']")
-                            if await pass_input.is_visible() and VK_PASSWORD:
-                                await pass_input.fill(VK_PASSWORD)
+                            if await pass_input.count() > 0 and await pass_input.first.is_visible() and VK_PASSWORD:
+                                await pass_input.first.fill(VK_PASSWORD)
                                 await page.keyboard.press("Enter")
                                 await page.wait_for_timeout(5000)
 
                             self.db.log_trace(jid, "Playwright auth sequence executed. Returning to target wall...")
                             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                        except Exception as e:
-                            self.db.log_trace(jid, f"VK Auth automation failed: {e}")
+                    except Exception as e:
+                        self.db.log_trace(jid, f"VK Auth automation bypassed or failed: {e}")
                 # -------------------------------------------
 
                 try:
                     await page.screenshot(path=str(dl_dir / f"{jid}_01_initial_load.png"))
                 except Exception: pass
+                
+                try:
+                    age_gate = await page.wait_for_selector("a.av_btn.av_go[rel='yes']", state="visible", timeout=10000)
+                    if age_gate:
+                        self.db.log_trace(jid, "Age-gate detected. Clicking 'Yes'...")
+                        await age_gate.click()
+                        await page.wait_for_timeout(2000)
+                except Exception:
+                    pass
                 
                 try:
                     age_gate = await page.wait_for_selector("a.av_btn.av_go[rel='yes']", state="visible", timeout=10000)
