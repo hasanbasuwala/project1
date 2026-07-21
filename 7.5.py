@@ -829,6 +829,23 @@ class DownloaderEngine:
             "logger": SilentLogger(),
             "compat_opts": {"allow-unsafe-ext"}
         }
+
+        # --- ADDED: ON-THE-FLY NETSCAPE COOKIE TRANSLATOR ---
+        if "vk.com" in url.lower() and VK_COOKIES:
+            cookie_path = dl_dir / f"{jid}_vk_cookies.txt"
+            try:
+                with open(cookie_path, "w", encoding="utf-8") as f:
+                    f.write("# Netscape HTTP Cookie File\n")
+                    for item in VK_COOKIES.split(';'):
+                        if '=' in item:
+                            k, v = item.strip().split('=', 1)
+                            # Domain, IncludeSubdomains, Path, Secure, Expiry, Name, Value
+                            f.write(f".vk.com\tTRUE\t/\tTRUE\t0\t{k}\t{v}\n")
+                opts["cookiefile"] = str(cookie_path)
+            except Exception:
+                pass
+        # ----------------------------------------------------
+
         if custom_opts: opts.update(custom_opts)
             
         with yt_dlp.YoutubeDL(opts) as ydl: ydl.extract_info(url, download=True)
