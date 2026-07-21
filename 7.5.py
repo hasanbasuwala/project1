@@ -285,6 +285,13 @@ class DownloaderEngine:
 
     async def execute(self, job_data: dict):
         jid, url, strategy, quality = job_data['id'], job_data['url'], job_data['strategy'], job_data['quality']
+        
+        # --- URL NORMALIZATION (vk.ru -> vk.com) ---
+        if "vk.ru" in url.lower():
+            url = re.sub(r'vk\.ru', 'vk.com', url, flags=re.IGNORECASE)
+            self.db.log_trace(jid, f"Normalized vk.ru alias to {url}")
+        # -------------------------------------------
+
         dl_dir = JOBS_DIR / f"JOB_{jid}" / "dl"
         
         self.db.log_trace(jid, f"Download Orchestrator engaged. Strategy: {strategy}")
