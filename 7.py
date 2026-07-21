@@ -769,20 +769,11 @@ class DownloaderEngine:
             def error(self, msg): pass
 
         def prog_hook(d):
+            # ... (keep the existing prog_hook logic exactly as is) ...
             if d.get("status") == "downloading":
                 try: 
                     pct_str = re.sub(r"\x1b[^m]*m", "", d.get("_percent_str", "0.0%")).strip()
-                    speed = re.sub(r"\x1b[^m]*m", "", d.get("_speed_str", "~")).strip()
-                    eta = re.sub(r"\x1b[^m]*m", "", d.get("_eta_str", "~")).strip()
-                    tot_str = re.sub(r"\x1b[^m]*m", "", d.get("_total_bytes_str", d.get("_total_bytes_estimate_str", "~"))).strip()
-                    
-                    val = float(re.search(r"[\d.]+", pct_str).group()) if re.search(r"[\d.]+", pct_str) else 0.0
-                    
-                    global _live_ui_text
-                    _live_ui_text[jid] = f"[yt-dlp] {pct_str} of {tot_str} at {speed} ETA {eta}"
-
-                    stage_str = f"downloading | {speed} | {eta}"
-                    asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val, stage=stage_str), loop)
+                    # ... (rest of prog_hook)
                 except Exception: pass
         
         opts = {
@@ -794,6 +785,13 @@ class DownloaderEngine:
             "logger": SilentLogger(),
             "compat_opts": {"allow-unsafe-ext"}
         }
+
+        # --- ADD THIS BLOCK FOR VK AUTHENTICATION ---
+        if "vk.com" in url.lower() and VK_USERNAME and VK_PASSWORD:
+            opts["username"] = VK_USERNAME
+            opts["password"] = VK_PASSWORD
+        # --------------------------------------------
+
         if custom_opts: opts.update(custom_opts)
             
         with yt_dlp.YoutubeDL(opts) as ydl: ydl.extract_info(url, download=True)
