@@ -300,7 +300,26 @@ async def _handle_callback(cq: CallbackQuery, data: str):
         await cq.answer(f"Launching {name}…")
         launch(target)
         await _safe_edit(cq.message, status_text(), build_menu())
-        await cq.message.reply(f"🚀 Launched `{name}` in tmux session `{TMUX_SESSION}`.")
+
+        # give it a moment to print its startup banner, then show the actual
+        # terminal output right here instead of making you go attach tmux
+        await asyncio.sleep(2)
+        log = capture_pane()
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh log", callback_data="viewlog")]])
+        text = f"📟 Live log — `{name}`:\n```\n{(log or '(no output yet)')[-3500:]}\n```"
+        await cq.message.reply(text, reply_markup=kb)
+        return
+
+    if data == "viewlog":
+        state = running_script()
+        if not state:
+            await cq.answer("Nothing running.", show_alert=True)
+            return
+        await cq.answer("Refreshed")
+        log = capture_pane()
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh log", callback_data="viewlog")]])
+        text = f"📟 Live log — `{state['script']}`:\n```\n{(log or '(no output yet)')[-3500:]}\n```"
+        await _safe_edit(cq.message, text, kb)
         return
 
     if data == "delcancel":
@@ -382,6 +401,22 @@ async def _handle_callback(cq: CallbackQuery, data: str):
         return
 
 
+async def _startup():
+    await app.start()
+    print("🚀 Launcher Online!!")
+    try:
+        await app.send_message(
+            OWNER_ID,
+            "🚀 **Launcher Online!!**\n\n" + status_text(),
+            reply_markup=build_menu(),
+        )
+    except Exception as e:
+        print(f"Could not DM owner on startup: {e}")
+
+    from pyrogram import idle
+    await idle()
+    await app.stop()
+
+
 if __name__ == "__main__":
-    print(f"Launcher bot up. Scripts folder: {SCRIPT_DIR}")
-    app.run()
+    asyncio.run(_startup())
