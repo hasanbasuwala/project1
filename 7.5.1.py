@@ -185,8 +185,19 @@ class LinkClassifier:
         if ".mp4" in u or "direct-mp4" in u: return "DIRECT_MP4"
         return "GENERIC_FALLBACK"
 
+async def is_proxy_working(proxy_url: str) -> bool:
+    """Pings a reliable endpoint to verify the proxy is alive and responsive."""
+    test_url = "http://httpbin.org/ip"
+    try:
+        # Use a short timeout to prevent dead proxies from hanging the queue
+        async with aiohttp.ClientSession() as session:
+            async with session.get(test_url, proxy=proxy_url, timeout=5) as response:
+                return response.status == 200
+    except Exception:
+        return False
+
 async def get_random_free_proxy() -> str:
-    """Fetches a random HTTP proxy from the Proxifly GitHub repository."""
+    """Fetches HTTP proxies, verifies them, and returns the first working one."""
     url = "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt"
     try:
         async with aiohttp.ClientSession() as session:
@@ -194,12 +205,17 @@ async def get_random_free_proxy() -> str:
                 if response.status == 200:
                     text = await response.text()
                     proxies = [line.strip() for line in text.split('\n') if line.strip()]
+                    
                     if proxies:
-                        selected = random.choice(proxies)
-                        # Fix: Prevent double-scheme formatting
-                        return selected if selected.startswith("http") else f"http://{selected}"
+                        random.shuffle(proxies)
+                        # Test up to 10 random proxies to find a healthy one
+                        for p in proxies[:10]:
+                            formatted_proxy = p if p.startswith("http") else f"http://{p}"
+                            if await is_proxy_working(formatted_proxy):
+                                return formatted_proxy
+                                
     except Exception as e:
-        print(f"Proxy fetch failed: {e}")
+        print(f"Proxy fetch/check failed: {e}")
     return ""
 
 # ──────────────────────────── SUBSYSTEM 3: ENGINES ──────────────────────
