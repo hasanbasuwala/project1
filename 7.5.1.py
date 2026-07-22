@@ -459,6 +459,10 @@ class DownloaderEngine:
         capture_headers = {}
 
         proxy_config = {"server": proxy_url} if proxy_url else None
+
+        # Check if saved auth state exists
+        auth_state_path = Path("vk_state.json")
+        storage_state = str(auth_state_path) if auth_state_path.exists() else None
         
         async with async_playwright() as p:
             context = await p.chromium.launch_persistent_context(
