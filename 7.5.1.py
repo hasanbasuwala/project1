@@ -1,5 +1,5 @@
 """
-stealth_bot.py - v7.5
+stealth_bot.py - v7.5.1
 ───────────────────────────────────────────────────────────────
 ARCHITECTURE:
   • Single-file Micro-Orchestration (Classes).
@@ -1572,7 +1572,7 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
         stat_str = "ONLINE & SECURE"
     
     text = (
-        f"💻 **MAINFRAME v7.5**\n"
+        f"💻 **MAINFRAME v7.5.1**\n"
         f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
         f"`[⚡] STAT :` `{stat_str}`\n"
         f"`[⚠️] SYNC :` {sync_stat}\n"
