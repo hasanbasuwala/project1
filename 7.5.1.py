@@ -235,20 +235,6 @@ class DownloaderEngine:
             }
             json.dump(safe_payload, f)
             
-    async def _is_proxy_alive(self, proxy_url: str, timeout_seconds: int = 5) -> bool:
-        """Pings a lightweight endpoint to verify proxy health before deployment."""
-        try:
-            from curl_cffi import requests
-            proxies = {"http": proxy_url, "https": proxy_url}
-            
-            # Use a fast 5-second timeout. If a proxy takes longer than 5s to ping, 
-            # it's too slow for video extraction anyway.
-            async with requests.AsyncSession(proxies=proxies) as session:
-                response = await session.get("http://clients3.google.com/generate_204", timeout=timeout_seconds)
-                return response.status_code == 204
-        except Exception:
-            return False
-            
     async def _pre_download_validation(self, url: str, jid: str, headers: dict, cookie_str: str, proxy_url: str = None) -> bool:
         from curl_cffi.requests import AsyncSession
         self.db.log_trace(jid, "Performing pre-download hardened TLS validation via curl_cffi...")
@@ -563,28 +549,9 @@ class DownloaderEngine:
                                 await page.wait_for_timeout(5000)
 
                             self.db.log_trace(jid, "Playwright auth sequence executed. Returning to target wall...")
-            # Navigate to the target
-            await page.goto(url, timeout=60000, wait_until="domcontentloaded")
-            
-            # --- ADDED: ANTI-BOT AUTOCLICKER ---
-            try:
-                # Look for the VK robot check button (Russian or English)
-                bot_button = page.locator("button:has-text('Продолжить'), button:has-text('Continue')")
-                
-                # Wait briefly to see if the button appears
-                if await bot_button.is_visible(timeout=5000):
-                    self.db.log_trace(jid, "Anti-bot CAPTCHA detected. Attempting to click 'Continue'...")
-                    await bot_button.click()
-                    
-                    # Wait for the page to navigate away from the captcha
-                    await page.wait_for_load_state("networkidle", timeout=15000)
-                    self.db.log_trace(jid, "CAPTCHA bypassed successfully.")
-            except Exception as e:
-                # If the button isn't there, or times out, just proceed normally
-                pass
-            # -----------------------------------
-            
-            # (Your existing code that scans for the video player goes here)
+                            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    except Exception as e:
+                        self.db.log_trace(jid, f"VK Auth automation bypassed or failed: {e}")
                 # -------------------------------------------
 
                 try:
