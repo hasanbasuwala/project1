@@ -43,19 +43,19 @@ async def run_test():
     os.makedirs(VIDEO_DIR, exist_ok=True)
     print(f"[*] Targeting Mobile Site: {mobile_url}")
 
-    async with async_playwright() as p:
-        print("[*] Launching Playwright (HEADED mode via Xvfb with Stealth)...")
+    # --- THE NEW v2.x STEALTH WRAPPER ---
+    async with Stealth().use_async(async_playwright()) as p:
+        print("[*] Launching Playwright (HEADED mode via Xvfb with Stealth v2)...")
         mobile_device = p.devices['iPhone 13']
         
-        # --- CRITICAL TERMUX / ARM64 MODIFICATIONS ---
         browser = await p.chromium.launch(
-            executable_path='/usr/bin/chromium', # Force system ARM64 Chromium
-            headless=False,                      # FALSE! We are using Xvfb to fake a display
+            executable_path='/usr/bin/chromium',
+            headless=False,
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-gpu",                 # Standard for Termux
-                "--use-gl=swiftshader",          # Software rendering fallback
+                "--disable-gpu",
+                "--use-gl=swiftshader",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-web-security"
             ]
@@ -69,30 +69,16 @@ async def run_test():
             record_video_size={"width": 390, "height": 844}
         )
         
-        if os.path.exists(COOKIE_FILE):
-            print(f"[*] Loading cookies from {COOKIE_FILE}...")
-            with open(COOKIE_FILE, 'r', encoding='utf-8') as f:
-                cookie_str = f.read().strip()
-            
-            pw_cookies = []
-            domains = [".vk.com", "m.vk.com", ".vk.ru", "m.vk.ru"]
-            for item in cookie_str.split(';'):
-                if '=' in item:
-                    k, v = item.strip().split('=', 1)
-                    for d in domains:
-                        pw_cookies.append({"name": k, "value": v, "domain": d, "path": "/"})
-            
-            if pw_cookies:
-                await context.add_cookies(pw_cookies)
-                print(f"[*] Injected {len(pw_cookies)} cookies.")
+        # ... [Keep your cookie injection code exactly the same here] ...
 
         page = await context.new_page()
         
-        # Apply the Playwright-Stealth patch to mask the remaining bot leaks
-        stealth = Stealth()
-        await stealth.apply_stealth_async(page)
+        # REMOVE the old manual stealth = Stealth() and await stealth.apply_stealth_async(page) lines!
+        # The new wrapper above already handles it automatically for every page.
         
         found_media = []
+
+        # ... [Keep the rest of your page.on sniffer and navigation sequence exactly the same] ...
 
         # Network Sniffer with API Block Detection
         async def handle_response(response):
