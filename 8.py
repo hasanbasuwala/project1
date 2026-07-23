@@ -964,7 +964,7 @@ class DownloaderEngine:
         }
 
         # --- ADDED: ON-THE-FLY NETSCAPE COOKIE TRANSLATOR ---
-        if "vk.com" in url.lower() and VK_COOKIES:
+        if ("vk.com" in url.lower() or "vkvideo.ru" in url.lower()) and VK_COOKIES:
             cookie_path = dl_dir / f"{jid}_vk_cookies.txt"
             try:
                 with open(cookie_path, "w", encoding="utf-8") as f:
@@ -972,8 +972,9 @@ class DownloaderEngine:
                     for item in VK_COOKIES.strip().split(';'):
                         if '=' in item:
                             k, v = item.strip().split('=', 1)
-                            # Changed expiry from 0 to 2147483647 (Year 2038) so yt-dlp keeps them
+                            # Write cookies for both domains so yt-dlp's extractor is fully authenticated
                             f.write(f".vk.com\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n")
+                            f.write(f".vkvideo.ru\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n")
                 opts["cookiefile"] = str(cookie_path)
             except Exception:
                 pass
