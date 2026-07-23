@@ -263,6 +263,52 @@ class DownloaderEngine:
             }
             json.dump(safe_payload, f)
             
+    def _extract_vk_api(self, url: str, jid: str) -> str | None:
+        """Extracts direct embedded player URLs using VK API token bypassing browser fingerprinting."""
+        if not vk_api or not VK_TOKEN:
+            return None
+
+        try:
+            vk_session = vk_api.VkApi(token=VK_TOKEN)
+            vk = vk_session.get_api()
+
+            # 1. Check if URL is a Wall Post (e.g., wall-223870924_29871)
+            wall_match = re.search(r'wall(-?\d+_\d+)', url)
+            if wall_match:
+                post_id = wall_match.group(1)
+                self.db.log_trace(jid, f"[vk_api] Intercepted wall post ID: {post_id}")
+                response = vk.wall.getById(posts=post_id)
+                if response:
+                    post = response[0]
+                    for item in post.get('attachments', []):
+                        if item.get('type') == 'video':
+                            video = item['video']
+                            video_id = f"{video['owner_id']}_{video['id']}"
+                            access_key = video.get('access_key', '')
+                            vid_query = f"{video_id}_{access_key}" if access_key else video_id
+                            
+                            vid_details = vk.video.get(videos=vid_query)
+                            if vid_details and vid_details.get('items'):
+                                player_url = vid_details['items'][0].get('player')
+                                self.db.log_trace(jid, f"[vk_api] Successfully extracted video player: {player_url}")
+                                return player_url
+
+            # 2. Check if URL is a Direct Video Link (e.g., video-223870924_456273130)
+            video_match = re.search(r'video(-?\d+_\d+)', url)
+            if video_match:
+                video_id = video_match.group(1)
+                self.db.log_trace(jid, f"[vk_api] Intercepted direct video ID: {video_id}")
+                vid_details = vk.video.get(videos=video_id)
+                if vid_details and vid_details.get('items'):
+                    player_url = vid_details['items'][0].get('player')
+                    self.db.log_trace(jid, f"[vk_api] Successfully extracted video player: {player_url}")
+                    return player_url
+
+        except Exception as e:
+            self.db.log_trace(jid, f"[vk_api] Extraction failed or skipped: {e}")
+
+        return None
+            
     async def _pre_download_validation(self, url: str, jid: str, headers: dict, cookie_str: str, proxy_url: str = None) -> bool:
         from curl_cffi.requests import AsyncSession
         self.db.log_trace(jid, "Performing pre-download hardened TLS validation via curl_cffi...")
