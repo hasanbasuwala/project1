@@ -3,6 +3,7 @@ import os
 import glob
 import requests
 from playwright.async_api import async_playwright
+from playwright_stealth import stealth
 import config
 
 # --- CONFIGURATION ---
@@ -17,9 +18,8 @@ VK_PASS = getattr(config, 'VK_PASSWORD', None)
 # ---------------------
 
 def send_video_to_telegram(video_path, caption):
-    """Uploads the recorded Playwright video clip to Telegram."""
     if not BOT_TOKEN or not OWNER_ID:
-        print("[!] WARNING: BOT_TOKEN or OWNER_ID missing in config.py. Skipping Telegram upload.")
+        print("[!] WARNING: BOT_TOKEN or OWNER_ID missing. Skipping Telegram upload.")
         return
 
     print(f"[*] Uploading video {video_path} to Telegram...")
@@ -38,26 +38,29 @@ def send_video_to_telegram(video_path, caption):
     except Exception as e:
         print(f"[-] Failed to send video to Telegram: {e}")
 
-
 async def run_test():
     mobile_url = TARGET_URL.replace("vk.com", "m.vk.com").replace("vk.ru", "m.vk.com")
     os.makedirs(VIDEO_DIR, exist_ok=True)
     print(f"[*] Targeting Mobile Site: {mobile_url}")
 
     async with async_playwright() as p:
-        print("[*] Launching Playwright with Live Screen Recording...")
+        print("[*] Launching Playwright (HEADED mode via Xvfb with Stealth)...")
         mobile_device = p.devices['iPhone 13']
         
+        # --- CRITICAL TERMUX / ARM64 MODIFICATIONS ---
         browser = await p.chromium.launch(
-            headless=True,
+            executable_path='/usr/bin/chromium', # Force system ARM64 Chromium
+            headless=False,                      # FALSE! We are using Xvfb to fake a display
             args=[
-                "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
-                "--disable-dev-shm-usage"
+                "--disable-dev-shm-usage",
+                "--disable-gpu",                 # Standard for Termux
+                "--use-gl=swiftshader",          # Software rendering fallback
+                "--disable-blink-features=AutomationControlled",
+                "--disable-web-security"
             ]
         )
         
-        # Enable video recording directly in context
         context = await browser.new_context(
             **mobile_device,
             locale="en-US",
@@ -65,12 +68,6 @@ async def run_test():
             record_video_dir=VIDEO_DIR,
             record_video_size={"width": 390, "height": 844}
         )
-
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-        """)
         
         if os.path.exists(COOKIE_FILE):
             print(f"[*] Loading cookies from {COOKIE_FILE}...")
@@ -87,31 +84,25 @@ async def run_test():
             
             if pw_cookies:
                 await context.add_cookies(pw_cookies)
-                print(f"[*] Injected {len(pw_cookies)} cookies into browser context.")
+                print(f"[*] Injected {len(pw_cookies)} cookies.")
 
         page = await context.new_page()
+        
+        # Apply the Playwright-Stealth patch to mask the remaining bot leaks
+        await stealth_async(page)
+        
         found_media = []
 
-        # 1. WIRETAP BROWSER CONSOLE: Catch JavaScript errors 
-        page.on("console", lambda msg: print(f"[JS {msg.type.upper()}] {msg.text}") if msg.type in ["error", "warning"] else None)
-
-        # 2. WIRETAP FAILED REQUESTS: Catch connections VK aggressively drops
-        page.on("requestfailed", lambda req: print(f"[NETWORK DROP] {req.url[:120]} - {req.failure}"))
-
-        # 3. NETWORK SNIFFER: Updated to catch HTTP error codes
+        # Network Sniffer with API Block Detection
         async def handle_response(response):
             try:
                 req = response.request
                 url_lower = req.url.lower()
                 content_type = response.headers.get("content-type", "").lower()
                 
-                # ---> DETECT API BLOCKS (403 Forbidden, 429 Too Many Requests) <---
-                if response.status >= 400:
-                    # Ignore harmless ad-block/tracker failures
-                    if not any(bad in url_lower for bad in ["tracker", "log", "stats"]):
-                        print(f"[HTTP {response.status}] Blocked Request: {req.url[:120]}...")
+                if response.status >= 400 and not any(bad in url_lower for bad in ["tracker", "log", "stats", "analytics"]):
+                    print(f"[HTTP {response.status}] Blocked Request: {req.url[:120]}...")
                 
-                # Normal Media Sniffing
                 bad_keywords = ["google", "analytics", "ad", "beacon", "vast", "blank", "trailer", "promo", ".mp3", "audio"]
                 if any(bad in url_lower for bad in bad_keywords): return
                 
@@ -123,22 +114,24 @@ async def run_test():
                 pass
 
         page.on("response", handle_response)
+        page.on("console", lambda msg: print(f"[JS {msg.type.upper()}] {msg.text}") if msg.type in ["error", "warning"] else None)
 
-        # Execution Sequence
         print("\n[*] Navigating to target post...")
-        await page.goto(mobile_url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(4000)
+        # Generous timeout for Termux environments
+        await page.goto(mobile_url, wait_until="domcontentloaded", timeout=90000) 
+        await page.wait_for_timeout(6000)
 
         login_btn = page.locator("a[href*='login'], .a_login, button:has-text('Log in')")
         if await login_btn.count() > 0 and await login_btn.first.is_visible():
             print("[*] Guest wall hit. Clicking Log In...")
             await login_btn.first.click()
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(4000)
 
         login_input = page.locator("input[name='login'], input[name='email'], input[type='text']")
         if await login_input.count() > 0 and await login_input.first.is_visible():
             print("[*] Submitting credentials...")
             if VK_USER:
+                # Typing slowly mimics human behavior
                 await login_input.first.fill(VK_USER)
                 await page.keyboard.press("Enter")
                 await page.wait_for_timeout(3000)
@@ -147,21 +140,21 @@ async def run_test():
             if await pass_input.count() > 0 and await pass_input.first.is_visible() and VK_PASS:
                 await pass_input.first.fill(VK_PASS)
                 await page.keyboard.press("Enter")
-                await page.wait_for_timeout(6000)
+                await page.wait_for_timeout(8000)
                 
                 print("[*] Re-navigating to target post...")
-                await page.goto(mobile_url, wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(4000)
+                await page.goto(mobile_url, wait_until="domcontentloaded", timeout=90000)
+                await page.wait_for_timeout(6000)
 
         print("[*] Scrolling to trigger video player rendering...")
-        await page.mouse.wheel(0, 400)
-        await page.wait_for_timeout(5000)
+        await page.mouse.wheel(0, 500)
+        await page.wait_for_timeout(6000)
 
         play_btn = page.locator(".VideoIcon, .MediaGrid__item, div[aria-label*='Play'], .vv_inline_video")
         if await play_btn.count() > 0 and await play_btn.first.is_visible():
             print("[*] Play button detected! Clicking...")
             await play_btn.first.click(force=True)
-            await page.wait_for_timeout(5000)
+            await page.wait_for_timeout(8000)
 
         print("\n" + "="*50)
         print(f"TEST COMPLETE | Media Links Captured: {len(found_media)}")
@@ -169,16 +162,14 @@ async def run_test():
             print(f"{i+1}. {link[:100]}...")
         print("="*50)
 
-        # CLOSE CONTEXT FIRST so Playwright flushes and saves the video file
         await context.close()
         await browser.close()
 
-    # Find and upload the generated video file
+    # Upload video result
     video_files = glob.glob(os.path.join(VIDEO_DIR, "*.webm"))
     if video_files:
         latest_video = max(video_files, key=os.path.getctime)
-        send_video_to_telegram(latest_video, "🎥 Playwright Live Recording of Mobile Navigation")
-
+        send_video_to_telegram(latest_video, "🎥 Playwright Xvfb Recording (Stealth Mode)")
 
 if __name__ == "__main__":
     asyncio.run(run_test())
