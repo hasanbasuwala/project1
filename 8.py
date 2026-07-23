@@ -589,14 +589,14 @@ class DownloaderEngine:
             )
             
             # --- ADDED: PLAYWRIGHT BROWSER COOKIE INJECTION ---
-            if ("vk.com" in url or "vk.ru" in url) and VK_COOKIES:
+            if any(d in url.lower() for d in ["vk.com", "vk.ru", "vkvideo.ru"]) and VK_COOKIES:
                 pw_cookies = []
                 for item in VK_COOKIES.strip().split(';'):
                     if '=' in item:
                         k, v = item.strip().split('=', 1)
-                        # Use domain instead of url to ensure subdomains (.vk.com) get the cookies
                         pw_cookies.append({"name": k, "value": v, "domain": ".vk.com", "path": "/"})
                         pw_cookies.append({"name": k, "value": v, "domain": ".vk.ru", "path": "/"})
+                        pw_cookies.append({"name": k, "value": v, "domain": ".vkvideo.ru", "path": "/"})
                 if pw_cookies:
                     try:
                         await context.add_cookies(pw_cookies)
