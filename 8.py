@@ -264,7 +264,7 @@ class DownloaderEngine:
             json.dump(safe_payload, f)
             
     def _extract_vk_api(self, url: str, jid: str) -> str | None:
-        """Extracts direct embedded player URLs using VK API token bypassing browser fingerprinting."""
+        """Extracts canonical video URLs or direct MP4/HLS streams via VK API."""
         if not vk_api or not VK_TOKEN:
             return None
 
@@ -278,6 +278,7 @@ class DownloaderEngine:
                 post_id = wall_match.group(1)
                 self.db.log_trace(jid, f"[vk_api] Intercepted wall post ID: {post_id}")
                 response = vk.wall.getById(posts=post_id)
+                
                 if response:
                     post = response[0]
                     for item in post.get('attachments', []):
@@ -287,22 +288,42 @@ class DownloaderEngine:
                             access_key = video.get('access_key', '')
                             vid_query = f"{video_id}_{access_key}" if access_key else video_id
                             
+                            # Attempt to get raw streams directly from backend
                             vid_details = vk.video.get(videos=vid_query)
                             if vid_details and vid_details.get('items'):
-                                player_url = vid_details['items'][0].get('player')
-                                self.db.log_trace(jid, f"[vk_api] Successfully extracted video player: {player_url}")
-                                return player_url
+                                v_item = vid_details['items'][0]
+                                if 'files' in v_item:
+                                    files = v_item['files']
+                                    for q in ['mp4_1080', 'mp4_720', 'mp4_480', 'mp4_360', 'mp4_240']:
+                                        if q in files:
+                                            self.db.log_trace(jid, f"[vk_api] Ghost Protocol: Direct MP4 found: {files[q]}")
+                                            return files[q]
+                                    if 'hls' in files:
+                                        self.db.log_trace(jid, f"[vk_api] Ghost Protocol: Direct HLS found: {files['hls']}")
+                                        return files['hls']
+                            
+                            # Fallback: Construct the Canonical Site URL (Not the embed!)
+                            canonical_url = f"https://vk.com/video{vid_query}"
+                            self.db.log_trace(jid, f"[vk_api] Reconstructed canonical site URL: {canonical_url}")
+                            return canonical_url
 
-            # 2. Check if URL is a Direct Video Link (e.g., video-223870924_456273130)
+            # 2. Check if URL is already a Direct Video Link
             video_match = re.search(r'video(-?\d+_\d+)', url)
             if video_match:
                 video_id = video_match.group(1)
                 self.db.log_trace(jid, f"[vk_api] Intercepted direct video ID: {video_id}")
                 vid_details = vk.video.get(videos=video_id)
                 if vid_details and vid_details.get('items'):
-                    player_url = vid_details['items'][0].get('player')
-                    self.db.log_trace(jid, f"[vk_api] Successfully extracted video player: {player_url}")
-                    return player_url
+                    v_item = vid_details['items'][0]
+                    if 'files' in v_item:
+                        files = v_item['files']
+                        for q in ['mp4_1080', 'mp4_720', 'mp4_480', 'mp4_360', 'mp4_240']:
+                            if q in files:
+                                self.db.log_trace(jid, f"[vk_api] Ghost Protocol: Direct MP4 found: {files[q]}")
+                                return files[q]
+                        if 'hls' in files:
+                            self.db.log_trace(jid, f"[vk_api] Ghost Protocol: Direct HLS found: {files['hls']}")
+                            return files['hls']
 
         except Exception as e:
             self.db.log_trace(jid, f"[vk_api] Extraction failed or skipped: {e}")
