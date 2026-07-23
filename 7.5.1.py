@@ -499,17 +499,14 @@ class DownloaderEngine:
             )
             
             # --- ADDED: PLAYWRIGHT BROWSER COOKIE INJECTION ---
-            if "vk.com" in url and VK_COOKIES:
+            if ("vk.com" in url or "vk.ru" in url) and VK_COOKIES:
                 pw_cookies = []
                 for item in VK_COOKIES.strip().split(';'):
                     if '=' in item:
                         k, v = item.strip().split('=', 1)
-                        pw_cookies.append({
-                            "name": k,
-                            "value": v,
-                            "domain": ".vk.com",
-                            "path": "/"
-                        })
+                        # Inject directly via URL to ensure HTTPS secure flags are applied
+                        pw_cookies.append({"name": k, "value": v, "url": "https://vk.com/"})
+                        pw_cookies.append({"name": k, "value": v, "url": "https://vk.ru/"})
                 if pw_cookies:
                     try:
                         await context.add_cookies(pw_cookies)
@@ -569,27 +566,33 @@ class DownloaderEngine:
                 # --- ADDED: VK PLAYWRIGHT AUTHENTICATION ---
                 if "vk.com" in url or "vkvideo.ru" in url:
                     try:
-                        # Wait a moment for dynamic elements to settle
                         await page.wait_for_timeout(3000)
                         
-                        # Language-agnostic: look for the login input field directly
+                        # 1. Check if we hit a guest error wall and need to click the UI "Sign in" button first
+                        sign_in_btn = page.locator("text='Sign in', text='Войти'")
+                        if await sign_in_btn.count() > 0 and await sign_in_btn.first.is_visible():
+                            self.db.log_trace(jid, "Guest wall detected. Clicking Sign In to spawn auth form...")
+                            await sign_in_btn.first.click()
+                            await page.wait_for_timeout(3500)
+
+                        # 2. Look for the actual login input field
                         login_input = page.locator("input[name='login']")
                         if await login_input.count() > 0 and await login_input.first.is_visible():
-                            self.db.log_trace(jid, "VK Auth Wall detected. Injecting Playwright credentials...")
+                            self.db.log_trace(jid, "VK Auth Form detected. Injecting Playwright credentials...")
                             
                             if VK_USERNAME:
                                 await login_input.first.fill(VK_USERNAME)
                                 await page.keyboard.press("Enter")
-                                await page.wait_for_timeout(3000)
+                                await page.wait_for_timeout(3500)
 
-                            # Fill Password (VK often loads this dynamically after the email)
+                            # 3. Fill Password (VK loads this dynamically after the email)
                             pass_input = page.locator("input[name='password']")
                             if await pass_input.count() > 0 and await pass_input.first.is_visible() and VK_PASSWORD:
                                 await pass_input.first.fill(VK_PASSWORD)
                                 await page.keyboard.press("Enter")
-                                await page.wait_for_timeout(5000)
+                                await page.wait_for_timeout(6000)
 
-                            self.db.log_trace(jid, "Playwright auth sequence executed. Returning to target wall...")
+                            self.db.log_trace(jid, "Playwright auth sequence executed. Reloading target wall...")
                             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                     except Exception as e:
                         self.db.log_trace(jid, f"VK Auth automation bypassed or failed: {e}")
