@@ -92,12 +92,26 @@ async def run_test():
         page = await context.new_page()
         found_media = []
 
+        # 1. WIRETAP BROWSER CONSOLE: Catch JavaScript errors 
+        page.on("console", lambda msg: print(f"[JS {msg.type.upper()}] {msg.text}") if msg.type in ["error", "warning"] else None)
+
+        # 2. WIRETAP FAILED REQUESTS: Catch connections VK aggressively drops
+        page.on("requestfailed", lambda req: print(f"[NETWORK DROP] {req.url[:120]} - {req.failure}"))
+
+        # 3. NETWORK SNIFFER: Updated to catch HTTP error codes
         async def handle_response(response):
             try:
                 req = response.request
                 url_lower = req.url.lower()
                 content_type = response.headers.get("content-type", "").lower()
                 
+                # ---> DETECT API BLOCKS (403 Forbidden, 429 Too Many Requests) <---
+                if response.status >= 400:
+                    # Ignore harmless ad-block/tracker failures
+                    if not any(bad in url_lower for bad in ["tracker", "log", "stats"]):
+                        print(f"[HTTP {response.status}] Blocked Request: {req.url[:120]}...")
+                
+                # Normal Media Sniffing
                 bad_keywords = ["google", "analytics", "ad", "beacon", "vast", "blank", "trailer", "promo", ".mp3", "audio"]
                 if any(bad in url_lower for bad in bad_keywords): return
                 
