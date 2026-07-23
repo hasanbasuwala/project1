@@ -294,6 +294,12 @@ class DownloaderEngine:
                 if any(bad in content_type for bad in invalid_types):
                     self.db.log_trace(jid, f"Pre-check failed: Invalid Content-Type '{content_type}'")
                     return False
+
+                # --- ADDED: Whitelist HTTP 206 Video Chunks ---
+                if status == 206:
+                    self.db.log_trace(jid, "Pre-check: HTTP 206 Partial Content chunk detected. Stream is valid.")
+                    return True
+                # ----------------------------------------------
                     
                 if content_length > 0 and content_length < 100000:
                     self.db.log_trace(jid, "Pre-check failed: Content-Length suspiciously small (<100KB).")
