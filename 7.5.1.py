@@ -531,7 +531,8 @@ class DownloaderEngine:
                     url_lower = req.url.lower()
                     content_type = response.headers.get("content-type", "").lower()
                     
-                    bad_keywords = ["google", "analytics", "ad", "beacon", "vast", "blank", "trailer", "promo"]
+                        # --- ADDED: Ignore background MP3 notification sounds ---
+                     bad_keywords = ["google", "analytics", "ad", "beacon", "vast", "blank", "trailer", "promo", ".mp3", "audio"]
                     if any(bad in url_lower for bad in bad_keywords): return
                     
                     is_media = False
