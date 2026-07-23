@@ -567,14 +567,13 @@ class DownloaderEngine:
             await page.route("**/*", handle_route)
 
             try:
-                self.db.log_trace(jid, "Navigating to main target URL and waiting for network idle...")
-                await page.goto(url, wait_until="networkidle", timeout=60000)
+                self.db.log_trace(jid, "Navigating to main target URL...")
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_timeout(8000) # Hard wait for SPA skeleton to render
                 
                 # --- ADDED: VK PLAYWRIGHT AUTHENTICATION ---
                 if "vk.com" in url or "vkvideo.ru" in url:
                     try:
-                        await page.wait_for_timeout(3000)
-                        
                         # 1. Check if we hit a guest error wall and need to click the UI "Sign in" button first
                         sign_in_btn = page.locator("text='Sign in', text='Войти'")
                         if await sign_in_btn.count() > 0 and await sign_in_btn.first.is_visible():
@@ -599,8 +598,9 @@ class DownloaderEngine:
                                 await page.keyboard.press("Enter")
                                 await page.wait_for_timeout(6000)
 
-                        self.db.log_trace(jid, "Playwright auth sequence executed. Reloading target wall...")
-                        await page.goto(url, wait_until="networkidle", timeout=60000)
+                            self.db.log_trace(jid, "Playwright auth sequence executed. Reloading target wall...")
+                            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                            await page.wait_for_timeout(8000) # Hard wait after auth reload
                     except Exception as e:
                         self.db.log_trace(jid, f"VK Auth automation bypassed or failed: {e}")
                 # -------------------------------------------
