@@ -66,7 +66,13 @@ API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID = config.API_ID, config.API_HASH, config
 OWNER_ID = int(config.OWNER_ID) if hasattr(config, "OWNER_ID") else 0
 
 # --- ADD THIS LINE ---
-VK_COOKIES = getattr(config, "VK_COOKIES", None)
+VK_COOKIES = None
+if os.path.exists("extracted_cookies.txt"):
+    with open("extracted_cookies.txt", "r", encoding="utf-8") as f:
+        VK_COOKIES = f.read().strip()
+
+VK_USERNAME = getattr(config, "VK_USERNAME", None)
+VK_PASSWORD = getattr(config, "VK_PASSWORD", None)
 # ---------------------
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
