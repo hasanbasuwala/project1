@@ -510,9 +510,9 @@ class DownloaderEngine:
                 for item in VK_COOKIES.strip().split(';'):
                     if '=' in item:
                         k, v = item.strip().split('=', 1)
-                        # Inject directly via URL to ensure HTTPS secure flags are applied
-                        pw_cookies.append({"name": k, "value": v, "url": "https://vk.com/"})
-                        pw_cookies.append({"name": k, "value": v, "url": "https://vk.ru/"})
+                        # Use domain instead of url to ensure subdomains (.vk.com) get the cookies
+                        pw_cookies.append({"name": k, "value": v, "domain": ".vk.com", "path": "/"})
+                        pw_cookies.append({"name": k, "value": v, "domain": ".vk.ru", "path": "/"})
                 if pw_cookies:
                     try:
                         await context.add_cookies(pw_cookies)
