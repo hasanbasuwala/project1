@@ -599,8 +599,9 @@ class DownloaderEngine:
                                 await page.keyboard.press("Enter")
                                 await page.wait_for_timeout(6000)
 
-                            self.db.log_trace(jid, "Playwright auth sequence executed. Reloading target wall...")
-                            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                self.db.log_trace(jid, "Navigating to main target URL and waiting for network idle...")
+                # Changed domcontentloaded to networkidle to wait out the VK skeleton screens
+                await page.goto(url, wait_until="networkidle", timeout=60000)
                     except Exception as e:
                         self.db.log_trace(jid, f"VK Auth automation bypassed or failed: {e}")
                 # -------------------------------------------
