@@ -338,33 +338,40 @@ class DownloaderEngine:
 
             self.db.log_trace(jid, "yt-dlp variants failed. Escalating to Playwright extraction...")
             
-            # Try up to 3 different proxies before attempting a local fallback
-            for attempt in range(3):
-                proxy_url = await get_random_free_proxy()
-                
-                # Check if proxy fetch failed or returned empty to prevent Playwright config errors
-                if not proxy_url:
-                    self.db.log_trace(jid, f"Extraction attempt {attempt + 1}/3: No valid proxy found. Skipping to next attempt.")
-                    continue
-                    
-                self.db.log_trace(jid, f"Extraction attempt {attempt + 1}/3 using proxy: {proxy_url}")
-                
-                try:
-                    playwright_data = await self._run_playwright_extraction(url, jid, dl_dir, proxy_url)
-                    if playwright_data and playwright_data.get('url'):
-                        self.db.log_trace(jid, "Extraction successful via proxy.")
-                        used_proxy = proxy_url
-                        break
-                except Exception as e:
-                    self.db.log_trace(jid, f"Proxy attempt failed: {e}")
-            else:
-                # Absolute last resort fallback to local Wi-Fi
-                self.db.log_trace(jid, "All proxies exhausted or unreachable. Routing entire payload and extraction through direct local Wi-Fi...")
+            # --- AUTOMATIC PROXY BYPASS FOR VK ---
+            if "vk.com" in url.lower() or "vkvideo.ru" in url.lower():
+                self.db.log_trace(jid, "VK link detected: Enforcing DIRECT local connection to protect cookies and bypass SSL proxy blocks.")
                 used_proxy = None
                 try:
                     playwright_data = await self._run_playwright_extraction(url, jid, dl_dir, proxy_url=None)
                 except Exception as e:
-                    raise RuntimeError(f"PASS 11 FAILED: Target is completely unreachable on local Wi-Fi as well. Error: {e}")
+                    raise RuntimeError(f"PASS 11 FAILED: Direct VK extraction failed: {e}")
+            else:
+                # Standard proxy cascading for other sites
+                for attempt in range(3):
+                    proxy_url = await get_random_free_proxy()
+                    
+                    if not proxy_url:
+                        self.db.log_trace(jid, f"Extraction attempt {attempt + 1}/3: No valid proxy found. Skipping to next attempt.")
+                        continue
+                        
+                    self.db.log_trace(jid, f"Extraction attempt {attempt + 1}/3 using proxy: {proxy_url}")
+                    
+                    try:
+                        playwright_data = await self._run_playwright_extraction(url, jid, dl_dir, proxy_url)
+                        if playwright_data and playwright_data.get('url'):
+                            self.db.log_trace(jid, "Extraction successful via proxy.")
+                            used_proxy = proxy_url
+                            break
+                    except Exception as e:
+                        self.db.log_trace(jid, f"Proxy attempt failed: {e}")
+                else:
+                    self.db.log_trace(jid, "All proxies exhausted or unreachable. Routing entire payload and extraction through direct local Wi-Fi...")
+                    used_proxy = None
+                    try:
+                        playwright_data = await self._run_playwright_extraction(url, jid, dl_dir, proxy_url=None)
+                    except Exception as e:
+                        raise RuntimeError(f"PASS 11 FAILED: Target is completely unreachable on local Wi-Fi as well. Error: {e}")
 
             if not playwright_data or not playwright_data.get('url'):
                 raise RuntimeError("PASS 11 FAILED: All extraction methods exhausted. Target is highly protected.")
