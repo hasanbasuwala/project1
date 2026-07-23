@@ -89,7 +89,8 @@ async def run_test():
         page = await context.new_page()
         
         # Apply the Playwright-Stealth patch to mask the remaining bot leaks
-        await stealth_async(page)
+        stealth = Stealth()
+        await stealth.apply_stealth_async(page)
         
         found_media = []
 
