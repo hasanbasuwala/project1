@@ -3,7 +3,7 @@ import os
 import glob
 import requests
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth
+from playwright_stealth import Stealth  # <-- THIS MUST BE HERE
 import config
 
 # --- CONFIGURATION ---
