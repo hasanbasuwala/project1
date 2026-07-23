@@ -65,7 +65,12 @@ logging.getLogger("pyrogram").setLevel(logging.ERROR)
 API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID = config.API_ID, config.API_HASH, config.BOT_TOKEN, config.CHANNEL_ID
 OWNER_ID = int(config.OWNER_ID) if hasattr(config, "OWNER_ID") else 0
 
-# --- ADD THIS LINE ---
+# --- VK API & SESSION CONFIGURATION ---
+try:
+    import vk_api
+except ImportError:
+    vk_api = None
+
 VK_COOKIES = None
 if os.path.exists("extracted_cookies.txt"):
     with open("extracted_cookies.txt", "r", encoding="utf-8") as f:
@@ -73,7 +78,8 @@ if os.path.exists("extracted_cookies.txt"):
 
 VK_USERNAME = getattr(config, "VK_USERNAME", None)
 VK_PASSWORD = getattr(config, "VK_PASSWORD", None)
-# ---------------------
+VK_TOKEN = getattr(config, "VK_TOKEN", None)  # <--- ADD THIS LINE
+# --------------------------------------
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
