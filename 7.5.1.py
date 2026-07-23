@@ -566,8 +566,9 @@ class DownloaderEngine:
             await page.route("**/*", handle_route)
 
             try:
-                self.db.log_trace(jid, "Navigating to main target URL...")
-                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                self.db.log_trace(jid, "Navigating to main target URL and waiting for network idle...")
+                # Changed domcontentloaded to networkidle to wait out the VK skeleton screens
+                await page.goto(url, wait_until="networkidle", timeout=60000)
                 
                 # --- ADDED: VK PLAYWRIGHT AUTHENTICATION ---
                 if "vk.com" in url or "vkvideo.ru" in url:
