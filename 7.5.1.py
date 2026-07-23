@@ -491,7 +491,8 @@ class DownloaderEngine:
                     "--disable-setuid-sandbox",
                     "--disable-blink-features=AutomationControlled",
                     "--disable-site-isolation-trials", 
-                    "--disable-web-security",          
+                    "--disable-web-security",
+                    "--ignore-certificate-errors",
                     f"--disable-extensions-except={path_to_extension}",
                     f"--load-extension={path_to_extension}"
                 ]
