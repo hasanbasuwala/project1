@@ -371,9 +371,20 @@ class DownloaderEngine:
             self.db.log_trace(jid, f"Normalized vk.ru alias to {url}")
         # -------------------------------------------
 
+        # --- PHASE 0: VK API TOKEN EXTRACTION OVERRIDE ---
+        if any(domain in url.lower() for domain in ["vk.com", "vkvideo.ru"]) and VK_TOKEN:
+            self.db.log_trace(jid, "VK target detected. Querying VK API backend with token...")
+            extracted_player = await asyncio.to_thread(self._extract_vk_api, url, jid)
+            if extracted_player:
+                self.db.log_trace(jid, f"VK API Token bypass successful! Rerouting payload URL to: {extracted_player}")
+                url = extracted_player  # Overwrite original wall post URL with extracted video_ext link
+        # -------------------------------------------------
+
         dl_dir = JOBS_DIR / f"JOB_{jid}" / "dl"
         
         self.db.log_trace(jid, f"Download Orchestrator engaged. Strategy: {strategy}")
+        
+        # ... rest of execute() remains unchanged ...
 
         if strategy == "TELEGRAM":
             async def tg_prog(c, t):
