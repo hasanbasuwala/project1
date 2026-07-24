@@ -2312,8 +2312,9 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
                         await status.edit_text("⚠️ Playlist is empty or heavily restricted.")
                         return
                         
-                    # Generate a unique ID for this playlist grouping
+                    # ENCODE METADATA IN SOURCE: PL_ID | Total Assets | Playlist Name
                     pl_id = f"PL_{str(uuid.uuid4())[:6]}"
+                    pl_source = f"{pl_id}|{len(entries)}|{pl_title}"
                     
                     # Store all items directly to the database in a "held" state
                     for i, entry in enumerate(entries):
@@ -2322,18 +2323,15 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
                             vid_title = entry.get('title', f"Playlist Video {i+1}")
                             jid = str(uuid.uuid4())[:8]
                             
-                            # Notice tracker_id is None, and stage is playlist_held. 
-                            # The daemon handles UI generation later.
                             await db.create_job({
                                 "id": jid, "url": vid_url, "title": vid_title, 
-                                "source": pl_id, "quality": "auto", 
+                                "source": pl_source, "quality": "auto", 
                                 "strategy": LinkClassifier.classify(vid_url), 
                                 "chat_id": msg.chat.id, "tracker_id": None
                             })
-                            # Force the DB to register the held stage
                             await db.update_job(jid, stage='playlist_held')
                             
-                    await status.edit_text(f"✅ **VAULT SECURED**\n**Playlist:** `{pl_title}`\n**Total Assets:** `{len(entries)}`\n\nThe Warden Daemon will now process these sequentially while maintaining the 15GB disk quota.")
+                    await status.edit_text(f"✅ **VAULT SECURED**\n**Playlist:** `{pl_title}`\n**Assets:** `{len(entries)}`\n\nThe Warden Daemon will now stream these consecutively while enforcing the 15GB disk limit.")
                     return
                 except Exception as e:
                     await status.edit_text(f"⚠️ Extraction failed: {e}")
