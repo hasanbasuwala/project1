@@ -1421,65 +1421,54 @@ class RecoveryManager:
 # ──────────────────────────── SUBSYSTEM 5: PLAYLIST DAEMON ─────────
 
 def get_current_storage_gb() -> float:
-    """Calculates total disk space used by the active jobs directory."""
     try:
         return sum(f.stat().st_size for f in JOBS_DIR.rglob("*") if f.is_file()) / (1024 ** 3)
     except Exception:
         return 0.0
 
 async def playlist_daemon(db: JobScheduler, pipeline: PipelineManager, app: Client):
-    """
-    Autonomous Warden: Monitors disk space and sequentially feeds playlist 
-    items into the main pipeline one-by-one to prevent storage overload.
-    """
+    """Warden Daemon: Streams playlists consecutively and throttles via disk space."""
     while True:
-        await asyncio.sleep(10) # Audit the system every 10 seconds
-        
+        await asyncio.sleep(5) 
         try:
-            # 1. HARD DISK QUOTA (12GB threshold allows 3GB overhead for FFmpeg encoding)
-            if get_current_storage_gb() >= 12.0:
-                continue 
-
-            active_jobs = await db.get_active_jobs()
+            storage_gb = get_current_storage_gb()
+            # 12GB threshold ensures 3GB headroom for FFmpeg muxing
+            disk_full = storage_gb >= 12.0  
             
-            # Isolate playlists from standard batch/direct downloads
+            active_jobs = await db.get_active_jobs()
             playlist_jobs = [j for j in active_jobs if str(j.get('source', '')).startswith('PL_')]
-            if not playlist_jobs:
-                continue
+            
+            if not playlist_jobs: continue
 
-            # Group jobs by their specific Playlist ID
+            # Group jobs by their Playlist ID
             playlists = {}
             for j in playlist_jobs:
-                pid = j['source']
-                if pid not in playlists: playlists[pid] = []
-                playlists[pid].append(j)
+                src = j['source']
+                if src not in playlists: playlists[src] = []
+                playlists[src].append(j)
 
-            # 2. SEQUENTIAL RELEASE LOGIC
-            for pid, jobs in playlists.items():
-                # Check if this specific playlist already has an item moving through the pipeline
-                active_items = [j for j in jobs if j.get('stage') not in ['playlist_held', 'completed', 'failed', 'cancelled']]
+            for src, jobs in playlists.items():
+                # Count how many items from THIS playlist are actively downloading right now
+                dl_active = [j for j in jobs if j.get('stage') in ['queued', 'downloading']]
                 
-                # Only release the next item if the previous one has completely finished and uploaded
-                if len(active_items) == 0:
+                # Stream logic: Keep 1 item downloading at a time. 
+                # If 0 are downloading, and disk space is okay, release the next one.
+                if len(dl_active) == 0 and not disk_full:
                     held_items = [j for j in jobs if j.get('stage') == 'playlist_held']
-                    
                     if held_items:
                         next_job = held_items[0]
                         jid = next_job['id']
                         
-                        # Spawn the Job Card in Telegram now that it's actually starting
                         tracker = await app.send_message(
                             next_job['chat_id'], 
                             f"`[ ⚡ ] ＴＡＳＫ :` `{next_job['title'][:30]}..`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (PLAYLIST)`",
                             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
                         )
                         
-                        # Push to active pipeline
                         await db.update_job(jid, stage='queued', tracker_id=tracker.id)
                         await pipeline.dl_q.put(jid)
-                        
-        except Exception as e:
-            pass # Keep the daemon alive silently if a database lock occurs
+        except Exception:
+            pass
 
 # ──────────────────────────── PIPELINE MANAGER (Orchestrator) ───────────
 
