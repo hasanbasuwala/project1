@@ -2296,6 +2296,10 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
 
     @app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["start", "dashboard", "go", "end"]))
     async def url_catcher(_, msg: Message):
+        # --- FIX: GLOBALS DECLARED AT THE VERY TOP ---
+        global _batch_mode, _batch_collection
+        # ---------------------------------------------
+        
         if msg.reply_to_message and msg.reply_to_message.text and "RENAME TASK" in msg.reply_to_message.text:
             try:
                 jid = re.search(r"`([a-zA-Z0-9_]+)`", msg.reply_to_message.text).group(1)
@@ -2309,15 +2313,21 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
             except Exception: pass
             return
 
-        url = next((w for w in msg.text.split() if w.startswith("http") or w.startswith("magnet:?")), None)
-        if url:
-            # --- ADDED: CUSTOM CAPTION EXTRACTION ---
-            # Extracts anything written after the '#' symbol
-            custom_caption = None
-            if "#" in msg.text:
-                custom_caption = msg.text.split("#", 1)[1].strip()
-            # ----------------------------------------
+        # ROBUST URL & CAPTION EXTRACTION
+        raw_text = msg.text
+        custom_caption = None
+        
+        # Extract the caption safely
+        if "#" in raw_text:
+            custom_caption = raw_text.split("#", 1)[1].strip()
             
+        # Find the URL and strip the hashtag so yt-dlp doesn't crash on invalid fragments
+        raw_url_word = next((w for w in raw_text.split() if w.startswith("http") or w.startswith("magnet:?")), None)
+        url = None
+        if raw_url_word:
+            url = raw_url_word.split("#")[0].strip() 
+
+        if url:
             # --- PLAYLIST INTERCEPTOR & VAULT STORAGE ---
             is_playlist = "playlist" in url.lower() or ("vk" in url.lower() and "video" in url.lower() and "list=" in url.lower())
             
@@ -2359,15 +2369,13 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
                     for i, entry in enumerate(entries):
                         vid_url = entry.get('url') or entry.get('webpage_url')
                         if vid_url:
-                            original_title = entry.get('title', f"Part {i+1}")
+                            original_title = entry.get('title', f"Video {i+1}")
                             
-                            # --- ADDED: APPLY CUSTOM CAPTION TO ALL PLAYLIST VIDEOS ---
+                            # APPLY EXACT CAPTION WITH PART COUNTER
                             if custom_caption:
-                                # Appends the original title to the custom caption so you can tell them apart
-                                vid_title = custom_caption
+                                vid_title = f"{custom_caption} (Part {i+1})"
                             else:
                                 vid_title = original_title
-                            # ----------------------------------------------------------
                             
                             jid = str(uuid.uuid4())[:8]
                             
@@ -2387,13 +2395,11 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
             # ----------------------------------------------
 
             # NORMAL SINGLE/BATCH PROCESSING
-            # Use the custom caption if provided, otherwise fallback to the normal text
             if custom_caption:
                 title = custom_caption
             else:
-                title = msg.text.replace(url, "").strip() or url[:40]
+                title = raw_text.replace(raw_url_word, "").strip() or url[:40]
             
-            global _batch_mode, _batch_collection
             if _batch_mode:
                 _batch_collection.append((url, title, msg.chat.id))
                 await msg.reply(f"✅ Added to batch. Total: {len(_batch_collection)}.", quote=True)
