@@ -2373,7 +2373,7 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
                             
                             # APPLY EXACT CAPTION WITH PART COUNTER
                             if custom_caption:
-                                vid_title = f"{custom_caption} (Part {i+1})"
+                                vid_title = custom_caption
                             else:
                                 vid_title = original_title
                             
