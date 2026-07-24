@@ -2214,6 +2214,102 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
 
         url = next((w for w in msg.text.split() if w.startswith("http") or w.startswith("magnet:?")), None)
         if url:
+            global _batch_mode, _batch_collection
+            
+            # --- ADDED: PLAYLIST INTERCEPTOR & UNPACKER ---
+            is_playlist = "playlist" in url.lower() or ("vk" in url.lower() and "video" in url.lower() and "list=" in url.lower())
+            
+            if is_playlist:
+                status_msg = await msg.reply("🗂️ **Playlist detected.** Unpacking URLs...")
+                
+                def _extract_flat():
+                    opts = {"extract_flat": True, "quiet": True, "no_warnings": True}
+                    # Attach cookies in case the playlist is private/restricted
+                    if VK_COOKIES:
+                        cookie_path = "temp_playlist_cookies.txt"
+                        try:
+                            with open(cookie_path, "w", encoding="utf-8") as f:
+                                f.write("# Netscape HTTP Cookie File\n")
+                                for item in VK_COOKIES.strip().split(';'):
+                                    if '=' in item:
+                                        k, v = item.strip().split('=', 1)
+                                        f.write(f".vk.com\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n")
+                            opts["cookiefile"] = cookie_path
+                        except Exception: pass
+                        
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        return ydl.extract_info(url, download=False)
+                        
+                try:
+                    info = await asyncio.to_thread(_extract_flat)
+                    entries = info.get('entries', []) if info else []
+                    
+                    if not entries:
+                        await status_msg.edit_text("⚠️ Failed to unpack playlist. It might be empty or highly restricted.")
+                        return
+                        
+                    # Clean up temporary cookie file
+                    if os.path.exists("temp_playlist_cookies.txt"):
+                        os.remove("temp_playlist_cookies.txt")
+                        
+                except Exception as e:
+                    await status_msg.edit_text(f"⚠️ Playlist extraction failed: {e}")
+                    return
+
+                # If batch mode is active, add them to the batch quietly
+                if _batch_mode:
+                    for entry in entries:
+                        vid_url = entry.get('url') or entry.get('webpage_url')
+                        if vid_url:
+                            vid_title = entry.get('title', 'VK Playlist Video')
+                            _batch_collection.append((vid_url, vid_title, msg.chat.id))
+                    await status_msg.edit_text(f"✅ Unpacked {len(entries)} videos and added them to the Batch queue. Total: {len(_batch_collection)}.")
+                    return
+                else:
+                    # If not in batch mode, treat the playlist as an instant mini-batch
+                    await status_msg.edit_text(f"🚀 Unpacked {len(entries)} videos. Dispatching to Orchestrator...")
+                    for entry in entries:
+                        vid_url = entry.get('url') or entry.get('webpage_url')
+                        if vid_url:
+                            vid_title = entry.get('title', 'VK Playlist Video')
+                            jid = str(uuid.uuid4())[:8]
+                            tracker = await app.send_message(
+                                msg.chat.id,
+                                f"`[ ⚡ ] ＴＡＳＫ :` `{vid_title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (PLAYLIST)`", 
+                                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
+                            )
+                            await db.create_job({"id": jid, "url": vid_url, "title": vid_title, "source": "Playlist", "quality": "auto", "strategy": LinkClassifier.classify(vid_url), "chat_id": msg.chat.id, "tracker_id": tracker.id})
+                            await pipeline.dl_q.put(jid)
+                            await asyncio.sleep(0.5) # Prevent Telegram FloodWait when spamming cards
+                    return
+            # ----------------------------------------------
+
+            # NORMAL SINGLE LINK PROCESSING (Unchanged)
+            title = msg.text.replace(url, "").strip() or url[:40]
+            if _batch_mode:
+                _batch_collection.append((url, title, msg.chat.id))
+                await msg.reply(f"✅ Added to batch. Total: {len(_batch_collection)}. Send `/end` to process.", quote=True)
+            else:
+                jid = str(uuid.uuid4())[:8]
+                tracker = await msg.reply(f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]]))
+                await db.create_job({"id": jid, "url": url, "title": title, "source": "Direct", "quality": "auto", "strategy": LinkClassifier.classify(url), "chat_id": msg.chat.id, "tracker_id": tracker.id})
+                await pipeline.dl_q.put(jid)
+
+        if msg.reply_to_message and msg.reply_to_message.text and "RENAME TASK" in msg.reply_to_message.text:
+            try:
+                jid = re.search(r"`([a-zA-Z0-9_]+)`", msg.reply_to_message.text).group(1)
+                new_title = msg.text.strip()
+                await db.update_job(jid, title=new_title)
+                await msg.reply_to_message.delete()
+                await msg.delete()
+                if _dashboard_msg_id:
+                    text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
+                    await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
+            except Exception: pass
+            return
+
+        url = next((w for w in msg.text.split() if w.startswith("http") or w.startswith("magnet:?")), None)
+        if url:
             title = msg.text.replace(url, "").strip() or url[:40]
             
             global _batch_mode, _batch_collection
