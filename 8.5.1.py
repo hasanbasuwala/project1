@@ -1007,7 +1007,49 @@ class DownloaderEngine:
 
         if custom_opts: opts.update(custom_opts)
             
-        with yt_dlp.YoutubeDL(opts) as ydl: ydl.extract_info(url, download=True)
+        # --- START DOWNLOAD EXECUTION WITH ARIA2C FALLBACK LOGIC ---
+        base_opts = opts.copy()
+
+        # Phase 1: Inject Aria2c configuration for maximum speed
+        opts["external_downloader"] = "aria2c"
+        opts["external_downloader_args"] = {
+            "aria2c": [
+                "-c",            # Continue/resume partial downloads
+                "-j", "10",      # Number of concurrent downloads
+                "-x", "10",      # Max connections per server
+                "-s", "10",      # Split the file into 10 pieces
+                "-k", "5M"       # Minimum split size (5 Megabytes)
+            ]
+        }
+
+        if hasattr(self, 'db'):
+            self.db.log_trace(jid, "Executing yt-dlp via Aria2c multi-connection mode...")
+
+        try:
+            # Attempt the accelerated download
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info(url, download=True)
+                
+        except Exception as e:
+            if hasattr(self, 'db'):
+                self.db.log_trace(jid, f"Aria2c download failed/rejected: {str(e)[:100]}. Falling back to boosted native yt-dlp...")
+            
+            # Phase 2: Setup Boosted Native yt-dlp fallback
+            fallback_opts = base_opts.copy()
+            
+            # Inject speed-boosting settings for native HTTP downloader
+            fallback_opts["concurrent_fragment_downloads"] = 10  # Speeds up HLS / .m3u8 streams
+            fallback_opts["http_chunk_size"] = 10485760          # 10MB chunk requests for direct .mp4
+            fallback_opts["buffersize"] = 32768                  # 32KB memory buffer
+            fallback_opts["source_address"] = "0.0.0.0"          # Force IPv4 to prevent IPv6 latency hanging
+            
+            if hasattr(self, 'db'):
+                self.db.log_trace(jid, "Executing fallback via Native yt-dlp (Boosted HTTP Settings)...")
+            
+            # Execute the fallback
+            with yt_dlp.YoutubeDL(fallback_opts) as ydl_fallback:
+                ydl_fallback.extract_info(url, download=True)
+        # --- END DOWNLOAD EXECUTION ---
 
     async def _run_aria(self, url: str, jid: str, dl_dir: Path, headers: dict = None):
         out_name = f"{jid}.mp4"
