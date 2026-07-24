@@ -264,49 +264,45 @@ class DownloaderEngine:
             json.dump(safe_payload, f)
             
     def _extract_vk_api(self, url: str, jid: str) -> str | None:
-        """Extracts and rebuilds the canonical VK video URL to bypass embed limits and CDN binding."""
+        """Ghost Protocol: Extract direct CDN links bypassing web frontend entirely."""
         if not vk_api or not VK_TOKEN:
             return None
 
         try:
             vk_session = vk_api.VkApi(token=VK_TOKEN)
             vk = vk_session.get_api()
-
-            # 1. Check if URL is a Wall Post (e.g., wall-223870924_29871)
+            
+            video_id = None
+            
+            # 1. Parse Wall Post or Direct Link for video ID
             wall_match = re.search(r'wall(-?\d+_\d+)', url)
             if wall_match:
                 post_id = wall_match.group(1)
-                self.db.log_trace(jid, f"[vk_api] Intercepted wall post ID: {post_id}")
                 response = vk.wall.getById(posts=post_id)
-                
                 if response:
-                    post = response[0]
-                    for item in post.get('attachments', []):
+                    for item in response[0].get('attachments', []):
                         if item.get('type') == 'video':
-                            video = item['video']
-                            video_id = f"{video['owner_id']}_{video['id']}"
-                            access_key = video.get('access_key', '')
-                            vid_query = f"{video_id}_{access_key}" if access_key else video_id
-                            
-                            # Reconstruct the canonical main-site URL
-                            canonical_url = f"https://vk.com/video{vid_query}"
-                            self.db.log_trace(jid, f"[vk_api] Reconstructed canonical site URL: {canonical_url}")
-                            return canonical_url
+                            v = item['video']
+                            video_id = f"{v['owner_id']}_{v['id']}_{v.get('access_key', '')}".strip('_')
+            else:
+                video_match = re.search(r'video(-?\d+_\d+)', url)
+                if video_match:
+                    video_id = video_match.group(1)
 
-            # 2. Check if URL is already a Direct Video Link
-            video_match = re.search(r'video(-?\d+_\d+)', url)
-            if video_match:
-                video_id = video_match.group(1)
-                self.db.log_trace(jid, f"[vk_api] Intercepted direct video ID: {video_id}")
-                
-                # Reconstruct the canonical main-site URL
-                canonical_url = f"https://vk.com/video{video_id}"
-                self.db.log_trace(jid, f"[vk_api] Reconstructed canonical site URL: {canonical_url}")
-                return canonical_url
+            # 2. Extract Raw Files via API
+            if video_id:
+                vid_details = vk.video.get(videos=video_id)
+                if vid_details and vid_details.get('items'):
+                    files = vid_details['items'][0].get('files', {})
+                    # Prioritize highest quality MP4
+                    for q in ['mp4_1080', 'mp4_720', 'mp4_480', 'mp4_360', 'mp4_240', 'hls']:
+                        if q in files:
+                            direct_link = files[q]
+                            self.db.log_trace(jid, f"[vk_api] Direct {q.upper()} link extracted.")
+                            return direct_link
 
         except Exception as e:
-            self.db.log_trace(jid, f"[vk_api] Extraction failed or skipped: {e}")
-
+            self.db.log_trace(jid, f"[vk_api] Ghost Protocol Failed: {e}")
         return None
             
     async def _pre_download_validation(self, url: str, jid: str, headers: dict, cookie_str: str, proxy_url: str = None) -> bool:
