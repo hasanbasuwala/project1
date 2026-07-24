@@ -1727,7 +1727,7 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
     expanded_jid = None
     
     if len(parts) == 2:
-        if parts[1].startswith("Batch_"):
+        if parts[1].startswith("Batch_") or parts[1].startswith("PL_"):
             expanded_batch = parts[1]
         else:
             expanded_jid = parts[1]
@@ -1738,7 +1738,6 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
     total_storage = sum(f.stat().st_size for f in JOBS_DIR.rglob("*") if f.is_file()) / (1024 ** 3)
     jobs = await db.get_active_jobs()
     
-    # Isolate Recovery Jobs from Standard Jobs
     recovery_pool = [j for j in jobs if j.get('recovered_at_stage') is not None]
     standard_jobs = [j for j in jobs if j.get('recovered_at_stage') is None]
 
@@ -1746,13 +1745,15 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
         if not stage_str: return ""
         return stage_str.split("|")[0].strip().lower() if "|" in stage_str else stage_str.strip().lower()
 
-    # Buckets for standard pipeline
+    # Filter out playlist_held items from standard processing buckets to keep UI clean
+    active_standard = [j for j in standard_jobs if _base(j.get('stage')) != 'playlist_held']
+
     buckets = {
-        "dl": [j for j in standard_jobs if _base(j['stage']) in ["queued", "downloading"]],
-        "dl_done": [j for j in standard_jobs if _base(j['stage']) == "downloaded"],
-        "enc": [j for j in standard_jobs if _base(j['stage']) in ["encoding", "process"]],
-        "enc_done": [j for j in standard_jobs if _base(j['stage']) == "encoded"],
-        "up": [j for j in standard_jobs if _base(j['stage']) == "uploading"]
+        "dl": [j for j in active_standard if _base(j['stage']) in ["queued", "downloading"]],
+        "dl_done": [j for j in active_standard if _base(j['stage']) == "downloaded"],
+        "enc": [j for j in active_standard if _base(j['stage']) in ["encoding", "process"]],
+        "enc_done": [j for j in active_standard if _base(j['stage']) == "encoded"],
+        "up": [j for j in active_standard if _base(j['stage']) == "uploading"]
     }
 
     act_text_blocks = []
@@ -1761,43 +1762,32 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
     else:
         act_text_blocks.append("`[🔄] ACT  :`")
         counter = 1
-        
-        if buckets['dl']:
-            act_text_blocks.append(f"`  {counter}. DL ({len(buckets['dl'])})`")
-            for i, j in enumerate(buckets['dl'][:5]):
-                pct = float(j.get('pct', 0.0) or 0.0)
-                act_text_blocks.append(f"`     {chr(97+i)}. {j['title'][:12]}.. [{make_bar(pct, 8)}] {pct:.1f}%`")
-            counter += 1
-            
-        if buckets['enc']:
-            act_text_blocks.append(f"`  {counter}. PR ({len(buckets['enc'])})`")
-            for i, j in enumerate(buckets['enc'][:5]):
-                pct = float(j.get('pct', 0.0) or 0.0)
-                act_text_blocks.append(f"`     {chr(97+i)}. {j['title'][:12]}.. [{make_bar(pct, 8)}] {pct:.1f}%`")
-            counter += 1
-            
-        if buckets['up']:
-            act_text_blocks.append(f"`  {counter}. UP ({len(buckets['up'])})`")
-            for i, j in enumerate(buckets['up'][:5]):
-                pct = float(j.get('pct', 0.0) or 0.0)
-                act_text_blocks.append(f"`     {chr(97+i)}. {j['title'][:12]}.. [{make_bar(pct, 8)}] {pct:.1f}%`")
+        for key, name in [('dl', 'DL'), ('enc', 'PR'), ('up', 'UP')]:
+            if buckets[key]:
+                act_text_blocks.append(f"`  {counter}. {name} ({len(buckets[key])})`")
+                for i, j in enumerate(buckets[key][:3]):
+                    pct = float(j.get('pct', 0.0) or 0.0)
+                    act_text_blocks.append(f"`     {chr(97+i)}. {j['title'][:12]}.. [{make_bar(pct, 8)}] {pct:.1f}%`")
+                counter += 1
                 
     act_string = "\n".join(act_text_blocks)
-
     sync_stat = "`RECOVERY AUDIT ACTIVE`" if recovery_pool else "`SYSTEM NORMAL`"
     
     global _batch_mode, _batch_collection
     batch_active = any(str(j.get('source', '')).startswith('Batch_') for j in standard_jobs)
+    pl_active = any(str(j.get('source', '')).startswith('PL_') for j in standard_jobs)
     
     if _batch_mode:
-        stat_str = f"🟡 BATCH COLLECTION ({len(_batch_collection)} ITEMS QUEUED)"
+        stat_str = f"🟡 BATCH COLLECTION ({len(_batch_collection)} ITEMS)"
+    elif pl_active:
+        stat_str = "🟣 PLAYLIST STREAMING ACTIVE"
     elif batch_active:
         stat_str = "🔵 BATCH PROCESSING ACTIVE"
     else:
         stat_str = "ONLINE & SECURE"
     
     text = (
-        f"💻 **MAINFRAME v8.5.1**\n"
+        f"💻 **MAINFRAME v8.5.2**\n"
         f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
         f"`[⚡] STAT :` `{stat_str}`\n"
         f"`[⚠️] SYNC :` {sync_stat}\n"
@@ -1810,6 +1800,71 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
 
     kb_lines = []
 
+    # Helper for Playlist Dropdowns
+    def build_playlist_dropdown(target_stage: str, label: str, icon: str, job_list: list, parent_tab: str = "root"):
+        pl_jobs = [j for j in job_list if str(j.get('source', '')).startswith('PL_')]
+        if not pl_jobs: return
+
+        playlists = {}
+        for j in pl_jobs:
+            src = j['source']
+            if src not in playlists: playlists[src] = []
+            playlists[src].append(j)
+
+        is_stage_open = (stage_tab == target_stage)
+        prefix = "[-]" if is_stage_open else "[+]"
+        parent_nav = parent_tab if is_stage_open and target_stage != "root" else ("root" if is_stage_open else target_stage)
+        
+        kb_lines.append([InlineKeyboardButton(f"{prefix} {icon} {label} ({len(playlists)} ACTIVE)", callback_data=f"dash|{parent_nav}")])
+        
+        if is_stage_open:
+            for src, p_jobs in playlists.items():
+                parts = src.split('|')
+                pl_id = parts[0]
+                total_orig = int(parts[1]) if len(parts) > 1 else len(p_jobs)
+                pl_name = parts[2][:15] if len(parts) > 2 else pl_id
+                
+                # Active DB items means they haven't completed/deleted yet
+                completed = total_orig - len(p_jobs)
+                
+                is_this_pl_open = (expanded_batch == pl_id)
+                p_prefix = "[-]" if is_this_pl_open else "[+]"
+                
+                next_cb = f"dash|{target_stage}" if is_this_pl_open else f"dash|{target_stage}:{pl_id}"
+                kb_lines.append([InlineKeyboardButton(f" └ {p_prefix} 🗂️ {pl_name} ({completed}/{total_orig} Done)", callback_data=next_cb)])
+                
+                if is_this_pl_open:
+                    # Show active pipeline items first, then preview the next 2 held items
+                    active_p = [j for j in p_jobs if _base(j.get('stage')) != 'playlist_held']
+                    held_p = [j for j in p_jobs if _base(j.get('stage')) == 'playlist_held']
+                    display_jobs = active_p + held_p[:2] 
+                    
+                    for j in display_jobs:
+                        jid = j['id']
+                        title = j['title'][:10]
+                        is_job_expanded = (expanded_jid == jid)
+                        
+                        if is_job_expanded:
+                            raw_stage = str(j.get('stage', '')).upper()
+                            pct = float(j.get('pct', 0.0) or 0.0)
+                            
+                            kb_lines.append([InlineKeyboardButton(f"🪪 ISOLATED JOB CARD: {jid}", callback_data="noop")])
+                            kb_lines.append([InlineKeyboardButton(f"📁 {title}...", callback_data="noop")])
+                            kb_lines.append([InlineKeyboardButton(f"⚙️ {raw_stage}", callback_data="noop")])
+                            kb_lines.append([InlineKeyboardButton(f"📊 [{make_bar(pct, 8)}] {pct:.1f}%", callback_data="noop")])
+                            kb_lines.append([
+                                InlineKeyboardButton("📄 LOGS", callback_data=f"joblog|{jid}"),
+                                InlineKeyboardButton("❌ KILL", callback_data=f"kill|{jid}")
+                            ])
+                            kb_lines.append([InlineKeyboardButton("🔙 CLOSE CARD", callback_data=f"dash|{target_stage}:{pl_id}")])
+                        else:
+                            stage_short = "HELD" if _base(j.get('stage')) == 'playlist_held' else _base(j.get('stage', ''))[:4].upper()
+                            pct = float(j.get('pct', 0.0) or 0.0)
+                            kb_lines.append([
+                                InlineKeyboardButton(f"      ├ [{stage_short}] {title}.. | {pct:.1f}%", callback_data=f"dash|{target_stage}:{pl_id}:{jid}"),
+                                InlineKeyboardButton("❌", callback_data=f"kill|{j['id']}")
+                            ])
+                            
     # Helper for Batch Dropdowns
     def build_batch_dropdown(target_stage: str, label: str, icon: str, job_list: list, parent_tab: str = "root"):
         batch_jobs = [j for j in job_list if str(j.get('source', '')).startswith('Batch_')]
@@ -1859,15 +1914,10 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
                                 InlineKeyboardButton("📄 LOGS", callback_data=f"joblog|{jid}"),
                                 InlineKeyboardButton("❌ KILL", callback_data=f"kill|{jid}")
                             ])
-                            kb_lines.append([
-                                InlineKeyboardButton("✏️ RENAME", callback_data=f"rename|{jid}"),
-                                InlineKeyboardButton("⏭ FORCE UP", callback_data=f"forceup|{jid}")
-                            ])
                             kb_lines.append([InlineKeyboardButton("🔙 CLOSE CARD", callback_data=f"dash|{target_stage}:{b_name}")])
                         else:
                             pct = float(j.get('pct', 0.0) or 0.0)
                             stage_short = _base(j.get('stage', ''))[:4].upper()
-                            # Updated callback data to include target, batch name, and job id
                             kb_lines.append([
                                 InlineKeyboardButton(f"      ├ [{stage_short}] {title}.. | {pct:.1f}%", callback_data=f"dash|{target_stage}:{b_name}:{jid}"),
                                 InlineKeyboardButton("❌", callback_data=f"kill|{j['id']}")
@@ -1906,10 +1956,6 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
                         InlineKeyboardButton("📄 LOGS", callback_data=f"joblog|{jid}"),
                         InlineKeyboardButton("❌ KILL", callback_data=f"kill|{jid}")
                     ])
-                    kb_lines.append([
-                        InlineKeyboardButton("✏️ RENAME", callback_data=f"rename|{jid}"),
-                        InlineKeyboardButton("⏭ FORCE UP", callback_data=f"forceup|{jid}")
-                    ])
                     kb_lines.append([InlineKeyboardButton("🔙 CLOSE CARD", callback_data=f"dash|{target_stage}")])
                 else:
                     pct = j.get('pct', 0.0)
@@ -1919,7 +1965,7 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
                     ])
 
     if recovery_pool:
-        is_rec_open = stage_tab in ["recovery", "rec_dl", "rec_enc", "rec_up", "rec_batches"]
+        is_rec_open = stage_tab in ["recovery", "rec_dl", "rec_enc", "rec_up", "rec_batches", "rec_playlists"]
         kb_lines.append([InlineKeyboardButton(f"{'[-]' if is_rec_open else '[+]'} 🚨 RECOVERY POOL ({len(recovery_pool)})", callback_data=f"dash|{'root' if is_rec_open else 'recovery'}")])
         
         if is_rec_open:
@@ -1927,16 +1973,15 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
             rec_enc = [j for j in recovery_pool if _base(j['recovered_at_stage']) in ["encoding", "encoded"]]
             rec_up = [j for j in recovery_pool if _base(j['recovered_at_stage']) == "uploading"]
             
-            # Subsystem Batch injection in Recovery
+            build_playlist_dropdown("rec_playlists", "STALLED PLAYLISTS", "🗂️", recovery_pool, parent_tab="recovery")
             build_batch_dropdown("rec_batches", "STALLED BATCHES", "📦", recovery_pool, parent_tab="recovery")
-            
             build_dropdown("rec_dl", "STALLED DOWNLOADS", "📥", rec_dl, parent_tab="recovery")
             build_dropdown("rec_enc", "STALLED PROCESSING", "⚙️", rec_enc, parent_tab="recovery")
             build_dropdown("rec_up", "STALLED UPLOADS", "📤", rec_up, parent_tab="recovery")
             
             kb_lines.append([InlineKeyboardButton("🗑️ PURGE ALL RECOVERED", callback_data="purge_recovery")])
 
-    # Subsystem Batch injection in Main Dashboard
+    build_playlist_dropdown("main_playlists", "ACTIVE PLAYLISTS", "🗂️", standard_jobs, parent_tab="root")
     build_batch_dropdown("main_batches", "ACTIVE BATCHES", "📦", standard_jobs, parent_tab="root")
 
     build_dropdown("dl", "DOWNLOADING", "📥", buckets["dl"])
