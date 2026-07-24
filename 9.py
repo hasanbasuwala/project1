@@ -2364,7 +2364,7 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
                             # --- ADDED: APPLY CUSTOM CAPTION TO ALL PLAYLIST VIDEOS ---
                             if custom_caption:
                                 # Appends the original title to the custom caption so you can tell them apart
-                                vid_title = f"{custom_caption} - {original_title}"
+                                vid_title = custom_caption
                             else:
                                 vid_title = original_title
                             # ----------------------------------------------------------
