@@ -2311,6 +2311,13 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
 
         url = next((w for w in msg.text.split() if w.startswith("http") or w.startswith("magnet:?")), None)
         if url:
+            # --- ADDED: CUSTOM CAPTION EXTRACTION ---
+            # Extracts anything written after the '#' symbol
+            custom_caption = None
+            if "#" in msg.text:
+                custom_caption = msg.text.split("#", 1)[1].strip()
+            # ----------------------------------------
+            
             # --- PLAYLIST INTERCEPTOR & VAULT STORAGE ---
             is_playlist = "playlist" in url.lower() or ("vk" in url.lower() and "video" in url.lower() and "list=" in url.lower())
             
@@ -2346,15 +2353,22 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
                         await status.edit_text("⚠️ Playlist is empty or heavily restricted.")
                         return
                         
-                    # ENCODE METADATA IN SOURCE: PL_ID | Total Assets | Playlist Name
                     pl_id = f"PL_{str(uuid.uuid4())[:6]}"
                     pl_source = f"{pl_id}|{len(entries)}|{pl_title}"
                     
-                    # Store all items directly to the database in a "held" state
                     for i, entry in enumerate(entries):
                         vid_url = entry.get('url') or entry.get('webpage_url')
                         if vid_url:
-                            vid_title = entry.get('title', f"Playlist Video {i+1}")
+                            original_title = entry.get('title', f"Part {i+1}")
+                            
+                            # --- ADDED: APPLY CUSTOM CAPTION TO ALL PLAYLIST VIDEOS ---
+                            if custom_caption:
+                                # Appends the original title to the custom caption so you can tell them apart
+                                vid_title = f"{custom_caption} - {original_title}"
+                            else:
+                                vid_title = original_title
+                            # ----------------------------------------------------------
+                            
                             jid = str(uuid.uuid4())[:8]
                             
                             await db.create_job({
@@ -2373,7 +2387,11 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
             # ----------------------------------------------
 
             # NORMAL SINGLE/BATCH PROCESSING
-            title = msg.text.replace(url, "").strip() or url[:40]
+            # Use the custom caption if provided, otherwise fallback to the normal text
+            if custom_caption:
+                title = custom_caption
+            else:
+                title = msg.text.replace(url, "").strip() or url[:40]
             
             global _batch_mode, _batch_collection
             if _batch_mode:
