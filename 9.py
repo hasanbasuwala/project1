@@ -2426,7 +2426,7 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         if url:
             title = msg.text.replace(url, "").strip() or url[:40]
             
-            global _batch_mode, _batch_collection
+            
             if _batch_mode:
                 # Add to holding list without triggering processing
                 _batch_collection.append((url, title, msg.chat.id))
