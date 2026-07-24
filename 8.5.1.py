@@ -1012,13 +1012,20 @@ class DownloaderEngine:
 
         # Phase 1: Inject Aria2c configuration for maximum speed
         opts["external_downloader"] = "aria2c"
+        
+        # FIX: Allow yt-dlp to read Aria2c's progress stream so the UI updates
+        opts["noprogress"] = False  
+        opts["quiet"] = False       
+        
         opts["external_downloader_args"] = {
             "aria2c": [
-                "-c",            # Continue/resume partial downloads
-                "-j", "10",      # Number of concurrent downloads
-                "-x", "10",      # Max connections per server
-                "-s", "10",      # Split the file into 10 pieces
-                "-k", "5M"       # Minimum split size (5 Megabytes)
+                "-c",            
+                "-j", "10",      
+                "-x", "10",      
+                "-s", "10",      
+                "-k", "5M",      
+                "--summary-interval=1",       # FIX: Force Aria2c to report speed every second
+                "--console-log-level=notice"  # FIX: Ensure Aria2c prints the progress bar
             ]
         }
 
@@ -1035,13 +1042,14 @@ class DownloaderEngine:
                 self.db.log_trace(jid, f"Aria2c download failed/rejected: {str(e)[:100]}. Falling back to boosted native yt-dlp...")
             
             # Phase 2: Setup Boosted Native yt-dlp fallback
+            # This copies base_opts, which restores "quiet": True for the native downloader
             fallback_opts = base_opts.copy()
             
             # Inject speed-boosting settings for native HTTP downloader
-            fallback_opts["concurrent_fragment_downloads"] = 10  # Speeds up HLS / .m3u8 streams
-            fallback_opts["http_chunk_size"] = 10485760          # 10MB chunk requests for direct .mp4
-            fallback_opts["buffersize"] = 32768                  # 32KB memory buffer
-            fallback_opts["source_address"] = "0.0.0.0"          # Force IPv4 to prevent IPv6 latency hanging
+            fallback_opts["concurrent_fragment_downloads"] = 10  
+            fallback_opts["http_chunk_size"] = 10485760          
+            fallback_opts["buffersize"] = 32768                  
+            fallback_opts["source_address"] = "0.0.0.0"          
             
             if hasattr(self, 'db'):
                 self.db.log_trace(jid, "Executing fallback via Native yt-dlp (Boosted HTTP Settings)...")
