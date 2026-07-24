@@ -2277,17 +2277,14 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
 
         url = next((w for w in msg.text.split() if w.startswith("http") or w.startswith("magnet:?")), None)
         if url:
-            global _batch_mode, _batch_collection
-            
-            # --- ADDED: PLAYLIST INTERCEPTOR & UNPACKER ---
+            # --- PLAYLIST INTERCEPTOR & VAULT STORAGE ---
             is_playlist = "playlist" in url.lower() or ("vk" in url.lower() and "video" in url.lower() and "list=" in url.lower())
             
             if is_playlist:
-                status_msg = await msg.reply("🗂️ **Playlist detected.** Unpacking URLs...")
+                status = await msg.reply("🗂️ **Playlist detected.** Unpacking metadata...")
                 
                 def _extract_flat():
-                    opts = {"extract_flat": True, "quiet": True, "no_warnings": True}
-                    # Attach cookies in case the playlist is private/restricted
+                    opts = {"extract_flat": True, "quiet": True}
                     if VK_COOKIES:
                         cookie_path = "temp_playlist_cookies.txt"
                         try:
@@ -2306,52 +2303,50 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
                 try:
                     info = await asyncio.to_thread(_extract_flat)
                     entries = info.get('entries', []) if info else []
+                    pl_title = info.get('title', 'Unknown VK Playlist')
                     
-                    if not entries:
-                        await status_msg.edit_text("⚠️ Failed to unpack playlist. It might be empty or highly restricted.")
-                        return
-                        
-                    # Clean up temporary cookie file
                     if os.path.exists("temp_playlist_cookies.txt"):
                         os.remove("temp_playlist_cookies.txt")
                         
-                except Exception as e:
-                    await status_msg.edit_text(f"⚠️ Playlist extraction failed: {e}")
-                    return
-
-                # If batch mode is active, add them to the batch quietly
-                if _batch_mode:
-                    for entry in entries:
+                    if not entries:
+                        await status.edit_text("⚠️ Playlist is empty or heavily restricted.")
+                        return
+                        
+                    # Generate a unique ID for this playlist grouping
+                    pl_id = f"PL_{str(uuid.uuid4())[:6]}"
+                    
+                    # Store all items directly to the database in a "held" state
+                    for i, entry in enumerate(entries):
                         vid_url = entry.get('url') or entry.get('webpage_url')
                         if vid_url:
-                            vid_title = entry.get('title', 'VK Playlist Video')
-                            _batch_collection.append((vid_url, vid_title, msg.chat.id))
-                    await status_msg.edit_text(f"✅ Unpacked {len(entries)} videos and added them to the Batch queue. Total: {len(_batch_collection)}.")
-                    return
-                else:
-                    # If not in batch mode, treat the playlist as an instant mini-batch
-                    await status_msg.edit_text(f"🚀 Unpacked {len(entries)} videos. Dispatching to Orchestrator...")
-                    for entry in entries:
-                        vid_url = entry.get('url') or entry.get('webpage_url')
-                        if vid_url:
-                            vid_title = entry.get('title', 'VK Playlist Video')
+                            vid_title = entry.get('title', f"Playlist Video {i+1}")
                             jid = str(uuid.uuid4())[:8]
-                            tracker = await app.send_message(
-                                msg.chat.id,
-                                f"`[ ⚡ ] ＴＡＳＫ :` `{vid_title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (PLAYLIST)`", 
-                                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
-                            )
-                            await db.create_job({"id": jid, "url": vid_url, "title": vid_title, "source": "Playlist", "quality": "auto", "strategy": LinkClassifier.classify(vid_url), "chat_id": msg.chat.id, "tracker_id": tracker.id})
-                            await pipeline.dl_q.put(jid)
-                            await asyncio.sleep(0.5) # Prevent Telegram FloodWait when spamming cards
+                            
+                            # Notice tracker_id is None, and stage is playlist_held. 
+                            # The daemon handles UI generation later.
+                            await db.create_job({
+                                "id": jid, "url": vid_url, "title": vid_title, 
+                                "source": pl_id, "quality": "auto", 
+                                "strategy": LinkClassifier.classify(vid_url), 
+                                "chat_id": msg.chat.id, "tracker_id": None
+                            })
+                            # Force the DB to register the held stage
+                            await db.update_job(jid, stage='playlist_held')
+                            
+                    await status.edit_text(f"✅ **VAULT SECURED**\n**Playlist:** `{pl_title}`\n**Total Assets:** `{len(entries)}`\n\nThe Warden Daemon will now process these sequentially while maintaining the 15GB disk quota.")
+                    return
+                except Exception as e:
+                    await status.edit_text(f"⚠️ Extraction failed: {e}")
                     return
             # ----------------------------------------------
 
-            # NORMAL SINGLE LINK PROCESSING (Unchanged)
+            # NORMAL SINGLE/BATCH PROCESSING
             title = msg.text.replace(url, "").strip() or url[:40]
+            
+            global _batch_mode, _batch_collection
             if _batch_mode:
                 _batch_collection.append((url, title, msg.chat.id))
-                await msg.reply(f"✅ Added to batch. Total: {len(_batch_collection)}. Send `/end` to process.", quote=True)
+                await msg.reply(f"✅ Added to batch. Total: {len(_batch_collection)}.", quote=True)
             else:
                 jid = str(uuid.uuid4())[:8]
                 tracker = await msg.reply(f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]]))
