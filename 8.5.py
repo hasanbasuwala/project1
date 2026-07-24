@@ -959,6 +959,35 @@ class DownloaderEngine:
             "compat_opts": {"allow-unsafe-ext"}
         }
 
+        # --- ADDED: DYNAMIC CDN SIGNATURE SPOOFING (COOKIELESS BYPASS) ---
+        # Default to a highly standard Windows Chrome User-Agent
+        custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        
+        # Check the URL for VK's strict engine bindings
+        if "srcAg=GECKO" in url:
+            custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0"
+            if hasattr(self, 'db'):
+                self.db.log_trace(jid, "Ghost Protocol: Gecko CDN signature detected. Spoofing Firefox User-Agent.")
+        elif "srcAg=SAFARI" in url:
+            custom_ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"
+            if hasattr(self, 'db'):
+                self.db.log_trace(jid, "Ghost Protocol: Safari CDN signature detected. Spoofing Apple User-Agent.")
+        elif "srcAg=CHROMIUM" in url:
+            if hasattr(self, 'db'):
+                self.db.log_trace(jid, "Ghost Protocol: Chromium CDN signature detected. Using standard Chrome User-Agent.")
+
+        # Inject the spoofed User-Agent directly into yt-dlp's network options
+        if "http_headers" not in opts:
+            opts["http_headers"] = {}
+        opts["http_headers"]["User-Agent"] = custom_ua
+        
+        # Disable yt-dlp's default impersonation in Pass 3/4 if we are strictly spoofing a raw link
+        if "impersonate" in opts and ("srcAg=" in url):
+            del opts["impersonate"]
+            if hasattr(self, 'db'):
+                self.db.log_trace(jid, "Ghost Protocol: Disabled curl_cffi impersonation to prevent header collisions.")
+        # -----------------------------------------------------------------
+
         # --- ADDED: ON-THE-FLY NETSCAPE COOKIE TRANSLATOR ---
         if ("vk.com" in url.lower() or "vkvideo.ru" in url.lower()) and VK_COOKIES:
             cookie_path = dl_dir / f"{jid}_vk_cookies.txt"
