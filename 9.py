@@ -2577,11 +2577,15 @@ async def main():
         recovering_batch_jids = await RecoveryManager.scan_and_requeue(db, pipeline.dl_q, pipeline.enc_q, pipeline.up_q, app)
         pipeline.start_workers()
         
+        # (Inside async def main():)
+        
         asyncio.create_task(dispatcher.sender_loop()) 
         asyncio.create_task(ui_accumulator.run_loop()) 
         asyncio.create_task(terminal_loop(db, pipeline))
         
-        # ... [Keep previous bootstrap code in main()] ...
+        # --- ADD THIS LINE HERE ---
+        asyncio.create_task(playlist_daemon(db, pipeline, app))
+        # --------------------------
         
         # ─── BATCH ORCHESTRATORS ───
         asyncio.create_task(_batch_runner(db, pipeline, app))
