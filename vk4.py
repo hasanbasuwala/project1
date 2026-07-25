@@ -912,8 +912,8 @@ async def worker_pipeline(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.
             up_q.task_done()
 
     for _ in range(3): asyncio.create_task(dl_worker())
-    asyncio.create_task(enc_worker())
-    asyncio.create_task(up_worker())
+    for _ in range(2): asyncio.create_task(enc_worker())
+    for _ in range(2): asyncio.create_task(up_worker())
 
 # ──────────────────────────── BOOTSTRAP & REFRESHER ────────────────────
 
