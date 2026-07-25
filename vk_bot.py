@@ -97,7 +97,7 @@ class JobScheduler:
             with sqlite3.connect(self.db_path) as conn:
                 conn.executemany('INSERT INTO playlist_items VALUES (?, ?, ?, ?, "pending")', items)
 
-    async def get_active_playlists((self) -> list[dict]:
+    async def get_active_playlists(self) -> list[dict]:
         async with self.lock:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
