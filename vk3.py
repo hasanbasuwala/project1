@@ -263,6 +263,43 @@ async def playlist_drip_feed_loop(db: JobScheduler, dl_q: asyncio.Queue):
                         await dl_q.put(jid)
         except Exception as e:
             log.error(f"Drip Feed Loop Error: {e}")
+            
+class AriaLogger:
+    def __init__(self, jid: str, db: JobScheduler):
+        self.jid = jid
+        self.db = db
+        self.last_up = 0
+
+    def debug(self, msg): self._process(msg)
+    def info(self, msg): self._process(msg)
+    def warning(self, msg): pass
+    def error(self, msg): pass
+
+    def _process(self, msg):
+        # Target the specific aria2c summary line structure
+        if "DL:" in msg and "ETA:" in msg and "%" in msg:
+            try:
+                pct_m = re.search(r"\((\d+)%\)", msg)
+                speed_m = re.search(r"DL:([^\s]+)", msg)
+                eta_m = re.search(r"ETA:([^\]\s]+)", msg)
+                
+                if pct_m and speed_m and eta_m:
+                    pct = float(pct_m.group(1))
+                    speed = speed_m.group(1) + "/s"
+                    eta = eta_m.group(1)
+                    
+                    now = time.time()
+                    if now - self.last_up >= 1.5:
+                        global _live_ui_text
+                        _live_ui_text[self.jid] = f"[aria2] {pct:.1f}% at {speed} ETA {eta}"
+                        
+                        stage_str = f"downloading | {speed} | {eta}"
+                        asyncio.run_coroutine_threadsafe(
+                            self.db.update_job(self.jid, pct=pct, stage=stage_str), loop
+                        )
+                        self.last_up = now
+            except Exception:
+                pass
 
 # ──────────────────────────── PIPELINE ENGINES ─────────────────────────
 
@@ -348,10 +385,18 @@ class DownloaderEngine:
             "format": "bestvideo[height<=1080]+bestaudio/best",
             "merge_output_format": "mp4",
             "progress_hooks": [prog_hook],
-            "quiet": True,
+            "quiet": False,  # Changed to False so the custom logger receives the output
             "noprogress": True,
             "no_warnings": True,
-            "compat_opts": {"allow-unsafe-ext"}
+            "compat_opts": {"allow-unsafe-ext"},
+            
+            # --- ARIA2C INTEGRATION & LOG INTERCEPTION ---
+            "external_downloader": "aria2c",
+            "external_downloader_args": [
+                "-c", "-j", "16", "-x", "16", "-s", "16", "-k", "5M",
+                "--summary-interval=1"
+            ],
+            "logger": AriaLogger(jid, self.db)
         }
 
         # --- ADDED: DYNAMIC CDN SIGNATURE SPOOFING (COOKIELESS BYPASS) ---
