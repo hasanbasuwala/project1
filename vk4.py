@@ -418,13 +418,11 @@ class DownloaderEngine:
             "no_warnings": True,
             "compat_opts": {"allow-unsafe-ext"},
             
-            "external_downloader": "aria2c",
             "external_downloader_args": [
                 "-c", "-j", "16", "-x", "16", "-s", "16", "-k", "5M",
-                "--summary-interval=1"
+                "--summary-interval=1", 
+                "--connect-timeout=15", "--timeout=15", "--max-tries=5"
             ],
-            "logger": AriaLogger(jid, self.db)
-        }
 
         # Dynamic CDN Signature Spoofing
         custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
