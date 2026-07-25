@@ -275,8 +275,12 @@ async def playlist_drip_feed_loop(db: JobScheduler, dl_q: asyncio.Queue):
         except Exception as e:
             log.error(f"Drip Feed Loop Error: {e}")
             
+import re
+import time
+import asyncio
+
 class AriaLogger:
-    def __init__(self, jid: str, db: JobScheduler):
+    def __init__(self, jid: str, db):
         self.jid = jid
         self.db = db
         self.last_up = 0
@@ -287,40 +291,35 @@ class AriaLogger:
     def error(self, msg): pass
 
     def _process(self, msg):
-        # Strip ANSI codes & clean formatting
         clean_msg = re.sub(r"\x1b[^m]*m", "", str(msg)).strip()
         
-        if "DL:" in clean_msg and "ETA:" in clean_msg and "%" in clean_msg:
-            try:
-                pct_m = re.search(r"\((\d+)%\)", clean_msg)
-                speed_m = re.search(r"DL:([^\s]+)", clean_msg)
-                eta_m = re.search(r"ETA:([^\]\s]+)", clean_msg)
+        # Regex targeting aria2c summary format: 3.4MiB/581MiB(0%) ... DL:1.7MiB ETA:5m25s
+        pattern = r"([\d\.]+[KMG]iB)/([\d\.]+[KMG]iB)\((\d+)%\).*?DL:([\d\.]+[KMG]iB)(?:/s)?.*?ETA:(.*)"
+        match = re.search(pattern, clean_msg)
+        
+        if match:
+            downloaded, total, pct, speed, eta = match.groups()
+            eta = eta.split("]")[0].strip() # Clean trailing bracket
+            
+            val = float(pct)
+            speed_str = f"{speed}/s" if not speed.endswith("/s") else speed
+            
+            now = time.time()
+            if now - self.last_up >= 1.0:
+                global _live_ui_text
+                _live_ui_text[self.jid] = f"[aria2] {val:.1f}% of {total} at {speed_str} ETA {eta}"
                 
-                if pct_m and speed_m and eta_m:
-                    pct = float(pct_m.group(1))
-                    speed = speed_m.group(1)
-                    if not speed.endswith("/s"): speed += "/s"
-                    eta = eta_m.group(1)
+                stage_str = f"downloading | {speed_str} | {eta}"
+                
+                try:
+                    active_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    active_loop = loop
                     
-                    now = time.time()
-                    if now - self.last_up >= 1.0:
-                        global _live_ui_text
-                        _live_ui_text[self.jid] = f"[aria2] {pct:.1f}% at {speed} ETA {eta}"
-                        
-                        stage_str = f"downloading | {speed} | {eta}"
-                        
-                        # Dynamically acquire active running event loop
-                        try:
-                            active_loop = asyncio.get_running_loop()
-                        except RuntimeError:
-                            active_loop = loop
-                            
-                        asyncio.run_coroutine_threadsafe(
-                            self.db.update_job(self.jid, pct=pct, stage=stage_str), active_loop
-                        )
-                        self.last_up = now
-            except Exception:
-                pass
+                asyncio.run_coroutine_threadsafe(
+                    self.db.update_job(self.jid, pct=val, stage=stage_str), active_loop
+                )
+                self.last_up = now
 
 # ──────────────────────────── PIPELINE ENGINES ─────────────────────────
 
