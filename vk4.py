@@ -981,6 +981,19 @@ async def main():
     db = JobScheduler(DB_PATH)
 
     dl_q, enc_q, up_q = asyncio.Queue(), asyncio.Queue(), asyncio.Queue()
+    
+    # --- START QUEUE RECOVERY ---
+    active_jobs = await db.get_active_jobs()
+    for job in active_jobs:
+        stage = str(job.get('stage', '')).lower()
+        if 'encoded' in stage or 'uploading' in stage:
+            await up_q.put(job['id'])
+        elif 'downloaded' in stage or 'encoding' in stage:
+            await enc_q.put(job['id'])
+        else:
+            await dl_q.put(job['id'])
+    # --- END QUEUE RECOVERY ---
+    
     setup_router(app, db, dl_q, enc_q, up_q)
 
     async with app:
