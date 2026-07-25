@@ -4,8 +4,8 @@ vk_bot.py - Dedicated VK Playlist Downloader Microservice
 ARCHITECTURE:
   • Standalone Bot Token & SQLite DB (vk_scheduler.db)
   • Drip-Feed Orchestrator (Prevents RAM/Loop starvation on massive playlists)
-  • Dynamic Caption Injector (#caption support)
-  • 1:1 Mainframe Parity (Termux UI, Accordion Dash, Ghost Protocol CDN Spoofing)
+  • Ghost Protocol: Cookieless CDN direct injection via VK API
+  • 1:1 Mainframe Parity (Termux UI, Accordion Dash, Deep Job Cards)
 ───────────────────────────────────────────────────────────────
 """
 
@@ -74,6 +74,8 @@ _live_ui_text = {}
 _last_completed = "—"
 _dash_msg_id, _dash_chat_id = 0, 0
 _dash_tab = "playlists"
+_expanded_pl = None
+_expanded_bucket = None
 _expanded_jid = None
 
 def make_bar(percent: float, width: int = 10) -> str:
@@ -212,19 +214,46 @@ class DownloaderEngine:
     def __init__(self, db: JobScheduler):
         self.db = db
 
+    def _extract_vk_api(self, url: str, jid: str) -> str | None:
+        """Ghost Protocol: Extract direct CDN links bypassing web frontend entirely."""
+        VK_TOKEN = getattr(config, "VK_TOKEN", None)
+        if not VK_TOKEN: return None
+
+        try:
+            import vk_api
+            vk_session = vk_api.VkApi(token=VK_TOKEN)
+            vk = vk_session.get_api()
+            
+            video_id = None
+            video_match = re.search(r'video(-?\d+_\d+)', url)
+            if video_match:
+                video_id = video_match.group(1)
+
+            if video_id:
+                vid_details = vk.video.get(videos=video_id)
+                if vid_details and vid_details.get('items'):
+                    files = vid_details['items'][0].get('files', {})
+                    # Prioritize highest quality media link directly from CDN
+                    for q in ['mp4_1080', 'mp4_720', 'mp4_480', 'mp4_360', 'hls']:
+                        if q in files:
+                            self.db.log_trace(jid, f"[vk_api] Direct {q.upper()} CDN link extracted.")
+                            return files[q]
+        except Exception as e:
+            self.db.log_trace(jid, f"[vk_api] Ghost Protocol Failed: {e}")
+        return None
+
     async def execute(self, job: dict):
-        jid, url = job['id'], job['url']
+        jid, original_url = job['id'], job['url']
         dl_dir = JOBS_DIR / f"JOB_{jid}" / "dl"
 
-        cookie_path = dl_dir / f"{jid}_cookies.txt"
-        if VK_COOKIES:
-            with open(cookie_path, "w", encoding="utf-8") as f:
-                f.write("# Netscape HTTP Cookie File\n")
-                for item in VK_COOKIES.strip().split(';'):
-                    if '=' in item:
-                        k, v = item.strip().split('=', 1)
-                        f.write(f".vk.com\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n")
-                        f.write(f".vkvideo.ru\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n")
+        # --- GHOST PROTOCOL: INTERCEPT & OVERRIDE URL ---
+        self.db.log_trace(jid, "Querying VK API backend for direct CDN payload...")
+        extracted_cdn = await asyncio.to_thread(self._extract_vk_api, original_url, jid)
+        
+        target_url = extracted_cdn if extracted_cdn else original_url
+        if extracted_cdn:
+            self.db.log_trace(jid, "Target bypassed! Proceeding with cookieless direct CDN stream.")
+        # ------------------------------------------------
 
         def prog_hook(d):
             if d.get("status") == "downloading":
@@ -237,7 +266,7 @@ class DownloaderEngine:
                     val = float(re.search(r"[\d.]+", pct_str).group()) if re.search(r"[\d.]+", pct_str) else 0.0
                     
                     global _live_ui_text
-                    _live_ui_text[jid] = f"[yt-dlp] {pct_str} of {tot_str} at {speed} ETA {eta}"
+                    _live_ui_text[jid] = f"[aria2c] {pct_str} of {tot_str} at {speed} ETA {eta}"
 
                     stage_str = f"downloading | {speed} | {eta}"
                     asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val, stage=stage_str), loop)
@@ -249,23 +278,16 @@ class DownloaderEngine:
             "merge_output_format": "mp4",
             "progress_hooks": [prog_hook],
             "quiet": True, "noprogress": True, "no_warnings": True,
-            "cookiefile": str(cookie_path) if VK_COOKIES else None,
             "compat_opts": {"allow-unsafe-ext"}
         }
 
-        # --- DYNAMIC CDN SIGNATURE SPOOFING ---
+        # Dynamic CDN Spoofing
         custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        if "srcAg=GECKO" in url:
-            custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0"
-            self.db.log_trace(jid, "Ghost Protocol: Gecko CDN signature spoofed.")
-        elif "srcAg=SAFARI" in url:
-            custom_ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"
-            self.db.log_trace(jid, "Ghost Protocol: Safari CDN signature spoofed.")
-            
+        if "srcAg=GECKO" in target_url: custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0"
+        elif "srcAg=SAFARI" in target_url: custom_ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"
         opts["http_headers"] = {"User-Agent": custom_ua}
-        # --------------------------------------
 
-        await asyncio.to_thread(self._run_ytdlp, url, jid, opts)
+        await asyncio.to_thread(self._run_ytdlp, target_url, jid, opts)
 
     def _run_ytdlp(self, url: str, jid: str, base_opts: dict):
         opts = base_opts.copy()
@@ -285,7 +307,6 @@ class DownloaderEngine:
             fallback_opts = base_opts.copy()
             fallback_opts["concurrent_fragment_downloads"] = 10  
             fallback_opts["http_chunk_size"] = 10485760          
-            fallback_opts["buffersize"] = 32768                  
             with yt_dlp.YoutubeDL(fallback_opts) as ydl_fallback:
                 ydl_fallback.extract_info(url, download=True)
 
@@ -345,29 +366,19 @@ async def safe_edit(app: Client, chat_id: int, msg_id: int, text: str, kb: Inlin
     except FloodWait as e: await asyncio.sleep(e.value)
     except Exception: pass
 
-async def render_dashboard(db: JobScheduler, tab: str = "playlists", exp_jid: str = None) -> tuple[str, InlineKeyboardMarkup]:
+async def render_dashboard(db: JobScheduler, tab: str = "playlists", exp_pl: str = None, exp_bucket: str = None, exp_jid: str = None) -> tuple[str, InlineKeyboardMarkup]:
     playlists = await db.get_active_playlists()
     active_jobs = await db.get_active_jobs()
     total_storage = sum(f.stat().st_size for f in JOBS_DIR.rglob("*") if f.is_file()) / (1024 ** 3)
 
-    act_text_blocks = []
-    dl_jobs = [j for j in active_jobs if "download" in j['stage']]
-    enc_jobs = [j for j in active_jobs if "encod" in j['stage']]
-    
-    if not dl_jobs and not enc_jobs:
-        act_text_blocks.append("`[🔄] ACT  :` `0 DL | 0 PR | 0 UP`")
+    act_text_blocks = ["`[🔄] ACT  :`"]
+    if not active_jobs:
+        act_text_blocks = ["`[🔄] ACT  :` `SYSTEM IDLE`"]
     else:
-        act_text_blocks.append("`[🔄] ACT  :`")
-        if dl_jobs:
-            act_text_blocks.append(f"`  1. DL ({len(dl_jobs)})`")
-            for i, j in enumerate(dl_jobs[:5]):
-                pct = float(j.get('pct', 0.0) or 0.0)
-                act_text_blocks.append(f"`     {chr(97+i)}. {j['title'][:12]}.. [{make_bar(pct, 8)}] {pct:.1f}%`")
-        if enc_jobs:
-            act_text_blocks.append(f"`  2. PR ({len(enc_jobs)})`")
-            for i, j in enumerate(enc_jobs[:5]):
-                pct = float(j.get('pct', 0.0) or 0.0)
-                act_text_blocks.append(f"`     {chr(97+i)}. {j['title'][:12]}.. [{make_bar(pct, 8)}] {pct:.1f}%`")
+        for i, j in enumerate(active_jobs[:7]):
+            pct = float(j.get('pct', 0.0) or 0.0)
+            stage_short = j.get('stage', '').split('|')[0].strip()[:4].upper()
+            act_text_blocks.append(f"`  {chr(97+i)}. [{stage_short}] {j['title'][:12]}.. [{make_bar(pct, 8)}] {pct:.0f}%`")
 
     act_string = "\n".join(act_text_blocks)
 
@@ -382,47 +393,82 @@ async def render_dashboard(db: JobScheduler, tab: str = "playlists", exp_jid: st
     )
 
     kb = []
-    is_pl_open = (tab == "playlists")
-    kb.append([InlineKeyboardButton(f"{'[-]' if is_pl_open else '[+]'} 🎵 ACTIVE PLAYLISTS ({len(playlists)})", callback_data=f"dash|{'root' if is_pl_open else 'playlists'}")])
+    is_root_open = (tab == "playlists")
+    kb.append([InlineKeyboardButton(f"{'[-]' if is_root_open else '[+]'} 🎵 ACTIVE PLAYLISTS ({len(playlists)})", callback_data=f"dash|{'root' if is_root_open else 'playlists'}")])
 
-    if is_pl_open:
+    def _base(stage_str): return stage_str.split("|")[0].strip().lower() if "|" in stage_str else stage_str.strip().lower()
+
+    if is_root_open:
         if not playlists:
             kb.append([InlineKeyboardButton("└ System Idle (Send Link)", callback_data="noop")])
         else:
             for pl in playlists:
                 pl_id = pl['id']
-                is_this_expanded = (exp_jid == pl_id)
-                prefix = "[-]" if is_this_expanded else "[+]"
-                status_icon = "⏸" if pl['status'] == "paused" else "▶️"
+                is_this_pl_exp = (exp_pl == pl_id)
+                pl_status_icon = "⏸" if pl['status'] == "paused" else "▶️"
                 
                 kb.append([InlineKeyboardButton(
-                    f" └ {prefix} {status_icon} {pl['caption'][:15] or 'Playlist'} [{pl['downloaded']}/{pl['total']}]", 
-                    callback_data=f"dash|playlists:{pl_id}" if not is_this_expanded else "dash|playlists"
+                    f" {'[-]' if is_this_pl_exp else '[+]'} {pl_status_icon} {pl['caption'][:15] or 'Playlist'} [{pl['downloaded']}/{pl['total']}]", 
+                    callback_data=f"dash|playlists:{pl_id}" if not is_this_pl_exp else "dash|playlists"
                 )])
                 
-                if is_this_expanded:
+                if is_this_pl_exp:
                     pl_jobs = [j for j in active_jobs if j.get('playlist_id') == pl_id]
-                    for j in pl_jobs:
-                        speed, eta = "—", "—"
-                        if "|" in j['stage']:
-                            p = [x.strip() for x in j['stage'].split("|")]
-                            if len(p) >= 3: speed, eta = p[1], p[2]
+                    buckets = {
+                        "dl": [j for j in pl_jobs if _base(j['stage']) in ["queued", "downloading"]],
+                        "dl_done": [j for j in pl_jobs if _base(j['stage']) == "downloaded"],
+                        "enc": [j for j in pl_jobs if _base(j['stage']) in ["encoding", "process"]],
+                        "enc_done": [j for j in pl_jobs if _base(j['stage']) == "encoded"],
+                        "up": [j for j in pl_jobs if _base(j['stage']) == "uploading"]
+                    }
+
+                    def build_bucket(bucket_id, label, icon, job_list):
+                        is_b_open = (exp_bucket == bucket_id)
+                        b_pref = "[-]" if is_b_open else "[+]"
+                        kb.append([InlineKeyboardButton(f"    ├ {b_pref} {icon} {label} ({len(job_list)})", callback_data=f"dash|playlists:{pl_id}:{bucket_id}" if not is_b_open else f"dash|playlists:{pl_id}")])
                         
-                        pct = float(j.get('pct', 0.0))
-                        bar = make_bar(pct, 8)
-                        
-                        kb.append([InlineKeyboardButton(f"📁 {j['title'][:10]}... | ⚡ {speed} | ⏳ {eta}", callback_data="noop")])
-                        kb.append([InlineKeyboardButton(f"📊 [{bar}] {pct:.1f}%", callback_data="noop")])
+                        if is_b_open:
+                            if not job_list: kb.append([InlineKeyboardButton("      └ Empty", callback_data="noop")])
+                            for j in job_list:
+                                jid = j['id']
+                                is_j_open = (exp_jid == jid)
+                                
+                                if is_j_open:
+                                    speed, eta = "—", "—"
+                                    if "|" in j['stage']:
+                                        p = [x.strip() for x in j['stage'].split("|")]
+                                        if len(p) >= 3: speed, eta = p[1], p[2]
+                                    pct = float(j.get('pct', 0.0))
+                                    bar = make_bar(pct, 8)
+                                    
+                                    kb.append([InlineKeyboardButton(f"🪪 ISOLATED JOB CARD: {jid}", callback_data="noop")])
+                                    kb.append([InlineKeyboardButton(f"📁 {j['title'][:15]}...", callback_data="noop")])
+                                    kb.append([InlineKeyboardButton(f"⚡ {speed}  |  ⏳ {eta}", callback_data="noop")])
+                                    kb.append([InlineKeyboardButton(f"📊 [{bar}] {pct:.1f}%", callback_data="noop")])
+                                    kb.append([
+                                        InlineKeyboardButton("📄 LOGS", callback_data=f"joblog|{jid}"),
+                                        InlineKeyboardButton("❌ KILL", callback_data=f"kill_job|{jid}")
+                                    ])
+                                    kb.append([InlineKeyboardButton("🔙 CLOSE CARD", callback_data=f"dash|playlists:{pl_id}:{bucket_id}")])
+                                else:
+                                    pct = float(j.get('pct', 0.0))
+                                    kb.append([InlineKeyboardButton(f"      ├ ⚡ {j['title'][:10]}.. | {pct:.0f}%", callback_data=f"dash|playlists:{pl_id}:{bucket_id}:{jid}")])
+
+                    build_bucket("dl", "DOWNLOADING", "📥", buckets["dl"])
+                    build_bucket("dl_done", "WAITING PROC", "⏳", buckets["dl_done"])
+                    build_bucket("enc", "PROCESSING", "⚙️", buckets["enc"])
+                    build_bucket("enc_done", "WAITING UP", "⏳", buckets["enc_done"])
+                    build_bucket("up", "UPLOADING", "📤", buckets["up"])
 
                     if pl['status'] == "paused":
                         kb.append([
-                            InlineKeyboardButton("▶️ RESUME", callback_data=f"res|{pl['id']}"),
-                            InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{pl['id']}")
+                            InlineKeyboardButton("▶️ RESUME PLAYLIST", callback_data=f"res|{pl['id']}"),
+                            InlineKeyboardButton("❌ CANCEL PLAYLIST", callback_data=f"kill|{pl['id']}")
                         ])
                     else:
                         kb.append([
-                            InlineKeyboardButton("⏸ PAUSE", callback_data=f"pause|{pl['id']}"),
-                            InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{pl['id']}")
+                            InlineKeyboardButton("⏸ PAUSE PLAYLIST", callback_data=f"pause|{pl['id']}"),
+                            InlineKeyboardButton("❌ CANCEL PLAYLIST", callback_data=f"kill|{pl['id']}")
                         ])
                     kb.append([InlineKeyboardButton("───────────────────", callback_data="noop")])
 
@@ -446,53 +492,39 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
         m = await msg.reply("🔍 `Querying VK API for Playlist items...`")
 
         def extract_via_vk_api(playlist_url: str):
-            """Ghost Protocol: Instant API extraction without webpage scraping."""
             VK_TOKEN = getattr(config, "VK_TOKEN", None)
-            if not VK_TOKEN:
-                return None
+            if not VK_TOKEN: return None
 
             try:
                 import vk_api
                 vk_session = vk_api.VkApi(token=VK_TOKEN)
                 vk = vk_session.get_api()
 
-                # Extract owner_id and playlist_id (e.g. from /video/playlist/-223870924_141)
                 match = re.search(r'playlist/(-?\d+)_(\d+)', playlist_url)
-                if not match:
-                    # Alternative URL format matching
-                    match = re.search(r'album_(-?\d+)_(\d+)', playlist_url)
+                if not match: match = re.search(r'album_(-?\d+)_(\d+)', playlist_url)
 
                 if match:
-                    owner_id = int(match.group(1))
-                    album_id = int(match.group(2))
-
-                    # Fetch videos directly via VK API (supports up to 100 per request)
+                    owner_id, album_id = int(match.group(1)), int(match.group(2))
                     all_videos = []
-                    offset = 0
-                    count = 100
+                    offset, count = 0, 100
 
                     while True:
                         res = vk.video.get(owner_id=owner_id, album_id=album_id, count=count, offset=offset)
                         items = res.get('items', [])
-                        if not items:
-                            break
+                        if not items: break
 
                         for v in items:
                             v_url = f"https://vk.com/video{v['owner_id']}_{v['id']}"
-                            v_title = v.get('title', 'VK Video')
-                            all_videos.append({'url': v_url, 'title': v_title})
+                            all_videos.append({'url': v_url, 'title': v.get('title', 'VK Video')})
 
                         offset += count
-                        if offset >= res.get('count', 0):
-                            break
-
+                        if offset >= res.get('count', 0): break
                     return all_videos
             except Exception as e:
                 log.error(f"VK API Extraction failed: {e}")
             return None
 
         def extract_via_ytdlp(playlist_url: str):
-            """Fallback: Standard yt-dlp scraping if API token is missing/failed."""
             cookie_path = "vk_temp_cookies.txt"
             if VK_COOKIES:
                 with open(cookie_path, "w", encoding="utf-8") as f:
@@ -503,26 +535,18 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                             f.write(f".vk.com\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n")
                             f.write(f".vkvideo.ru\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n")
 
-            opts = {
-                'extract_flat': True, 
-                'quiet': True,
-                'cookiefile': cookie_path if VK_COOKIES else None
-            }
+            opts = {'extract_flat': True, 'quiet': True, 'cookiefile': cookie_path if VK_COOKIES else None}
             with yt_dlp.YoutubeDL(opts) as ydl:
                 data = ydl.extract_info(playlist_url, download=False)
                 entries = data.get('entries', [])
                 items = []
                 for e in entries:
                     v_url = e.get('url') or e.get('webpage_url')
-                    if v_url:
-                        items.append({'url': v_url, 'title': e.get('title', 'VK Video')})
+                    if v_url: items.append({'url': v_url, 'title': e.get('title', 'VK Video')})
                 return items
 
         try:
-            # 1. Try Instant VK API First
             entries = await asyncio.to_thread(extract_via_vk_api, url)
-            
-            # 2. Fallback to yt-dlp if API wasn't configured or returned nothing
             if entries is None:
                 entries = await asyncio.to_thread(extract_via_ytdlp, url)
 
@@ -533,13 +557,12 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
             await db.create_playlist(pl_id, url, caption, len(entries), msg.chat.id)
 
             items = [(str(uuid.uuid4())[:8], pl_id, item['url'], item['title']) for item in entries]
-
             await db.add_playlist_items(items)
-            await m.edit(f"✅ **PLAYLIST LOCKED (VK API)**\nFound `{len(items)}` videos.\nDrip-feeding queued.")
+            await m.edit(f"✅ **PLAYLIST LOCKED**\nFound `{len(items)}` videos.\nDrip-feeding queued.")
             
-            global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_jid
+            global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid
             if _dash_msg_id and _dash_chat_id:
-                dash_text, kb = await render_dashboard(db, _dash_tab, _expanded_jid)
+                dash_text, kb = await render_dashboard(db, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid)
                 await safe_edit(app, _dash_chat_id, _dash_msg_id, dash_text, kb)
                 
         except Exception as e:
@@ -547,30 +570,51 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
 
     @app.on_message(filters.command(["vk_dash"]) & filters.user(OWNER_ID))
     async def cmd_dash(_, msg: Message):
-        global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_jid
-        text, kb = await render_dashboard(db, _dash_tab, _expanded_jid)
+        global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid
+        text, kb = await render_dashboard(db, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid)
         m = await msg.reply(text, reply_markup=kb)
         _dash_msg_id, _dash_chat_id = m.id, m.chat.id
 
     @app.on_callback_query()
     async def handle_callbacks(_, cb: CallbackQuery):
-        global _dash_tab, _expanded_jid, _dash_msg_id, _dash_chat_id
+        global _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid
+        
+        if '_expanded_pl' not in globals(): globals()['_expanded_pl'] = None
+        if '_expanded_bucket' not in globals(): globals()['_expanded_bucket'] = None
         
         if cb.data == "noop": return await cb.answer()
 
         if cb.data.startswith("dash|"):
             parts = cb.data.split("|")[1].split(":")
             _dash_tab = parts[0]
-            _expanded_jid = parts[1] if len(parts) > 1 else None
+            _expanded_pl = parts[1] if len(parts) > 1 else None
+            _expanded_bucket = parts[2] if len(parts) > 2 else None
+            _expanded_jid = parts[3] if len(parts) > 3 else None
             await cb.answer()
 
         elif cb.data == "refresh":
             await cb.answer("Refreshed.")
 
+        elif cb.data.startswith("joblog|"):
+            jid = cb.data.split("|")[1]
+            log_path = JOBS_DIR / f"JOB_{jid}" / "trace.log"
+            if not log_path.exists(): return await cb.answer("No logs found.", show_alert=True)
+            with open(log_path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+                recent = "\n".join(lines[-15:]) if lines else "No data."
+            return await cb.answer(f"--- TRACE LOGS ---\n{recent}", show_alert=True)
+
+        elif cb.data.startswith("kill_job|"):
+            jid = cb.data.split("|")[1]
+            await db.delete_job(jid)
+            shutil.rmtree(JOBS_DIR / f"JOB_{jid}", ignore_errors=True)
+            _expanded_jid = None 
+            await cb.answer("Task terminated.", show_alert=True)
+
         elif cb.data.startswith("pause|"):
             pl_id = cb.data.split("|")[1]
             await db.update_playlist(pl_id, status="paused")
-            await cb.answer("Playlist Paused.", show_alert=True)
+            await cb.answer("Playlist Paused. Active transfers will finish.", show_alert=True)
 
         elif cb.data.startswith("res|"):
             pl_id = cb.data.split("|")[1]
@@ -583,9 +627,10 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
             async with db.lock:
                 with sqlite3.connect(db.db_path) as conn:
                     conn.execute('DELETE FROM playlist_items WHERE playlist_id = ? AND status = "pending"', (pl_id,))
-            await cb.answer("Playlist Terminated.", show_alert=True)
+            _expanded_pl = None 
+            await cb.answer("Playlist Terminated. Pending items wiped.", show_alert=True)
 
-        text, kb = await render_dashboard(db, _dash_tab, _expanded_jid)
+        text, kb = await render_dashboard(db, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid)
         await safe_edit(app, cb.message.chat.id, cb.message.id, text, kb)
 
 # ──────────────────────────── WORKER & TERMUX LOOPS ────────────────────
@@ -604,7 +649,6 @@ async def terminal_loop(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.Qu
         else:
             for j in jobs[:5]:
                 col = C_YELLOW if "download" in j['stage'] else C_CYAN if "enc" in j['stage'] else C_GREEN
-                
                 sys.stdout.write(f"{C_BOLD}[{j['title'][:15]}]{C_RESET} {col}{j['stage']}{C_RESET} | [{make_bar(j['pct'], 10)}] {j['pct']:.1f}%\033[K\n")
                 
                 log_path = JOBS_DIR / f"JOB_{j['id']}" / "trace.log"
@@ -680,13 +724,12 @@ async def worker_pipeline(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.
 # ──────────────────────────── BOOTSTRAP ────────────────────────────────
 
 async def dashboard_refresher(app: Client, db: JobScheduler):
-    """Refreshes the pinned Telegram dashboard seamlessly every 4 seconds."""
-    global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_jid
+    global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid
     while True:
         await asyncio.sleep(4)
         if _dash_msg_id and _dash_chat_id:
             try:
-                text, kb = await render_dashboard(db, _dash_tab, _expanded_jid)
+                text, kb = await render_dashboard(db, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid)
                 await safe_edit(app, _dash_chat_id, _dash_msg_id, text, kb)
             except Exception:
                 pass
@@ -706,8 +749,8 @@ async def main():
         asyncio.create_task(dashboard_refresher(app, db))
 
         if OWNER_ID:
-            global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_jid
-            text, kb = await render_dashboard(db, _dash_tab, _expanded_jid)
+            global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid
+            text, kb = await render_dashboard(db, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid)
             m = await app.send_message(OWNER_ID, text, reply_markup=kb)
             _dash_msg_id, _dash_chat_id = m.id, m.chat.id
             
