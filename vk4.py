@@ -423,6 +423,7 @@ class DownloaderEngine:
                 "--summary-interval=1", 
                 "--connect-timeout=15", "--timeout=15", "--max-tries=5"
             ],
+            }
 
         # Dynamic CDN Signature Spoofing
         custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
