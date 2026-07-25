@@ -389,8 +389,13 @@ class DownloaderEngine:
         opts = base_opts.copy()
         opts["quiet"] = True
         opts["noprogress"] = True
-        opts["concurrent_fragment_downloads"] = 10
-        opts["http_chunk_size"] = 10485760
+        
+        # Increase fragments to 15-20 for faster segmented streaming (HLS)
+        opts["concurrent_fragment_downloads"] = 15 
+        
+        # Optionally, remove or increase chunk size to let yt-dlp optimize itself
+        # 10485760 is 10MB. We can increase to 20MB (20971520)
+        opts["http_chunk_size"] = 20971520
 
         self.db.log_trace(jid, "Executing native multi-threaded downloader...")
         try:
