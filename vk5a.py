@@ -339,6 +339,16 @@ class JobScheduler:
         At MAX_RETRIES it's marked 'failed' (terminal) and counted against
         the playlist total so the playlist can still reach "completed"
         instead of hanging at e.g. 599/600 forever.
+
+        Crucially: on a retry-eligible failure we do NOT delete the job row
+        or wipe its folder. aria2c's '-c' resume depends on the partial
+        media file plus its '<file>.aria2' control file still being on disk
+        with the same output path -- deleting them (as this used to do
+        unconditionally) forced every retry, crash or not, to restart the
+        download from zero. Keeping the same job id (== item id) means the
+        next claim_item_as_job() call is a harmless no-op INSERT OR IGNORE
+        against the same row, preserving tracker_id too (no duplicate
+        Telegram job card on retry).
         """
         jid = job['id']
         item_id = job.get('item_id') or jid
@@ -351,24 +361,34 @@ class JobScheduler:
                     'UPDATE playlist_items SET status = "pending", retries = ? WHERE id = ?',
                     (retries, item_id)
                 )
-            else:
+                # Reset progress display but deliberately leave the job row
+                # (and its on-disk folder) alone otherwise -- that's what
+                # lets aria2c resume instead of starting over.
                 self.conn.execute(
-                    'UPDATE playlist_items SET status = "failed", retries = ? WHERE id = ?',
-                    (retries, item_id)
+                    'UPDATE jobs SET stage = "queued", pct = 0.0, retries = ? WHERE id = ?',
+                    (retries, jid)
                 )
-                pl = self.conn.execute(
-                    'SELECT * FROM playlists WHERE id = ?', (job['playlist_id'],)
-                ).fetchone()
-                if pl:
-                    new_done = pl['downloaded'] + 1
-                    status = "completed" if new_done >= pl['total'] else pl['status']
-                    self.conn.execute(
-                        'UPDATE playlists SET downloaded = ?, status = ? WHERE id = ?',
-                        (new_done, status, pl['id'])
-                    )
+                self.conn.commit()
+                return
+
+            self.conn.execute(
+                'UPDATE playlist_items SET status = "failed", retries = ? WHERE id = ?',
+                (retries, item_id)
+            )
+            pl = self.conn.execute(
+                'SELECT * FROM playlists WHERE id = ?', (job['playlist_id'],)
+            ).fetchone()
+            if pl:
+                new_done = pl['downloaded'] + 1
+                status = "completed" if new_done >= pl['total'] else pl['status']
+                self.conn.execute(
+                    'UPDATE playlists SET downloaded = ?, status = ? WHERE id = ?',
+                    (new_done, status, pl['id'])
+                )
             self.conn.execute('DELETE FROM jobs WHERE id = ?', (jid,))
             self.conn.commit()
 
+        # Only reclaim disk space once we've permanently given up on this item.
         shutil.rmtree(JOBS_DIR / f"JOB_{jid}", ignore_errors=True)
 
     async def force_fail_job(self, jid: str):
@@ -436,7 +456,22 @@ class JobScheduler:
 
             enc_file = enc_dir / f"{jid}.mp4"
             enc_ok = enc_file.exists() and enc_file.stat().st_size > 0
-            dl_files = [f for f in dl_dir.rglob("*") if f.is_file()]
+
+            # aria2c leaves a "<file>.aria2" control file next to the partial
+            # data while a download is in progress/interrupted, and removes
+            # it automatically on success. yt-dlp's external-downloader path
+            # also writes to a ".part"-suffixed temp name until the download
+            # finishes. Either marker present means the download is NOT done
+            # -- checking "any file exists in dl_dir" (the old logic) treated
+            # a 5%-downloaded file as complete and shipped it straight to the
+            # encoder, which is why a crash-restart never actually resumed:
+            # the downloader (and aria2c's -c) never got invoked again.
+            in_progress_markers = list(dl_dir.glob("*.aria2")) + list(dl_dir.glob("*.part"))
+            complete_media_files = [
+                f for f in dl_dir.rglob("*")
+                if f.is_file() and f.suffix.lower() in (".mp4", ".mkv", ".ts", ".webm")
+                and not f.name.endswith(".part")
+            ]
 
             stage = (j.get('stage') or "").lower()
 
@@ -446,10 +481,14 @@ class JobScheduler:
             elif enc_ok:
                 await self.update_job(jid, stage="encoded", pct=0.0)
                 result["up"].append(jid)
-            elif dl_files:
+            elif complete_media_files and not in_progress_markers:
                 await self.update_job(jid, stage="downloaded", pct=0.0)
                 result["enc"].append(jid)
             else:
+                # Either nothing here yet, or an interrupted download --
+                # both go back through the downloader so aria2c can resume
+                # from whatever partial bytes + control file are already
+                # on disk instead of restarting from zero.
                 await self.update_job(jid, stage="queued", pct=0.0)
                 result["dl"].append(jid)
 
@@ -561,6 +600,16 @@ class DownloaderEngine:
         speed/ETA while nothing else updated). Talking to aria2c's own
         JSON-RPC port sidesteps that entirely: we get real progress without
         giving up aria2c's multi-connection download speed.
+
+        IMPORTANT: with --enable-rpc enabled, aria2c behaves as a persistent
+        server and does NOT exit on its own once its download finishes (it
+        stays up in case more tasks arrive via RPC). yt-dlp's external
+        downloader wrapper blocks on that subprocess actually exiting before
+        it considers the download done -- so without an explicit shutdown,
+        the file finishes on disk but the whole job (and the worker holding
+        it) hangs forever, frozen at 100%. This loop detects "was active,
+        now isn't" and calls aria2.shutdown to let the process terminate,
+        which is what actually lets yt-dlp move on.
         """
         # Wait for aria2c's RPC server to come up (it starts almost
         # instantly, but the exact process launch timing isn't guaranteed).
@@ -574,33 +623,56 @@ class DownloaderEngine:
                 await asyncio.sleep(0.5)
 
         last_db_update = 0.0
+        seen_active = False
+        idle_ticks = 0
+        # Grace window after downloads appear to have stopped, in case
+        # yt-dlp launches a second aria2c pass (e.g. an audio-only stream
+        # for an adaptive format) on the same port shortly after.
+        MAX_IDLE_TICKS = 8
+
         while not stop_event.is_set():
             try:
                 resp = await asyncio.to_thread(self._aria2_rpc_call, port, secret, "aria2.tellActive")
                 active = resp.get("result", [])
-                if active:
-                    completed = sum(int(d.get("completedLength", 0)) for d in active)
-                    total = sum(int(d.get("totalLength", 0)) for d in active)
-                    speed_bps = sum(int(d.get("downloadSpeed", 0)) for d in active)
-
-                    pct = (completed / total * 100.0) if total else 0.0
-                    speed_str = f"{speed_bps / (1024 * 1024):.2f}MiB/s" if speed_bps else "~"
-                    if speed_bps > 0 and total > completed:
-                        eta_sec = int((total - completed) / speed_bps)
-                        eta_str = f"{eta_sec // 60}m{eta_sec % 60}s"
-                    else:
-                        eta_str = "~"
-
-                    global _live_ui_text
-                    _live_ui_text[jid] = f"[aria2] {pct:.1f}% at {speed_str} ETA {eta_str}"
-
-                    now = time.time()
-                    if now - last_db_update >= 1.0:
-                        stage_str = f"downloading | {speed_str} | {eta_str}"
-                        await self.db.update_job(jid, pct=pct, stage=stage_str)
-                        last_db_update = now
             except Exception:
-                pass  # RPC momentarily unreachable (e.g. between the video and audio download calls) -- just skip this tick.
+                active = None  # RPC unreachable: aria2c still starting, or between passes.
+
+            if active:
+                seen_active = True
+                idle_ticks = 0
+                completed = sum(int(d.get("completedLength", 0)) for d in active)
+                total = sum(int(d.get("totalLength", 0)) for d in active)
+                speed_bps = sum(int(d.get("downloadSpeed", 0)) for d in active)
+
+                pct = (completed / total * 100.0) if total else 0.0
+                speed_str = f"{speed_bps / (1024 * 1024):.2f}MiB/s" if speed_bps else "~"
+                if speed_bps > 0 and total > completed:
+                    eta_sec = int((total - completed) / speed_bps)
+                    eta_str = f"{eta_sec // 60}m{eta_sec % 60}s"
+                else:
+                    eta_str = "~"
+
+                global _live_ui_text
+                _live_ui_text[jid] = f"[aria2] {pct:.1f}% at {speed_str} ETA {eta_str}"
+
+                now = time.time()
+                if now - last_db_update >= 1.0:
+                    stage_str = f"downloading | {speed_str} | {eta_str}"
+                    await self.db.update_job(jid, pct=pct, stage=stage_str)
+                    last_db_update = now
+
+            elif seen_active:
+                # Was downloading, now nothing's active -- the transfer is
+                # done (or errored out). aria2c won't exit by itself, so
+                # kick it so yt-dlp's subprocess wait actually unblocks.
+                try:
+                    await asyncio.to_thread(self._aria2_rpc_call, port, secret, "aria2.shutdown")
+                except Exception:
+                    pass  # already gone, or between video/audio passes -- fine either way
+                idle_ticks += 1
+                if idle_ticks >= MAX_IDLE_TICKS:
+                    return
+                seen_active = False  # give a second (e.g. audio) pass a chance to start
             await asyncio.sleep(1.0)
 
     async def execute(self, job: dict):
