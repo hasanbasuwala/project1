@@ -475,6 +475,38 @@ class EncoderEngine:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         await proc.wait()
+        
+async def extract_video_metadata(video_path):
+    """Uses ffprobe to extract exact width, height, and duration."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height:format=duration",
+            "-of", "json", str(video_path)
+        ]
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, _ = await proc.communicate()
+        data = json.loads(stdout)
+        
+        width = int(data['streams'][0]['width']) if 'streams' in data and data['streams'] else 0
+        height = int(data['streams'][0]['height']) if 'streams' in data and data['streams'] else 0
+        duration = int(float(data['format']['duration'])) if 'format' in data and 'duration' in data['format'] else 0
+        return width, height, duration
+    except Exception:
+        return 1280, 720, 0  # Fallback to standard 16:9 HD if probe fails
+
+async def generate_thumbnail(video_path, thumb_path):
+    """Uses ffmpeg to take a high-quality frame at the 3-second mark."""
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-ss", "00:00:03", "-i", str(video_path),
+            "-vframes", "1", "-q:v", "2", str(thumb_path)
+        ]
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        await proc.wait()
+        return str(thumb_path) if Path(thumb_path).exists() else None
+    except Exception:
+        return None
 
 class UploaderEngine:
     def __init__(self, db: JobScheduler, app: Client):
@@ -483,10 +515,80 @@ class UploaderEngine:
 
     async def execute(self, job: dict):
         jid = job['id']
-        enc_file = JOBS_DIR / f"JOB_{jid}" / "enc" / f"{jid}.mp4"
+        enc_dir = JOBS_DIR / f"JOB_{jid}" / "enc"
+        enc_file = enc_dir / f"{jid}.mp4"
+        thumb_file = enc_dir / f"{jid}_thumb.jpg"
+        
         if not enc_file.exists(): raise RuntimeError("Encoded payload missing.")
 
+        # --- EXTRACT METADATA & GENERATE THUMBNAIL ---
+        width, height, duration = await extract_video_metadata(enc_file)
+        thumb_path = await generate_thumbnail(enc_file, thumb_file)
+
         pl = await self.db.get_playlist(job['playlist_id'])
+        caption = f"{pl['caption']}\n\n**{job['title']}**" if pl and pl.get('caption') else f"**{job['title']}**"
+
+        last_db_up = 0
+
+        async def upload_progress(current, total):
+            nonlocal last_db_up
+            now = time.time()
+            if now - last_db_up >= 1.5:
+                pct = (current / total) * 100 if total else 0.0
+                curr_mb = current / (1024 * 1024)
+                tot_mb = total / (1024 * 1024)
+                stage_str = f"uploading | {curr_mb:.1f}MB/{tot_mb:.1f}MB | —"
+                
+                global _live_ui_text
+                _live_ui_text[jid] = f"[upload] {curr_mb:.1f}/{tot_mb:.1f} MB ({pct:.1f}%)"
+                
+                try:
+                    active_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    active_loop = loop
+                asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=pct, stage=stage_str), active_loop)
+                last_db_up = now
+
+        # MTProto Pyrogram client file payload delivery
+        await self.app.send_video(
+            chat_id=CHANNEL_ID,
+            video=str(enc_file),
+            caption=caption,
+            width=width,
+            height=height,
+            duration=duration,
+            thumb=thumb_path,  # Injects the high-quality JPG
+            supports_streaming=True,
+            progress=upload_progress
+        )
+
+        global _last_completed
+        _last_completed = job['title']
+
+        if pl:
+            new_count = pl['downloaded'] + 1
+            status = "completed" if new_count >= pl['total'] else pl['status']
+            await self.db.update_playlist(pl['id'], downloaded=new_count, status=status)
+            await self.db.update_item_status(jid, "done")
+
+        # Tracker card cleanup
+        try:
+            latest_job = await self.db.get_job(jid)
+            if latest_job and latest_job.get('tracker_id'):
+                final_text = (
+                    f"`[❖] ＴＡＳＫ :` `{latest_job['title'][:18]}..`\n"
+                    f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
+                    f"`✅ PHASE : COMPLETED`\n"
+                    f"`📤 ROUTE : {CHANNEL_ID}`\n"
+                    f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`"
+                )
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ DISMISS", callback_data=f"delmsg|{latest_job['tracker_id']}")]])
+                await safe_edit(self.app, latest_job['chat_id'], latest_job['tracker_id'], final_text, kb)
+        except Exception as e:
+            self.db.log_trace(jid, f"Failed to push final completion card: {e}")
+
+        await self.db.delete_job(jid)
+        shutil.rmtree(JOBS_DIR / f"JOB_{jid}", ignore_errors=True)
         caption = f"{pl['caption']}\n\n**{job['title']}**" if pl and pl.get('caption') else f"**{job['title']}**"
 
         last_db_up = 0
