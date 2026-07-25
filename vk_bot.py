@@ -442,33 +442,100 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
         url = parts[0].strip()
         caption = f"#{parts[1].strip()}" if len(parts) > 1 else ""
         
-        # Normalize vk.ru to vk.com
         url = re.sub(r'vk\.ru', 'vk.com', url, flags=re.IGNORECASE)
+        m = await msg.reply("🔍 `Querying VK API for Playlist items...`")
 
-        m = await msg.reply("🔍 `Scanning VK Playlist structure...`")
+        def extract_via_vk_api(playlist_url: str):
+            """Ghost Protocol: Instant API extraction without webpage scraping."""
+            VK_TOKEN = getattr(config, "VK_TOKEN", None)
+            if not VK_TOKEN:
+                return None
 
-        def extract():
-            opts = {'extract_flat': True, 'quiet': True}
+            try:
+                import vk_api
+                vk_session = vk_api.VkApi(token=VK_TOKEN)
+                vk = vk_session.get_api()
+
+                # Extract owner_id and playlist_id (e.g. from /video/playlist/-223870924_141)
+                match = re.search(r'playlist/(-?\d+)_(\d+)', playlist_url)
+                if not match:
+                    # Alternative URL format matching
+                    match = re.search(r'album_(-?\d+)_(\d+)', playlist_url)
+
+                if match:
+                    owner_id = int(match.group(1))
+                    album_id = int(match.group(2))
+
+                    # Fetch videos directly via VK API (supports up to 100 per request)
+                    all_videos = []
+                    offset = 0
+                    count = 100
+
+                    while True:
+                        res = vk.video.get(owner_id=owner_id, album_id=album_id, count=count, offset=offset)
+                        items = res.get('items', [])
+                        if not items:
+                            break
+
+                        for v in items:
+                            v_url = f"https://vk.com/video{v['owner_id']}_{v['id']}"
+                            v_title = v.get('title', 'VK Video')
+                            all_videos.append({'url': v_url, 'title': v_title})
+
+                        offset += count
+                        if offset >= res.get('count', 0):
+                            break
+
+                    return all_videos
+            except Exception as e:
+                log.error(f"VK API Extraction failed: {e}")
+            return None
+
+        def extract_via_ytdlp(playlist_url: str):
+            """Fallback: Standard yt-dlp scraping if API token is missing/failed."""
+            cookie_path = "vk_temp_cookies.txt"
+            if VK_COOKIES:
+                with open(cookie_path, "w", encoding="utf-8") as f:
+                    f.write("# Netscape HTTP Cookie File\n")
+                    for item in VK_COOKIES.strip().split(';'):
+                        if '=' in item:
+                            k, v = item.strip().split('=', 1)
+                            f.write(f".vk.com\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n")
+                            f.write(f".vkvideo.ru\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n")
+
+            opts = {
+                'extract_flat': True, 
+                'quiet': True,
+                'cookiefile': cookie_path if VK_COOKIES else None
+            }
             with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=False)
+                data = ydl.extract_info(playlist_url, download=False)
+                entries = data.get('entries', [])
+                items = []
+                for e in entries:
+                    v_url = e.get('url') or e.get('webpage_url')
+                    if v_url:
+                        items.append({'url': v_url, 'title': e.get('title', 'VK Video')})
+                return items
 
         try:
-            data = await asyncio.to_thread(extract)
-            entries = data.get('entries', [])
+            # 1. Try Instant VK API First
+            entries = await asyncio.to_thread(extract_via_vk_api, url)
+            
+            # 2. Fallback to yt-dlp if API wasn't configured or returned nothing
+            if entries is None:
+                entries = await asyncio.to_thread(extract_via_ytdlp, url)
+
             if not entries:
                 return await m.edit("❌ No videos found in playlist link.")
 
             pl_id = str(uuid.uuid4())[:8]
             await db.create_playlist(pl_id, url, caption, len(entries), msg.chat.id)
 
-            items = []
-            for e in entries:
-                v_url = e.get('url') or e.get('webpage_url')
-                if v_url:
-                    items.append((str(uuid.uuid4())[:8], pl_id, v_url, e.get('title', 'VK Video')))
+            items = [(str(uuid.uuid4())[:8], pl_id, item['url'], item['title']) for item in entries]
 
             await db.add_playlist_items(items)
-            await m.edit(f"✅ **PLAYLIST LOCKED**\nFound `{len(items)}` videos.\nDrip-feeding queued.")
+            await m.edit(f"✅ **PLAYLIST LOCKED (VK API)**\nFound `{len(items)}` videos.\nDrip-feeding queued.")
             
             global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_jid
             if _dash_msg_id and _dash_chat_id:
