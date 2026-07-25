@@ -2,10 +2,10 @@
 vk_bot.py - Dedicated VK Playlist Downloader Microservice
 ───────────────────────────────────────────────────────────────
 ARCHITECTURE:
-  • Standalone Bot Token (VK_BOT_TOKEN) & SQLite DB (vk_scheduler.db)
-  • Drip-Feed Orchestrator (Prevents RAM/Loop starvation on 600+ playlist items)
+  • Standalone Bot Token & SQLite DB (vk_scheduler.db)
+  • Drip-Feed Orchestrator (Prevents RAM/Loop starvation on massive playlists)
   • Dynamic Caption Injector (#caption support)
-  • Accordion Dashboard with Pause/Resume/Cancel for Playlists
+  • 1:1 Mainframe Parity (Termux UI, Accordion Dash, Ghost Protocol CDN Spoofing)
 ───────────────────────────────────────────────────────────────
 """
 
@@ -21,10 +21,8 @@ import time
 import uuid
 import sys
 import sqlite3
-from enum import Enum
 from pathlib import Path
 import yt_dlp
-import aiohttp
 from logging.handlers import RotatingFileHandler
 
 from pyrogram import Client, filters
@@ -32,7 +30,13 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 from pyrogram.errors import FloodWait, MessageNotModified
 import config
 
-# ──────────────────────────── CONFIGURATION ─────────────────────────────
+try:
+    loop = asyncio.get_running_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+# ──────────────────────────── CONFIGURATION & CONSTANTS ──────────────────
 
 BASE_DIR = Path("SysCache_VK")
 LOG_DIR = BASE_DIR / "logs"
@@ -47,11 +51,12 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+logging.getLogger().handlers[1].setLevel(logging.CRITICAL)
 log = logging.getLogger("vk_stealth_bot")
 logging.getLogger("pyrogram").setLevel(logging.ERROR)
 
 API_ID, API_HASH = config.API_ID, config.API_HASH
-BOT_TOKEN = getattr(config, "VK_BOT_TOKEN", config.BOT_TOKEN) # Falls back to BOT_TOKEN if VK_BOT_TOKEN isn't set
+BOT_TOKEN = getattr(config, "VK_BOT_TOKEN", config.BOT_TOKEN) 
 CHANNEL_ID = config.CHANNEL_ID
 OWNER_ID = int(config.OWNER_ID) if hasattr(config, "OWNER_ID") else 0
 
@@ -63,9 +68,19 @@ if os.path.exists("extracted_cookies.txt"):
 JOBS_DIR = BASE_DIR / "jobs"
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_DL_WORKERS = 3  # Keep low to prevent IP bans/throttling from VK
+# --- Termux UI & Dashboard State Constants ---
+C_CYAN, C_YELLOW, C_RED, C_GREEN, C_RESET, C_BOLD = "\033[36m", "\033[33m", "\033[31m", "\033[32m", "\033[0m", "\033[1m"
+_live_ui_text = {}
+_last_completed = "—"
+_dash_msg_id, _dash_chat_id = 0, 0
+_dash_tab = "playlists"
+_expanded_jid = None
 
-# ──────────────────────────── DATABASE ─────────────────────────────────
+def make_bar(percent: float, width: int = 10) -> str:
+    filled = int(max(0.0, min(percent, 100.0)) / (100.0 / width))
+    return "█" * filled + "░" * (width - filled)
+
+# ──────────────────────────── SUBSYSTEM 1: DATABASE ─────────────────────
 
 class JobScheduler:
     def __init__(self, db_path: Path):
@@ -86,6 +101,12 @@ class JobScheduler:
                 id TEXT PRIMARY KEY, url TEXT, title TEXT, playlist_id TEXT,
                 stage TEXT, pct REAL, retries INTEGER, chat_id INTEGER
             )''')
+
+    def log_trace(self, jid: str, msg: str):
+        job_dir = JOBS_DIR / f"JOB_{jid}"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        with open(job_dir / "trace.log", "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
 
     async def create_playlist(self, pl_id: str, url: str, caption: str, total: int, chat_id: int):
         async with self.lock:
@@ -167,10 +188,9 @@ async def playlist_drip_feed_loop(db: JobScheduler, dl_q: asyncio.Queue):
                     continue
 
                 pl_id = pl['id']
-                # Count how many jobs are currently downloading/encoding for this playlist
                 current_active = len([j for j in active_jobs if j.get('playlist_id') == pl_id])
 
-                # Max 2 concurrent worker tasks per playlist to prevent bandwidth collapse
+                # Drip-feed logic to prevent memory exhaustion and IP bans
                 if current_active < 2:
                     slots_free = 2 - current_active
                     pending_items = await db.get_pending_items(pl_id, limit=slots_free)
@@ -210,8 +230,17 @@ class DownloaderEngine:
             if d.get("status") == "downloading":
                 try:
                     pct_str = re.sub(r"\x1b[^m]*m", "", d.get("_percent_str", "0.0%")).strip()
+                    speed = re.sub(r"\x1b[^m]*m", "", d.get("_speed_str", "~")).strip()
+                    eta = re.sub(r"\x1b[^m]*m", "", d.get("_eta_str", "~")).strip()
+                    tot_str = re.sub(r"\x1b[^m]*m", "", d.get("_total_bytes_str", d.get("_total_bytes_estimate_str", "~"))).strip()
+                    
                     val = float(re.search(r"[\d.]+", pct_str).group()) if re.search(r"[\d.]+", pct_str) else 0.0
-                    asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val, stage="downloading"), loop)
+                    
+                    global _live_ui_text
+                    _live_ui_text[jid] = f"[yt-dlp] {pct_str} of {tot_str} at {speed} ETA {eta}"
+
+                    stage_str = f"downloading | {speed} | {eta}"
+                    asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val, stage=stage_str), loop)
                 except Exception: pass
 
         opts = {
@@ -219,15 +248,46 @@ class DownloaderEngine:
             "format": "bestvideo[height<=1080]+bestaudio/best",
             "merge_output_format": "mp4",
             "progress_hooks": [prog_hook],
-            "quiet": True, "noprogress": True,
-            "cookiefile": str(cookie_path) if VK_COOKIES else None
+            "quiet": True, "noprogress": True, "no_warnings": True,
+            "cookiefile": str(cookie_path) if VK_COOKIES else None,
+            "compat_opts": {"allow-unsafe-ext"}
         }
 
-        await asyncio.to_thread(self._run_ytdlp, url, opts)
+        # --- DYNAMIC CDN SIGNATURE SPOOFING ---
+        custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        if "srcAg=GECKO" in url:
+            custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0"
+            self.db.log_trace(jid, "Ghost Protocol: Gecko CDN signature spoofed.")
+        elif "srcAg=SAFARI" in url:
+            custom_ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"
+            self.db.log_trace(jid, "Ghost Protocol: Safari CDN signature spoofed.")
+            
+        opts["http_headers"] = {"User-Agent": custom_ua}
+        # --------------------------------------
 
-    def _run_ytdlp(self, url: str, opts: dict):
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.extract_info(url, download=True)
+        await asyncio.to_thread(self._run_ytdlp, url, jid, opts)
+
+    def _run_ytdlp(self, url: str, jid: str, base_opts: dict):
+        opts = base_opts.copy()
+        opts["external_downloader"] = "aria2c"
+        opts["noprogress"] = False  
+        opts["quiet"] = False       
+        opts["external_downloader_args"] = {
+            "aria2c": ["-c", "-j", "10", "-x", "10", "-s", "10", "-k", "5M", "--summary-interval=1", "--console-log-level=notice"]
+        }
+
+        self.db.log_trace(jid, "Executing Aria2c multi-connection mode...")
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info(url, download=True)
+        except Exception as e:
+            self.db.log_trace(jid, f"Aria2c fallback triggered. Boosting native downloader...")
+            fallback_opts = base_opts.copy()
+            fallback_opts["concurrent_fragment_downloads"] = 10  
+            fallback_opts["http_chunk_size"] = 10485760          
+            fallback_opts["buffersize"] = 32768                  
+            with yt_dlp.YoutubeDL(fallback_opts) as ydl_fallback:
+                ydl_fallback.extract_info(url, download=True)
 
 class EncoderEngine:
     async def execute(self, job: dict):
@@ -265,7 +325,9 @@ class UploaderEngine:
             supports_streaming=True
         )
 
-        # Increment downloaded counter on Playlist master record
+        global _last_completed
+        _last_completed = job['title']
+
         if pl:
             new_count = pl['downloaded'] + 1
             status = "completed" if new_count >= pl['total'] else pl['status']
@@ -277,61 +339,111 @@ class UploaderEngine:
 
 # ──────────────────────────── DASHBOARD & ROUTER ───────────────────────
 
-_dash_msg_id, _dash_chat_id = 0, 0
+async def safe_edit(app: Client, chat_id: int, msg_id: int, text: str, kb: InlineKeyboardMarkup):
+    try: await app.edit_message_text(chat_id, msg_id, text, reply_markup=kb)
+    except MessageNotModified: pass
+    except FloodWait as e: await asyncio.sleep(e.value)
+    except Exception: pass
 
-def make_bar(percent: float, width: int = 10) -> str:
-    filled = int(max(0.0, min(percent, 100.0)) / (100.0 / width))
-    return "█" * filled + "░" * (width - filled)
-
-async def render_dashboard(db: JobScheduler) -> tuple[str, InlineKeyboardMarkup]:
+async def render_dashboard(db: JobScheduler, tab: str = "playlists", exp_jid: str = None) -> tuple[str, InlineKeyboardMarkup]:
     playlists = await db.get_active_playlists()
     active_jobs = await db.get_active_jobs()
+    total_storage = sum(f.stat().st_size for f in JOBS_DIR.rglob("*") if f.is_file()) / (1024 ** 3)
+
+    act_text_blocks = []
+    dl_jobs = [j for j in active_jobs if "download" in j['stage']]
+    enc_jobs = [j for j in active_jobs if "encod" in j['stage']]
+    
+    if not dl_jobs and not enc_jobs:
+        act_text_blocks.append("`[🔄] ACT  :` `0 DL | 0 PR | 0 UP`")
+    else:
+        act_text_blocks.append("`[🔄] ACT  :`")
+        if dl_jobs:
+            act_text_blocks.append(f"`  1. DL ({len(dl_jobs)})`")
+            for i, j in enumerate(dl_jobs[:5]):
+                pct = float(j.get('pct', 0.0) or 0.0)
+                act_text_blocks.append(f"`     {chr(97+i)}. {j['title'][:12]}.. [{make_bar(pct, 8)}] {pct:.1f}%`")
+        if enc_jobs:
+            act_text_blocks.append(f"`  2. PR ({len(enc_jobs)})`")
+            for i, j in enumerate(enc_jobs[:5]):
+                pct = float(j.get('pct', 0.0) or 0.0)
+                act_text_blocks.append(f"`     {chr(97+i)}. {j['title'][:12]}.. [{make_bar(pct, 8)}] {pct:.1f}%`")
+
+    act_string = "\n".join(act_text_blocks)
 
     text = (
-        f"🤖 **VK PLAYLIST MAINFRAME**\n"
+        f"💻 **VK PLAYLIST MAINFRAME**\n"
         f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
-        f"`[🎵] ACTIVE PLAYLISTS :` `{len(playlists)}`\n"
-        f"`[⚡] RUNNING WORKERS  :` `{len(active_jobs)}`\n"
+        f"`[⚡] STAT :` `DRIP-FEED ACTIVE`\n"
+        f"`[💾] DISK :` `{total_storage:.2f} GB`\n"
+        f"{act_string}\n"
+        f"`[🏁] LAST :` `{_last_completed[:12]}`\n"
         f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`"
     )
 
     kb = []
-    if not playlists:
-        kb.append([InlineKeyboardButton("└ System Idle (Send /vk)", callback_data="noop")])
-    else:
-        for pl in playlists:
-            status_icon = "⏸" if pl['status'] == "paused" else "▶️"
-            pct = (pl['downloaded'] / pl['total'] * 100) if pl['total'] > 0 else 0
-            
-            kb.append([InlineKeyboardButton(f"{status_icon} {pl['caption'][:15] or 'Playlist'} [{pl['downloaded']}/{pl['total']}]", callback_data="noop")])
-            kb.append([InlineKeyboardButton(f" Progress: [{make_bar(pct, 8)}] {pct:.1f}%", callback_data="noop")])
-            
-            if pl['status'] == "paused":
-                kb.append([
-                    InlineKeyboardButton("▶️ RESUME", callback_data=f"res|{pl['id']}"),
-                    InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{pl['id']}")
-                ])
-            else:
-                kb.append([
-                    InlineKeyboardButton("⏸ PAUSE", callback_data=f"pause|{pl['id']}"),
-                    InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{pl['id']}")
-                ])
-            kb.append([InlineKeyboardButton("───────────────────", callback_data="noop")])
+    is_pl_open = (tab == "playlists")
+    kb.append([InlineKeyboardButton(f"{'[-]' if is_pl_open else '[+]'} 🎵 ACTIVE PLAYLISTS ({len(playlists)})", callback_data=f"dash|{'root' if is_pl_open else 'playlists'}")])
 
-    kb.append([InlineKeyboardButton("🔄 REFRESH", callback_data="refresh")])
+    if is_pl_open:
+        if not playlists:
+            kb.append([InlineKeyboardButton("└ System Idle (Send Link)", callback_data="noop")])
+        else:
+            for pl in playlists:
+                pl_id = pl['id']
+                is_this_expanded = (exp_jid == pl_id)
+                prefix = "[-]" if is_this_expanded else "[+]"
+                status_icon = "⏸" if pl['status'] == "paused" else "▶️"
+                
+                kb.append([InlineKeyboardButton(
+                    f" └ {prefix} {status_icon} {pl['caption'][:15] or 'Playlist'} [{pl['downloaded']}/{pl['total']}]", 
+                    callback_data=f"dash|playlists:{pl_id}" if not is_this_expanded else "dash|playlists"
+                )])
+                
+                if is_this_expanded:
+                    pl_jobs = [j for j in active_jobs if j.get('playlist_id') == pl_id]
+                    for j in pl_jobs:
+                        speed, eta = "—", "—"
+                        if "|" in j['stage']:
+                            p = [x.strip() for x in j['stage'].split("|")]
+                            if len(p) >= 3: speed, eta = p[1], p[2]
+                        
+                        pct = float(j.get('pct', 0.0))
+                        bar = make_bar(pct, 8)
+                        
+                        kb.append([InlineKeyboardButton(f"📁 {j['title'][:10]}... | ⚡ {speed} | ⏳ {eta}", callback_data="noop")])
+                        kb.append([InlineKeyboardButton(f"📊 [{bar}] {pct:.1f}%", callback_data="noop")])
+
+                    if pl['status'] == "paused":
+                        kb.append([
+                            InlineKeyboardButton("▶️ RESUME", callback_data=f"res|{pl['id']}"),
+                            InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{pl['id']}")
+                        ])
+                    else:
+                        kb.append([
+                            InlineKeyboardButton("⏸ PAUSE", callback_data=f"pause|{pl['id']}"),
+                            InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{pl['id']}")
+                        ])
+                    kb.append([InlineKeyboardButton("───────────────────", callback_data="noop")])
+
+    kb.append([InlineKeyboardButton("🔄 REFRESH SYSTEM", callback_data="refresh")])
     return text, InlineKeyboardMarkup(kb)
 
 def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.Queue, up_q: asyncio.Queue):
 
-    @app.on_message(filters.command(["vk"]) & filters.user(OWNER_ID))
-    async def cmd_vk(_, msg: Message):
-        raw = msg.text.replace("/vk", "").strip()
-        if not raw:
-            return await msg.reply("⚠️ **Usage:** `/vk <url> #caption`")
-
-        parts = raw.split("#", 1)
+    @app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["vk_dash"]))
+    async def auto_catch_playlist(_, msg: Message):
+        text = msg.text.strip()
+        
+        if not ("http://" in text or "https://" in text):
+            return
+            
+        parts = text.split("#", 1)
         url = parts[0].strip()
-        caption = f"#{parts[1].strip()}" if len(parts) > 1 else "#VK_Playlist"
+        caption = f"#{parts[1].strip()}" if len(parts) > 1 else ""
+        
+        # Normalize vk.ru to vk.com
+        url = re.sub(r'vk\.ru', 'vk.com', url, flags=re.IGNORECASE)
 
         m = await msg.reply("🔍 `Scanning VK Playlist structure...`")
 
@@ -357,27 +469,38 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
 
             await db.add_playlist_items(items)
             await m.edit(f"✅ **PLAYLIST LOCKED**\nFound `{len(items)}` videos.\nDrip-feeding queued.")
+            
+            global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_jid
+            if _dash_msg_id and _dash_chat_id:
+                dash_text, kb = await render_dashboard(db, _dash_tab, _expanded_jid)
+                await safe_edit(app, _dash_chat_id, _dash_msg_id, dash_text, kb)
+                
         except Exception as e:
             await m.edit(f"❌ Extraction error: `{e}`")
 
     @app.on_message(filters.command(["vk_dash"]) & filters.user(OWNER_ID))
     async def cmd_dash(_, msg: Message):
-        global _dash_msg_id, _dash_chat_id
-        text, kb = await render_dashboard(db)
+        global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_jid
+        text, kb = await render_dashboard(db, _dash_tab, _expanded_jid)
         m = await msg.reply(text, reply_markup=kb)
         _dash_msg_id, _dash_chat_id = m.id, m.chat.id
 
     @app.on_callback_query()
     async def handle_callbacks(_, cb: CallbackQuery):
+        global _dash_tab, _expanded_jid, _dash_msg_id, _dash_chat_id
+        
         if cb.data == "noop": return await cb.answer()
 
-        if cb.data == "refresh":
-            text, kb = await render_dashboard(db)
-            try: await cb.message.edit_text(text, reply_markup=kb)
-            except Exception: pass
-            return await cb.answer("Refreshed.")
+        if cb.data.startswith("dash|"):
+            parts = cb.data.split("|")[1].split(":")
+            _dash_tab = parts[0]
+            _expanded_jid = parts[1] if len(parts) > 1 else None
+            await cb.answer()
 
-        if cb.data.startswith("pause|"):
+        elif cb.data == "refresh":
+            await cb.answer("Refreshed.")
+
+        elif cb.data.startswith("pause|"):
             pl_id = cb.data.split("|")[1]
             await db.update_playlist(pl_id, status="paused")
             await cb.answer("Playlist Paused.", show_alert=True)
@@ -390,13 +513,48 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
         elif cb.data.startswith("kill|"):
             pl_id = cb.data.split("|")[1]
             await db.update_playlist(pl_id, status="completed")
+            async with db.lock:
+                with sqlite3.connect(db.db_path) as conn:
+                    conn.execute('DELETE FROM playlist_items WHERE playlist_id = ? AND status = "pending"', (pl_id,))
             await cb.answer("Playlist Terminated.", show_alert=True)
 
-        text, kb = await render_dashboard(db)
-        try: await cb.message.edit_text(text, reply_markup=kb)
-        except Exception: pass
+        text, kb = await render_dashboard(db, _dash_tab, _expanded_jid)
+        await safe_edit(app, cb.message.chat.id, cb.message.id, text, kb)
 
-# ──────────────────────────── WORKER LOOPS & BOOTSTRAP ─────────────────
+# ──────────────────────────── WORKER & TERMUX LOOPS ────────────────────
+
+async def terminal_loop(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.Queue, up_q: asyncio.Queue):
+    sys.stdout.write("\033[2J") 
+    while True:
+        await asyncio.sleep(1) 
+        sys.stdout.write("\033[H") 
+        sys.stdout.write(f"{C_CYAN}{C_BOLD}=== VK MAINFRAME [LIVE] ==={C_RESET}\n")
+        sys.stdout.write(f"QUEUES | DL: {dl_q.qsize()} | ENC: {enc_q.qsize()} | UP: {up_q.qsize()}\n{'─' * 40}\n")
+        
+        jobs = await db.get_active_jobs()
+        if not jobs: 
+            sys.stdout.write(f"{C_GREEN}System Idle. Awaiting playlist vectors.{C_RESET}\033[K\n")
+        else:
+            for j in jobs[:5]:
+                col = C_YELLOW if "download" in j['stage'] else C_CYAN if "enc" in j['stage'] else C_GREEN
+                
+                sys.stdout.write(f"{C_BOLD}[{j['title'][:15]}]{C_RESET} {col}{j['stage']}{C_RESET} | [{make_bar(j['pct'], 10)}] {j['pct']:.1f}%\033[K\n")
+                
+                log_path = JOBS_DIR / f"JOB_{j['id']}" / "trace.log"
+                last_log = "Initializing..."
+                if log_path.exists():
+                    try:
+                        with open(log_path, "r", encoding="utf-8") as f:
+                            lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+                            if lines: last_log = re.sub(r"^\[.*?\]\s*", "", lines[-1])
+                    except Exception: pass
+                sys.stdout.write(f"  ├ 📄 \033[2m{last_log[:70]}\033[0m\033[K\n")
+                
+                live_text = _live_ui_text.get(j['id'], "Awaiting data stream...")
+                sys.stdout.write(f"  └ 📡 \033[36m{live_text[:75]}\033[0m\033[K\n")
+        
+        sys.stdout.write("\033[J") 
+        sys.stdout.flush()
 
 async def worker_pipeline(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.Queue, up_q: asyncio.Queue, app: Client):
     dl_engine = DownloaderEngine(db)
@@ -414,7 +572,7 @@ async def worker_pipeline(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.
                     await db.update_job(jid, stage="downloaded")
                     await enc_q.put(jid)
                 except Exception as e:
-                    log.error(f"DL Error {jid}: {e}")
+                    db.log_trace(jid, f"DL Error: {e}")
                     await db.delete_job(jid)
             dl_q.task_done()
 
@@ -425,11 +583,12 @@ async def worker_pipeline(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.
             j_data = next((j for j in job if j['id'] == jid), None)
             if j_data:
                 try:
+                    await db.update_job(jid, stage="encoding")
                     await enc_engine.execute(j_data)
                     await db.update_job(jid, stage="encoded")
                     await up_q.put(jid)
                 except Exception as e:
-                    log.error(f"Enc Error {jid}: {e}")
+                    db.log_trace(jid, f"Enc Error: {e}")
                     await db.delete_job(jid)
             enc_q.task_done()
 
@@ -440,15 +599,30 @@ async def worker_pipeline(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.
             j_data = next((j for j in job if j['id'] == jid), None)
             if j_data:
                 try:
+                    await db.update_job(jid, stage="uploading")
                     await up_engine.execute(j_data)
                 except Exception as e:
-                    log.error(f"UP Error {jid}: {e}")
+                    db.log_trace(jid, f"UP Error: {e}")
                     await db.delete_job(jid)
             up_q.task_done()
 
     for _ in range(2): asyncio.create_task(dl_worker())
     asyncio.create_task(enc_worker())
     asyncio.create_task(up_worker())
+
+# ──────────────────────────── BOOTSTRAP ────────────────────────────────
+
+async def dashboard_refresher(app: Client, db: JobScheduler):
+    """Refreshes the pinned Telegram dashboard seamlessly every 4 seconds."""
+    global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_jid
+    while True:
+        await asyncio.sleep(4)
+        if _dash_msg_id and _dash_chat_id:
+            try:
+                text, kb = await render_dashboard(db, _dash_tab, _expanded_jid)
+                await safe_edit(app, _dash_chat_id, _dash_msg_id, text, kb)
+            except Exception:
+                pass
 
 async def main():
     app = Client("vk_stealth_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -461,14 +635,24 @@ async def main():
         log.info("VK Playlist Bot Online.")
         asyncio.create_task(playlist_drip_feed_loop(db, dl_q))
         asyncio.create_task(worker_pipeline(db, dl_q, enc_q, up_q, app))
+        asyncio.create_task(terminal_loop(db, dl_q, enc_q, up_q))
+        asyncio.create_task(dashboard_refresher(app, db))
 
         if OWNER_ID:
-            await app.send_message(OWNER_ID, "🟢 **VK Playlist Bot Online.** Send `/vk_dash` to launch dashboard.")
+            global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_jid
+            text, kb = await render_dashboard(db, _dash_tab, _expanded_jid)
+            m = await app.send_message(OWNER_ID, text, reply_markup=kb)
+            _dash_msg_id, _dash_chat_id = m.id, m.chat.id
+            
+            try:
+                await app.unpin_all_chat_messages(m.chat.id)
+                await m.pin(disable_notification=True, both_sides=True)
+            except Exception as e:
+                log.error(f"Failed to pin dashboard: {e}")
 
         while True:
             await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
     try: loop.run_until_complete(main())
     except KeyboardInterrupt: sys.exit(0)
