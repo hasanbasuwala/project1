@@ -1,11 +1,12 @@
 """
 vk_bot.py - Dedicated VK Playlist Downloader Microservice
 ───────────────────────────────────────────────────────────────
-ARCHITECTURE:
-  • Standalone Bot Token & SQLite DB (vk_scheduler.db)
-  • Drip-Feed Orchestrator (Prevents RAM/Loop starvation on massive playlists)
-  • Ghost Protocol: Cookieless CDN direct injection via VK API
-  • 1:1 Mainframe Parity (Termux UI, Accordion Dash, Deep Job Cards)
+FEATURES & ARCHITECTURE:
+  • MTProto Pyrogram Engine (API_ID + API_HASH + BOT_TOKEN) for >1GB Uploads
+  • Fixed Pause/Resume & Cancel Playlist State Management
+  • Native yt-dlp Multi-threaded Engine (Silent & Fast, Termux safe)
+  • Live Upload Progress Tracking (Up to 2 GB per file)
+  • Throttled Dual UI: Termux (2s) / Telegram Dashboard (10% or Stage change)
 ───────────────────────────────────────────────────────────────
 """
 
@@ -55,7 +56,8 @@ logging.getLogger().handlers[1].setLevel(logging.CRITICAL)
 log = logging.getLogger("vk_stealth_bot")
 logging.getLogger("pyrogram").setLevel(logging.ERROR)
 
-API_ID, API_HASH = config.API_ID, config.API_HASH
+API_ID = config.API_ID
+API_HASH = config.API_HASH
 BOT_TOKEN = getattr(config, "VK_BOT_TOKEN", config.BOT_TOKEN) 
 CHANNEL_ID = config.CHANNEL_ID
 OWNER_ID = int(config.OWNER_ID) if hasattr(config, "OWNER_ID") else 0
@@ -124,7 +126,7 @@ class JobScheduler:
         async with self.lock:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
-                return [dict(r) for r in conn.execute('SELECT * FROM playlists WHERE status != "completed"').fetchall()]
+                return [dict(r) for r in conn.execute('SELECT * FROM playlists WHERE status != "completed" AND status != "cancelled"').fetchall()]
 
     async def get_playlist(self, pl_id: str) -> dict:
         async with self.lock:
@@ -139,7 +141,20 @@ class JobScheduler:
                 for k, v in kwargs.items():
                     conn.execute(f'UPDATE playlists SET {k} = ? WHERE id = ?', (v, pl_id))
 
-    async def get_pending_items(self, pl_id: str, limit: int = 3) -> list[dict]:
+    async def cancel_playlist(self, pl_id: str):
+        """Full purge fix: Marks playlist cancelled, wipes pending items & active jobs, cleans disk."""
+        async with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute('UPDATE playlists SET status = "cancelled" WHERE id = ?', (pl_id,))
+                conn.execute('DELETE FROM playlist_items WHERE playlist_id = ? AND status = "pending"', (pl_id,))
+                conn.row_factory = sqlite3.Row
+                active_jobs = [dict(r) for r in conn.execute('SELECT id FROM jobs WHERE playlist_id = ?', (pl_id,)).fetchall()]
+                conn.execute('DELETE FROM jobs WHERE playlist_id = ?', (pl_id,))
+
+        for j in active_jobs:
+            shutil.rmtree(JOBS_DIR / f"JOB_{j['id']}", ignore_errors=True)
+
+    async def get_pending_items(self, pl_id: str, limit: int = 2) -> list[dict]:
         async with self.lock:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -178,21 +193,20 @@ class JobScheduler:
 # ──────────────────────────── DRIP-FEED ORCHESTRATOR ───────────────────
 
 async def playlist_drip_feed_loop(db: JobScheduler, dl_q: asyncio.Queue):
-    """Monitors active playlists and feeds 2-3 items at a time into the queue."""
+    """Monitors active playlists and feeds 2 items at a time per playlist."""
     while True:
-        await asyncio.sleep(4)
+        await asyncio.sleep(3)
         try:
             active_playlists = await db.get_active_playlists()
             active_jobs = await db.get_active_jobs()
 
             for pl in active_playlists:
-                if pl['status'] == 'paused':
+                if pl['status'] in ['paused', 'cancelled', 'completed']:
                     continue
 
                 pl_id = pl['id']
                 current_active = len([j for j in active_jobs if j.get('playlist_id') == pl_id])
 
-                # Drip-feed logic to prevent memory exhaustion and IP bans
                 if current_active < 2:
                     slots_free = 2 - current_active
                     pending_items = await db.get_pending_items(pl_id, limit=slots_free)
@@ -215,7 +229,7 @@ class DownloaderEngine:
         self.db = db
 
     def _extract_vk_api(self, url: str, jid: str) -> str | None:
-        """Ghost Protocol: Extract direct CDN links bypassing web frontend entirely."""
+        """Ghost Protocol: Direct CDN extraction without cookies."""
         VK_TOKEN = getattr(config, "VK_TOKEN", None)
         if not VK_TOKEN: return None
 
@@ -233,7 +247,6 @@ class DownloaderEngine:
                 vid_details = vk.video.get(videos=video_id)
                 if vid_details and vid_details.get('items'):
                     files = vid_details['items'][0].get('files', {})
-                    # Prioritize highest quality media link directly from CDN
                     for q in ['mp4_1080', 'mp4_720', 'mp4_480', 'mp4_360', 'hls']:
                         if q in files:
                             self.db.log_trace(jid, f"[vk_api] Direct {q.upper()} CDN link extracted.")
@@ -246,16 +259,17 @@ class DownloaderEngine:
         jid, original_url = job['id'], job['url']
         dl_dir = JOBS_DIR / f"JOB_{jid}" / "dl"
 
-        # --- GHOST PROTOCOL: INTERCEPT & OVERRIDE URL ---
         self.db.log_trace(jid, "Querying VK API backend for direct CDN payload...")
         extracted_cdn = await asyncio.to_thread(self._extract_vk_api, original_url, jid)
         
         target_url = extracted_cdn if extracted_cdn else original_url
         if extracted_cdn:
             self.db.log_trace(jid, "Target bypassed! Proceeding with cookieless direct CDN stream.")
-        # ------------------------------------------------
+
+        last_db_update = 0
 
         def prog_hook(d):
+            nonlocal last_db_update
             if d.get("status") == "downloading":
                 try:
                     pct_str = re.sub(r"\x1b[^m]*m", "", d.get("_percent_str", "0.0%")).strip()
@@ -266,10 +280,13 @@ class DownloaderEngine:
                     val = float(re.search(r"[\d.]+", pct_str).group()) if re.search(r"[\d.]+", pct_str) else 0.0
                     
                     global _live_ui_text
-                    _live_ui_text[jid] = f"[aria2c] {pct_str} of {tot_str} at {speed} ETA {eta}"
+                    _live_ui_text[jid] = f"[native] {pct_str} of {tot_str} at {speed} ETA {eta}"
 
-                    stage_str = f"downloading | {speed} | {eta}"
-                    asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val, stage=stage_str), loop)
+                    current_time = time.time()
+                    if current_time - last_db_update >= 1.5:
+                        stage_str = f"downloading | {speed} | {eta}"
+                        asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val, stage=stage_str), loop)
+                        last_db_update = current_time
                 except Exception: pass
 
         opts = {
@@ -277,38 +294,31 @@ class DownloaderEngine:
             "format": "bestvideo[height<=1080]+bestaudio/best",
             "merge_output_format": "mp4",
             "progress_hooks": [prog_hook],
-            "quiet": True, "noprogress": True, "no_warnings": True,
+            "quiet": True,
+            "noprogress": True,
+            "no_warnings": True,
             "compat_opts": {"allow-unsafe-ext"}
         }
 
-        # Dynamic CDN Spoofing
         custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        if "srcAg=GECKO" in target_url: custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0"
-        elif "srcAg=SAFARI" in target_url: custom_ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"
         opts["http_headers"] = {"User-Agent": custom_ua}
 
         await asyncio.to_thread(self._run_ytdlp, target_url, jid, opts)
 
     def _run_ytdlp(self, url: str, jid: str, base_opts: dict):
         opts = base_opts.copy()
-        opts["external_downloader"] = "aria2c"
-        opts["noprogress"] = False  
-        opts["quiet"] = False       
-        opts["external_downloader_args"] = {
-            "aria2c": ["-c", "-j", "10", "-x", "10", "-s", "10", "-k", "5M", "--summary-interval=1", "--console-log-level=notice"]
-        }
+        opts["quiet"] = True
+        opts["noprogress"] = True
+        opts["concurrent_fragment_downloads"] = 10
+        opts["http_chunk_size"] = 10485760
 
-        self.db.log_trace(jid, "Executing Aria2c multi-connection mode...")
+        self.db.log_trace(jid, "Executing native multi-threaded downloader...")
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.extract_info(url, download=True)
         except Exception as e:
-            self.db.log_trace(jid, f"Aria2c fallback triggered. Boosting native downloader...")
-            fallback_opts = base_opts.copy()
-            fallback_opts["concurrent_fragment_downloads"] = 10  
-            fallback_opts["http_chunk_size"] = 10485760          
-            with yt_dlp.YoutubeDL(fallback_opts) as ydl_fallback:
-                ydl_fallback.extract_info(url, download=True)
+            self.db.log_trace(jid, f"Native Download Error: {e}")
+            raise e
 
 class EncoderEngine:
     async def execute(self, job: dict):
@@ -339,11 +349,30 @@ class UploaderEngine:
         pl = await self.db.get_playlist(job['playlist_id'])
         caption = f"{pl['caption']}\n\n**{job['title']}**" if pl and pl.get('caption') else f"**{job['title']}**"
 
+        last_db_up = 0
+
+        async def upload_progress(current, total):
+            nonlocal last_db_up
+            now = time.time()
+            if now - last_db_up >= 1.5:
+                pct = (current / total) * 100 if total else 0.0
+                curr_mb = current / (1024 * 1024)
+                tot_mb = total / (1024 * 1024)
+                stage_str = f"uploading | {curr_mb:.1f}MB/{tot_mb:.1f}MB"
+                
+                global _live_ui_text
+                _live_ui_text[jid] = f"[upload] {curr_mb:.1f}/{tot_mb:.1f} MB ({pct:.1f}%)"
+                
+                await self.db.update_job(jid, pct=pct, stage=stage_str)
+                last_db_up = now
+
+        # MTProto Pyrogram client handles files > 1 GB smoothly via API_ID + API_HASH
         await self.app.send_video(
             chat_id=CHANNEL_ID,
             video=str(enc_file),
             caption=caption,
-            supports_streaming=True
+            supports_streaming=True,
+            progress=upload_progress
         )
 
         global _last_completed
@@ -396,7 +425,9 @@ async def render_dashboard(db: JobScheduler, tab: str = "playlists", exp_pl: str
     is_root_open = (tab == "playlists")
     kb.append([InlineKeyboardButton(f"{'[-]' if is_root_open else '[+]'} 🎵 ACTIVE PLAYLISTS ({len(playlists)})", callback_data=f"dash|{'root' if is_root_open else 'playlists'}")])
 
-    def _base(stage_str): return stage_str.split("|")[0].strip().lower() if "|" in stage_str else stage_str.strip().lower()
+    def _base(stage_str): 
+        if not stage_str: return "queued"
+        return stage_str.split("|")[0].strip().lower()
 
     if is_root_open:
         if not playlists:
@@ -438,6 +469,7 @@ async def render_dashboard(db: JobScheduler, tab: str = "playlists", exp_pl: str
                                     if "|" in j['stage']:
                                         p = [x.strip() for x in j['stage'].split("|")]
                                         if len(p) >= 3: speed, eta = p[1], p[2]
+                                        elif len(p) == 2: speed = p[1]
                                     pct = float(j.get('pct', 0.0))
                                     bar = make_bar(pct, 8)
                                     
@@ -480,9 +512,7 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
     @app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["vk_dash"]))
     async def auto_catch_playlist(_, msg: Message):
         text = msg.text.strip()
-        
-        if not ("http://" in text or "https://" in text):
-            return
+        if not ("http://" in text or "https://" in text): return
             
         parts = text.split("#", 1)
         url = parts[0].strip()
@@ -579,9 +609,6 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
     async def handle_callbacks(_, cb: CallbackQuery):
         global _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid
         
-        if '_expanded_pl' not in globals(): globals()['_expanded_pl'] = None
-        if '_expanded_bucket' not in globals(): globals()['_expanded_bucket'] = None
-        
         if cb.data == "noop": return await cb.answer()
 
         if cb.data.startswith("dash|"):
@@ -614,21 +641,20 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
         elif cb.data.startswith("pause|"):
             pl_id = cb.data.split("|")[1]
             await db.update_playlist(pl_id, status="paused")
-            await cb.answer("Playlist Paused. Active transfers will finish.", show_alert=True)
+            _expanded_pl = pl_id
+            await cb.answer("⏸ Playlist Paused. Queue held.", show_alert=True)
 
         elif cb.data.startswith("res|"):
             pl_id = cb.data.split("|")[1]
             await db.update_playlist(pl_id, status="active")
-            await cb.answer("Playlist Resumed.", show_alert=True)
+            _expanded_pl = pl_id
+            await cb.answer("▶️ Playlist Resumed.", show_alert=True)
 
         elif cb.data.startswith("kill|"):
             pl_id = cb.data.split("|")[1]
-            await db.update_playlist(pl_id, status="completed")
-            async with db.lock:
-                with sqlite3.connect(db.db_path) as conn:
-                    conn.execute('DELETE FROM playlist_items WHERE playlist_id = ? AND status = "pending"', (pl_id,))
-            _expanded_pl = None 
-            await cb.answer("Playlist Terminated. Pending items wiped.", show_alert=True)
+            await db.cancel_playlist(pl_id)
+            _expanded_pl = None
+            await cb.answer("❌ Playlist Terminated & Wiped.", show_alert=True)
 
         text, kb = await render_dashboard(db, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid)
         await safe_edit(app, cb.message.chat.id, cb.message.id, text, kb)
@@ -638,7 +664,7 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
 async def terminal_loop(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.Queue, up_q: asyncio.Queue):
     sys.stdout.write("\033[2J") 
     while True:
-        await asyncio.sleep(1) 
+        await asyncio.sleep(2) 
         sys.stdout.write("\033[H") 
         sys.stdout.write(f"{C_CYAN}{C_BOLD}=== VK MAINFRAME [LIVE] ==={C_RESET}\n")
         sys.stdout.write(f"QUEUES | DL: {dl_q.qsize()} | ENC: {enc_q.qsize()} | UP: {up_q.qsize()}\n{'─' * 40}\n")
@@ -675,8 +701,8 @@ async def worker_pipeline(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.
     async def dl_worker():
         while True:
             jid = await dl_q.get()
-            job = (await db.get_active_jobs())
-            j_data = next((j for j in job if j['id'] == jid), None)
+            jobs = await db.get_active_jobs()
+            j_data = next((j for j in jobs if j['id'] == jid), None)
             if j_data:
                 try:
                     await dl_engine.execute(j_data)
@@ -690,8 +716,8 @@ async def worker_pipeline(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.
     async def enc_worker():
         while True:
             jid = await enc_q.get()
-            job = (await db.get_active_jobs())
-            j_data = next((j for j in job if j['id'] == jid), None)
+            jobs = await db.get_active_jobs()
+            j_data = next((j for j in jobs if j['id'] == jid), None)
             if j_data:
                 try:
                     await db.update_job(jid, stage="encoding")
@@ -706,8 +732,8 @@ async def worker_pipeline(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.
     async def up_worker():
         while True:
             jid = await up_q.get()
-            job = (await db.get_active_jobs())
-            j_data = next((j for j in job if j['id'] == jid), None)
+            jobs = await db.get_active_jobs()
+            j_data = next((j for j in jobs if j['id'] == jid), None)
             if j_data:
                 try:
                     await db.update_job(jid, stage="uploading")
@@ -721,16 +747,54 @@ async def worker_pipeline(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.
     asyncio.create_task(enc_worker())
     asyncio.create_task(up_worker())
 
-# ──────────────────────────── BOOTSTRAP ────────────────────────────────
+# ──────────────────────────── BOOTSTRAP & REFRESHER ────────────────────
 
 async def dashboard_refresher(app: Client, db: JobScheduler):
     global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid
+    last_state_hash = {}
+
     while True:
-        await asyncio.sleep(4)
+        await asyncio.sleep(2)
         if _dash_msg_id and _dash_chat_id:
             try:
-                text, kb = await render_dashboard(db, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid)
-                await safe_edit(app, _dash_chat_id, _dash_msg_id, text, kb)
+                jobs = await db.get_active_jobs()
+                playlists = await db.get_active_playlists()
+                
+                needs_update = False
+                current_hash = {}
+
+                pl_summary = str([(p['id'], p['status'], p['downloaded']) for p in playlists])
+                if last_state_hash.get("playlists") != pl_summary:
+                    needs_update = True
+                    last_state_hash["playlists"] = pl_summary
+
+                for j in jobs:
+                    jid = j['id']
+                    stage_base = j['stage'].split('|')[0].strip() if j['stage'] else ""
+                    pct = float(j.get('pct', 0.0))
+                    pct_bucket = int(pct // 10) * 10 
+
+                    state_str = f"{stage_base}_{pct_bucket}"
+                    current_hash[jid] = state_str
+
+                    if last_state_hash.get(jid) != state_str:
+                        needs_update = True
+
+                active_jids = set(current_hash.keys())
+                known_jids = set(k for k in last_state_hash.keys() if k != "playlists")
+                if active_jids != known_jids:
+                    needs_update = True
+
+                if needs_update:
+                    text, kb = await render_dashboard(db, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid)
+                    await safe_edit(app, _dash_chat_id, _dash_msg_id, text, kb)
+                    
+                    for k in list(last_state_hash.keys()):
+                        if k != "playlists" and k not in current_hash:
+                            del last_state_hash[k]
+                    for k, v in current_hash.items():
+                        last_state_hash[k] = v
+
             except Exception:
                 pass
 
@@ -742,7 +806,7 @@ async def main():
     setup_router(app, db, dl_q, enc_q, up_q)
 
     async with app:
-        log.info("VK Playlist Bot Online.")
+        log.info("VK Playlist Bot Online via MTProto.")
         asyncio.create_task(playlist_drip_feed_loop(db, dl_q))
         asyncio.create_task(worker_pipeline(db, dl_q, enc_q, up_q, app))
         asyncio.create_task(terminal_loop(db, dl_q, enc_q, up_q))
