@@ -1053,6 +1053,27 @@ async def dashboard_refresher(app: Client, db: JobScheduler):
 
         except Exception:
             pass
+            
+async def ui_render_loop(db):
+    """Renders only active queued, downloading, encoding, or uploading jobs."""
+    while True:
+        await asyncio.sleep(1)
+        active_jobs = await db.get_active_jobs()
+        
+        # Filter out completed or failed jobs from terminal list
+        running_jobs = [
+            j for j in active_jobs 
+            if j.get("stage") and not any(x in j["stage"].lower() for x in ["completed", "failed"])
+        ]
+
+        # Refresh console output for running jobs only
+        print("\033[H\033[J", end="") # Clear console
+        print("=== VK MAINFRAME [LIVE] ===")
+        for job in running_jobs:
+            jid = job["id"]
+            title = job["title"][:20]
+            stage = _live_ui_text.get(jid, job.get("stage", "processing"))
+            print(f"[[{title}]] {stage}")
 
 async def main():
     app = Client("vk_stealth_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
