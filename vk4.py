@@ -895,18 +895,98 @@ async def worker_pipeline(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.
                     await db.delete_job(jid)
             enc_q.task_done()
 
-    async def up_worker():
-        while True:
-            jid = await up_q.get()
-            jobs = await db.get_active_jobs()
-            j_data = next((j for j in jobs if j['id'] == jid), None)
-            if j_data:
-                try:
-                    await db.update_job(jid, stage="uploading")
-                    await up_engine.execute(j_data)
-                except Exception as e:
-                    db.log_trace(jid, f"UP Error: {e}")
-                    await db.delete_job(jid)
+import subprocess
+import json
+from pathlib import Path
+
+def get_video_metadata(video_path: str):
+    """Extracts width, height, duration using ffprobe and generates a thumbnail frame."""
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_streams", "-show_format", video_path
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    data = json.loads(res.stdout) if res.returncode == 0 else {}
+
+    width, height, duration = 1280, 720, 0
+    
+    # Extract resolution & duration from streams
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") == "video":
+            width = int(stream.get("width", 1280))
+            height = int(stream.get("height", 720))
+            break
+            
+    if "format" in data and "duration" in data["format"]:
+        duration = int(float(data["format"]["duration"]))
+
+    # Generate high-res JPEG thumbnail from 2-second mark
+    thumb_path = f"{video_path}_thumb.jpg"
+    thumb_cmd = [
+        "ffmpeg", "-y", "-ss", "00:00:02", "-i", video_path,
+        "-vframes", "1", "-q:v", "2", "-vf", "scale=1280:-1", thumb_path
+    ]
+    subprocess.run(thumb_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    return {
+        "width": width,
+        "height": height,
+        "duration": duration,
+        "thumb": thumb_path if Path(thumb_path).exists() else None
+    }
+
+async def up_worker(db, app):
+    """Upload worker with metadata extraction & streaming flags."""
+    while True:
+        jid = await up_q.get()
+        try:
+            job = await db.get_job(jid)
+            chat_id = job["chat_id"]
+            video_file = job["file_path"]
+
+            await db.update_job(jid, stage="uploading | metadata extraction")
+            
+            # Extract video metadata & high-res thumbnail
+            meta = await asyncio.to_thread(get_video_metadata, video_file)
+            
+            file_size_bytes = Path(video_file).stat().st_size
+            file_size_mb = file_size_bytes / (1024 * 1024)
+            duration_str = f"{meta['duration'] // 60}m {meta['duration'] % 60}s"
+
+            caption = (
+                f"🎬 **{job['title']}**\n"
+                f"📏 **Resolution:** {meta['width']}x{meta['height']}\n"
+                f"⏱️ **Duration:** {duration_str}\n"
+                f"💾 **Size:** {file_size_mb:.2f} MB"
+            )
+
+            await db.update_job(jid, stage="uploading | streaming payload")
+
+            # Send full video payload with exact dimensions and thumbnail
+            sent_msg = await app.send_video(
+                chat_id=chat_id,
+                video=video_file,
+                caption=caption,
+                width=meta["width"],
+                height=meta["height"],
+                duration=meta["duration"],
+                thumb=meta["thumb"],
+                supports_streaming=True
+            )
+
+            # Cleanup thumbnail
+            if meta["thumb"] and Path(meta["thumb"]).exists():
+                Path(meta["thumb"]).unlink()
+
+            await db.update_job(jid, stage="completed", pct=100.0)
+            
+            # Clean live dashboard entry so job disappears
+            global _live_ui_text
+            _live_ui_text.pop(jid, None)
+
+        except Exception as e:
+            await db.update_job(jid, stage=f"failed | {e}")
+        finally:
             up_q.task_done()
 
     for _ in range(3): asyncio.create_task(dl_worker())
