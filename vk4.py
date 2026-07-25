@@ -478,6 +478,38 @@ class EncoderEngine:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         await proc.wait()
+        
+async def extract_video_metadata(video_path):
+    """Uses ffprobe to extract exact width, height, and duration."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height:format=duration",
+            "-of", "json", str(video_path)
+        ]
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, _ = await proc.communicate()
+        data = json.loads(stdout)
+        
+        width = int(data['streams'][0]['width']) if 'streams' in data and data['streams'] else 0
+        height = int(data['streams'][0]['height']) if 'streams' in data and data['streams'] else 0
+        duration = int(float(data['format']['duration'])) if 'format' in data and 'duration' in data['format'] else 0
+        return width, height, duration
+    except Exception:
+        return 1280, 720, 0  # Fallback to standard 16:9 HD if probe fails
+
+async def generate_thumbnail(video_path, thumb_path):
+    """Uses ffmpeg to take a high-quality frame at the 3-second mark."""
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-ss", "00:00:03", "-i", str(video_path),
+            "-vframes", "1", "-q:v", "2", str(thumb_path)
+        ]
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        await proc.wait()
+        return str(thumb_path) if Path(thumb_path).exists() else None
+    except Exception:
+        return None
 
 class UploaderEngine:
     def __init__(self, db: JobScheduler, app: Client):
