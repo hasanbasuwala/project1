@@ -235,7 +235,7 @@ class JobScheduler:
 # ──────────────────────────── DRIP-FEED ORCHESTRATOR ───────────────────
 
 async def playlist_drip_feed_loop(db: JobScheduler, dl_q: asyncio.Queue):
-    """Monitors active playlists and feeds 2 items at a time per playlist."""
+    """Monitors active playlists and maintains 3 concurrent downloads at all times."""
     while True:
         await asyncio.sleep(3)
         try:
@@ -247,10 +247,21 @@ async def playlist_drip_feed_loop(db: JobScheduler, dl_q: asyncio.Queue):
                     continue
 
                 pl_id = pl['id']
-                current_active = len([j for j in active_jobs if j.get('playlist_id') == pl_id])
+                
+                # Count ONLY jobs currently in queued or downloading stage for this playlist
+                downloading_jobs = [
+                    j for j in active_jobs 
+                    if j.get('playlist_id') == pl_id and (
+                        not j.get('stage') or 
+                        'queued' in j.get('stage', '').lower() or 
+                        'download' in j.get('stage', '').lower()
+                    )
+                ]
+                current_dl_count = len(downloading_jobs)
 
-                if current_active < 2:
-                    slots_free = 2 - current_active
+                TARGET_CONCURRENT_DOWNLOADS = 3
+                if current_dl_count < TARGET_CONCURRENT_DOWNLOADS:
+                    slots_free = TARGET_CONCURRENT_DOWNLOADS - current_dl_count
                     pending_items = await db.get_pending_items(pl_id, limit=slots_free)
 
                     for item in pending_items:
