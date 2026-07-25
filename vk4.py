@@ -518,8 +518,15 @@ class UploaderEngine:
 
     async def execute(self, job: dict):
         jid = job['id']
-        enc_file = JOBS_DIR / f"JOB_{jid}" / "enc" / f"{jid}.mp4"
+        enc_dir = JOBS_DIR / f"JOB_{jid}" / "enc"
+        enc_file = enc_dir / f"{jid}.mp4"
+        thumb_file = enc_dir / f"{jid}_thumb.jpg"
+        
         if not enc_file.exists(): raise RuntimeError("Encoded payload missing.")
+
+        # --- EXTRACT METADATA & GENERATE THUMBNAIL ---
+        width, height, duration = await extract_video_metadata(enc_file)
+        thumb_path = await generate_thumbnail(enc_file, thumb_file)
 
         pl = await self.db.get_playlist(job['playlist_id'])
         caption = f"{pl['caption']}\n\n**{job['title']}**" if pl and pl.get('caption') else f"**{job['title']}**"
@@ -538,14 +545,22 @@ class UploaderEngine:
                 global _live_ui_text
                 _live_ui_text[jid] = f"[upload] {curr_mb:.1f}/{tot_mb:.1f} MB ({pct:.1f}%)"
                 
-                await self.db.update_job(jid, pct=pct, stage=stage_str)
+                try:
+                    active_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    active_loop = loop
+                asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=pct, stage=stage_str), active_loop)
                 last_db_up = now
 
-        # MTProto Pyrogram client handles files > 1 GB smoothly via API_ID + API_HASH
+        # MTProto Pyrogram client file payload delivery
         await self.app.send_video(
             chat_id=CHANNEL_ID,
             video=str(enc_file),
             caption=caption,
+            width=width,
+            height=height,
+            duration=duration,
+            thumb=thumb_path,  # Injects the high-quality JPG
             supports_streaming=True,
             progress=upload_progress
         )
@@ -559,7 +574,7 @@ class UploaderEngine:
             await self.db.update_playlist(pl['id'], downloaded=new_count, status=status)
             await self.db.update_item_status(jid, "done")
 
-        # 5. Final UI Freeze & Cleanup in the tracking chat
+        # Tracker card cleanup
         try:
             latest_job = await self.db.get_job(jid)
             if latest_job and latest_job.get('tracker_id'):
