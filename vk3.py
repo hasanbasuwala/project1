@@ -276,26 +276,36 @@ class AriaLogger:
     def error(self, msg): pass
 
     def _process(self, msg):
-        # Target the specific aria2c summary line structure
-        if "DL:" in msg and "ETA:" in msg and "%" in msg:
+        # Strip ANSI codes & clean formatting
+        clean_msg = re.sub(r"\x1b[^m]*m", "", str(msg)).strip()
+        
+        if "DL:" in clean_msg and "ETA:" in clean_msg and "%" in clean_msg:
             try:
-                pct_m = re.search(r"\((\d+)%\)", msg)
-                speed_m = re.search(r"DL:([^\s]+)", msg)
-                eta_m = re.search(r"ETA:([^\]\s]+)", msg)
+                pct_m = re.search(r"\((\d+)%\)", clean_msg)
+                speed_m = re.search(r"DL:([^\s]+)", clean_msg)
+                eta_m = re.search(r"ETA:([^\]\s]+)", clean_msg)
                 
                 if pct_m and speed_m and eta_m:
                     pct = float(pct_m.group(1))
-                    speed = speed_m.group(1) + "/s"
+                    speed = speed_m.group(1)
+                    if not speed.endswith("/s"): speed += "/s"
                     eta = eta_m.group(1)
                     
                     now = time.time()
-                    if now - self.last_up >= 1.5:
+                    if now - self.last_up >= 1.0:
                         global _live_ui_text
                         _live_ui_text[self.jid] = f"[aria2] {pct:.1f}% at {speed} ETA {eta}"
                         
                         stage_str = f"downloading | {speed} | {eta}"
+                        
+                        # Dynamically acquire active running event loop
+                        try:
+                            active_loop = asyncio.get_running_loop()
+                        except RuntimeError:
+                            active_loop = loop
+                            
                         asyncio.run_coroutine_threadsafe(
-                            self.db.update_job(self.jid, pct=pct, stage=stage_str), loop
+                            self.db.update_job(self.jid, pct=pct, stage=stage_str), active_loop
                         )
                         self.last_up = now
             except Exception:
@@ -340,6 +350,9 @@ class DownloaderEngine:
         chat_id = job.get('chat_id')
         dl_dir = JOBS_DIR / f"JOB_{jid}" / "dl"
 
+        # Immediately update status to downloading so UI doesn't linger on 'queued'
+        await self.db.update_job(jid, stage="downloading | ~ | ~")
+
         # Initialize Individual Job Card for tracking
         if chat_id:
             try:
@@ -374,9 +387,13 @@ class DownloaderEngine:
                     _live_ui_text[jid] = f"[native] {pct_str} of {tot_str} at {speed} ETA {eta}"
 
                     current_time = time.time()
-                    if current_time - last_db_update >= 1.5:
+                    if current_time - last_db_update >= 1.0:
                         stage_str = f"downloading | {speed} | {eta}"
-                        asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val, stage=stage_str), loop)
+                        try:
+                            active_loop = asyncio.get_running_loop()
+                        except RuntimeError:
+                            active_loop = loop
+                        asyncio.run_coroutine_threadsafe(self.db.update_job(jid, pct=val, stage=stage_str), active_loop)
                         last_db_update = current_time
                 except Exception: pass
 
@@ -385,12 +402,11 @@ class DownloaderEngine:
             "format": "bestvideo[height<=1080]+bestaudio/best",
             "merge_output_format": "mp4",
             "progress_hooks": [prog_hook],
-            "quiet": False,  # Changed to False so the custom logger receives the output
+            "quiet": False,
             "noprogress": True,
             "no_warnings": True,
             "compat_opts": {"allow-unsafe-ext"},
             
-            # --- ARIA2C INTEGRATION & LOG INTERCEPTION ---
             "external_downloader": "aria2c",
             "external_downloader_args": [
                 "-c", "-j", "16", "-x", "16", "-s", "16", "-k", "5M",
@@ -399,34 +415,19 @@ class DownloaderEngine:
             "logger": AriaLogger(jid, self.db)
         }
 
-        # --- ADDED: DYNAMIC CDN SIGNATURE SPOOFING (COOKIELESS BYPASS) ---
-        # Default to a highly standard Windows Chrome User-Agent
+        # Dynamic CDN Signature Spoofing
         custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        
-        # Check the URL for VK's strict engine bindings
         if "srcAg=GECKO" in target_url:
             custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0"
-            if hasattr(self, 'db'):
-                self.db.log_trace(jid, "Ghost Protocol: Gecko CDN signature detected. Spoofing Firefox User-Agent.")
         elif "srcAg=SAFARI" in target_url:
             custom_ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"
-            if hasattr(self, 'db'):
-                self.db.log_trace(jid, "Ghost Protocol: Safari CDN signature detected. Spoofing Apple User-Agent.")
-        elif "srcAg=CHROMIUM" in target_url:
-            if hasattr(self, 'db'):
-                self.db.log_trace(jid, "Ghost Protocol: Chromium CDN signature detected. Using standard Chrome User-Agent.")
 
-        # Inject the spoofed User-Agent directly into yt-dlp's network options
         if "http_headers" not in opts:
             opts["http_headers"] = {}
         opts["http_headers"]["User-Agent"] = custom_ua
-        
-        # Disable yt-dlp's default impersonation in Pass 3/4 if we are strictly spoofing a raw link
+
         if "impersonate" in opts and ("srcAg=" in target_url):
             del opts["impersonate"]
-            if hasattr(self, 'db'):
-                self.db.log_trace(jid, "Ghost Protocol: Disabled curl_cffi impersonation to prevent header collisions.")
-        # -----------------------------------------------------------------
 
         await asyncio.to_thread(self._run_ytdlp, target_url, jid, opts)
 
