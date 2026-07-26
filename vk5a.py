@@ -104,7 +104,7 @@ JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Storage / concurrency safety (works for playlists of any size) ---
 MAX_RETRIES = 3                 # permanent failure after this many attempts of any stage
-MAX_GLOBAL_CONCURRENT = 3       # total in-flight jobs across ALL playlists at once
+MAX_GLOBAL_CONCURRENT = 7       # total in-flight jobs across ALL playlists at once
 MIN_FREE_GB = 3.0               # never let free disk space drop below this
 EST_JOB_FOOTPRINT_GB = 1.5      # rough worst-case footprint of one in-flight job
 
@@ -113,6 +113,7 @@ C_CYAN, C_YELLOW, C_RED, C_GREEN, C_RESET, C_BOLD = "\033[36m", "\033[33m", "\03
 _live_ui_text = {}
 _last_completed = "—"
 _dash_msg_id, _dash_chat_id = 0, 0
+_stack_msg_id, _stack_chat_id = 0, 0
 _dash_tab = "playlists"
 _expanded_pl = None
 _expanded_bucket = None
@@ -158,6 +159,58 @@ def _job_tracker_text(job: dict, avg_speed: str = None, avg_eta: str = None) -> 
     )
 
 
+def _stack_bucket(job: dict) -> str:
+    stage = (job.get('stage') or '').lower()
+    if stage.startswith('uploading') or stage.startswith('uploaded'):
+        return 'up'
+    if stage in ('encoding', 'encoded', 'process'):
+        return 'enc'
+    return 'dl'  # queued / downloading / downloaded
+
+
+def render_stack_card(jobs: list[dict], max_per_bucket: int = 6) -> str:
+    """
+    One compact message covering every active job, grouped by stage, instead
+    of a separate Telegram message per job. A 600-video playlist with the
+    old per-job-message design would leave hundreds of stray cards behind;
+    this stays at exactly one message no matter how large the playlist is.
+    """
+    groups: dict[str, list[dict]] = {'dl': [], 'enc': [], 'up': []}
+    for j in jobs:
+        groups[_stack_bucket(j)].append(j)
+
+    def fmt_job(j: dict) -> str:
+        pct = float(j.get('pct') or 0.0)
+        title = str(j.get('title') or '?')[:14]
+        bar = make_bar(pct, 8)
+        speed = ""
+        stage_val = j.get('stage') or ""
+        if "|" in stage_val:
+            parts = [p.strip() for p in stage_val.split("|")]
+            if len(parts) >= 2 and parts[1] not in ("~", ""):
+                speed = f" {parts[1]}"
+        return f"`  ├ {title:<14} [{bar}] {pct:>3.0f}%{speed}`"
+
+    lines = [f"📦 **ACTIVE JOBS** ({len(jobs)})", "`━━━━━━━━━━━━━━━━━━━━━━━━━━`"]
+    if not jobs:
+        lines.append("`  System idle.`")
+    else:
+        labels = (('dl', '📥 DOWNLOADING'), ('enc', '⚙️ ENCODING'), ('up', '📤 UPLOADING'))
+        shown = 0
+        for key, label in labels:
+            bucket_jobs = groups[key]
+            if not bucket_jobs:
+                continue
+            lines.append(f"`{label} ({len(bucket_jobs)})`")
+            lines.extend(fmt_job(j) for j in bucket_jobs[:max_per_bucket])
+            shown += min(len(bucket_jobs), max_per_bucket)
+        extra = len(jobs) - shown
+        if extra > 0:
+            lines.append(f"`  …and {extra} more`")
+    lines.append(f"`🏁 LAST : {_last_completed[:20]}`")
+    return "\n".join(lines)
+
+
 # ──────────────────────────── SUBSYSTEM 1: DATABASE ─────────────────────
 
 class JobScheduler:
@@ -188,12 +241,14 @@ class JobScheduler:
         )''')
         self.conn.execute('''CREATE TABLE IF NOT EXISTS jobs (
             id TEXT PRIMARY KEY, url TEXT, title TEXT, playlist_id TEXT, item_id TEXT,
-            stage TEXT, pct REAL, retries INTEGER, chat_id INTEGER, tracker_id INTEGER
+            stage TEXT, pct REAL, retries INTEGER, chat_id INTEGER, tracker_id INTEGER,
+            held INTEGER DEFAULT 0
         )''')
         # Best-effort migrations for DBs created by older versions of this script.
         for stmt in (
             'ALTER TABLE jobs ADD COLUMN tracker_id INTEGER',
             'ALTER TABLE jobs ADD COLUMN item_id TEXT',
+            'ALTER TABLE jobs ADD COLUMN held INTEGER DEFAULT 0',
             'ALTER TABLE playlist_items ADD COLUMN retries INTEGER',
         ):
             try:
@@ -316,6 +371,17 @@ class JobScheduler:
         async with self.lock:
             return [dict(r) for r in self.conn.execute('SELECT * FROM jobs').fetchall()]
 
+    async def get_held_jobs(self, pl_id: str) -> list[dict]:
+        async with self.lock:
+            return [dict(r) for r in self.conn.execute(
+                'SELECT * FROM jobs WHERE playlist_id = ? AND held = 1', (pl_id,)
+            ).fetchall()]
+
+    async def clear_held(self, jid: str):
+        async with self.lock:
+            self.conn.execute('UPDATE jobs SET held = 0 WHERE id = ?', (jid,))
+            self.conn.commit()
+
     async def get_job(self, jid: str) -> dict:
         async with self.lock:
             row = self.conn.execute('SELECT * FROM jobs WHERE id = ?', (jid,)).fetchone()
@@ -433,12 +499,24 @@ class JobScheduler:
         Trust the filesystem over a possibly-stale DB stage string after a
         crash. Also sweeps orphaned job folders (crash between mkdir and DB
         insert, or after DB delete but before rmtree).
-        Returns which queue each recovered job should re-enter.
+
+        Jobs belonging to a playlist that's currently 'paused' are NOT
+        pushed into any queue -- they're marked held=1 instead. Without
+        this check, a reboot would silently resume every in-flight job
+        regardless of pause, since nothing else in the recovery path knows
+        or cares about the playlist's pause state. The drip-feed loop
+        releases held jobs automatically once their playlist is resumed.
+
+        Returns which queue each recovered job should re-enter (jobs held
+        for a paused playlist are reported separately, not queued).
         """
-        result = {"dl": [], "enc": [], "up": []}
+        result = {"dl": [], "enc": [], "up": [], "held": []}
 
         async with self.lock:
             jobs = [dict(r) for r in self.conn.execute('SELECT * FROM jobs').fetchall()]
+            playlist_status = {
+                r[0]: r[1] for r in self.conn.execute('SELECT id, status FROM playlists').fetchall()
+            }
         known_ids = {j['id'] for j in jobs}
 
         if JOBS_DIR.exists():
@@ -476,49 +554,87 @@ class JobScheduler:
             stage = (j.get('stage') or "").lower()
 
             if stage.startswith("uploaded"):
-                # Uploaded to Telegram already; only bookkeeping/cleanup remains.
-                result["up"].append(jid)
+                bucket, new_stage = "up", None
             elif enc_ok:
-                await self.update_job(jid, stage="encoded", pct=0.0)
-                result["up"].append(jid)
+                bucket, new_stage = "up", "encoded"
             elif complete_media_files and not in_progress_markers:
-                await self.update_job(jid, stage="downloaded", pct=0.0)
-                result["enc"].append(jid)
+                bucket, new_stage = "enc", "downloaded"
             else:
-                # Either nothing here yet, or an interrupted download --
-                # both go back through the downloader so aria2c can resume
-                # from whatever partial bytes + control file are already
-                # on disk instead of restarting from zero.
-                await self.update_job(jid, stage="queued", pct=0.0)
-                result["dl"].append(jid)
+                bucket, new_stage = "dl", "queued"
+
+            if new_stage:
+                await self.update_job(jid, stage=new_stage, pct=0.0)
+
+            is_paused = playlist_status.get(j.get('playlist_id')) == "paused"
+            if is_paused:
+                async with self.lock:
+                    self.conn.execute('UPDATE jobs SET held = 1 WHERE id = ?', (jid,))
+                    self.conn.commit()
+                result["held"].append(jid)
+            else:
+                result[bucket].append(jid)
 
         return result
 
 
 # ──────────────────────────── DRIP-FEED ORCHESTRATOR ───────────────────
 
-async def playlist_drip_feed_loop(db: JobScheduler, dl_q: asyncio.Queue):
+async def playlist_drip_feed_loop(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.Queue, up_q: asyncio.Queue,
+                                   dl_pool: "WorkerPool", enc_pool: "WorkerPool", up_pool: "WorkerPool"):
     """Maintains bounded concurrent downloads, gated by both a global
     concurrency cap and free disk space, so a playlist of any size (600+
     videos) can never over-commit storage or memory."""
     while True:
         await asyncio.sleep(3)
         try:
+            active_playlists = await db.get_active_playlists()
+
+            # Release any jobs parked because their playlist was paused --
+            # including ones parked at boot by reconcile_on_startup() after
+            # a reboot. This runs independent of the disk/concurrency gate
+            # below since these are already-existing jobs, not new claims.
+            for pl in active_playlists:
+                if pl['status'] in ('paused', 'cancelled', 'completed'):
+                    continue
+                held_jobs = await db.get_held_jobs(pl['id'])
+                for hj in held_jobs:
+                    await db.clear_held(hj['id'])
+                    stage = (hj.get('stage') or '').lower()
+                    if stage.startswith('uploaded') or stage == 'encoded':
+                        await up_q.put(hj['id'])
+                    elif stage == 'downloaded':
+                        await enc_q.put(hj['id'])
+                    else:
+                        await dl_q.put(hj['id'])
+
             free_gb = get_free_space_gb()
             if free_gb < MIN_FREE_GB:
                 log.warning(f"Low disk space ({free_gb:.2f}GB free) — pausing new claims this cycle.")
                 continue
 
+            # A job "waiting for processing" or "waiting for upload" still
+            # counts toward the disk-safety budget (it still has a real file
+            # sitting on disk) -- but it shouldn't be capped at a hardcoded
+            # number that has no idea how many workers are actually
+            # configured. If enc/up have fewer workers than dl, a backlog
+            # naturally forms there; counting that backlog against a fixed
+            # cap of 3 (regardless of /vk_workers) starves dl_workers that
+            # have nothing to do with disk space at all. The cap now scales
+            # with whatever worker capacity is currently configured, so
+            # resizing via /vk_workers actually changes throughput, while
+            # disk safety remains a fully separate check below.
+            worker_capacity = dl_pool.target + enc_pool.target + up_pool.target
+            effective_cap = max(MAX_GLOBAL_CONCURRENT, worker_capacity)
+
             total_in_flight = await db.global_in_flight_count()
-            if total_in_flight >= MAX_GLOBAL_CONCURRENT:
+            if total_in_flight >= effective_cap:
                 continue
 
             slots_by_space = max(1, int((free_gb - MIN_FREE_GB) / EST_JOB_FOOTPRINT_GB))
-            global_slots_free = min(MAX_GLOBAL_CONCURRENT - total_in_flight, slots_by_space)
+            global_slots_free = min(effective_cap - total_in_flight, slots_by_space)
             if global_slots_free <= 0:
                 continue
 
-            active_playlists = await db.get_active_playlists()
             for pl in active_playlists:
                 if global_slots_free <= 0:
                     break
@@ -677,19 +793,9 @@ class DownloaderEngine:
 
     async def execute(self, job: dict):
         jid, original_url = job['id'], job['url']
-        chat_id = job.get('chat_id')
         dl_dir = JOBS_DIR / f"JOB_{jid}" / "dl"
 
         await self.db.update_job(jid, stage="downloading | ~ | ~")
-
-        if chat_id and not job.get('tracker_id'):
-            try:
-                card_text = _job_tracker_text(job)
-                m = await self.app.send_message(chat_id, card_text)
-                await self.db.update_job(jid, tracker_id=m.id)
-                job['tracker_id'] = m.id
-            except Exception as e:
-                self.db.log_trace(jid, f"Failed to deploy tracker card: {e}")
 
         self.db.log_trace(jid, "Querying VK API backend for direct CDN payload...")
         extracted_cdn = await asyncio.to_thread(self._extract_vk_api, original_url, jid)
@@ -726,17 +832,29 @@ class DownloaderEngine:
             ],
         }
 
+        # --- DYNAMIC CDN SIGNATURE SPOOFING (COOKIELESS BYPASS) ---
+        # Default to a highly standard Windows Chrome User-Agent
         custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+        # Check the URL for VK's strict engine bindings
         if "srcAg=GECKO" in target_url:
             custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0"
+            self.db.log_trace(jid, "Ghost Protocol: Gecko CDN signature detected. Spoofing Firefox User-Agent.")
         elif "srcAg=SAFARI" in target_url:
             custom_ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"
+            self.db.log_trace(jid, "Ghost Protocol: Safari CDN signature detected. Spoofing Apple User-Agent.")
+        elif "srcAg=CHROMIUM" in target_url:
+            self.db.log_trace(jid, "Ghost Protocol: Chromium CDN signature detected. Using standard Chrome User-Agent.")
 
+        # Inject the spoofed User-Agent directly into yt-dlp's network options
         opts.setdefault("http_headers", {})
         opts["http_headers"]["User-Agent"] = custom_ua
 
+        # Disable yt-dlp's default impersonation if we are strictly spoofing a raw link
         if "impersonate" in opts and ("srcAg=" in target_url):
             del opts["impersonate"]
+            self.db.log_trace(jid, "Ghost Protocol: Disabled curl_cffi impersonation to prevent header collisions.")
+        # -----------------------------------------------------------------
 
         stop_event = asyncio.Event()
         poller_task = asyncio.create_task(self._poll_aria2_progress(jid, rpc_port, rpc_secret, stop_event))
@@ -784,15 +902,32 @@ class EncoderEngine:
             tmp_dst = enc_dir / f"{jid}.mp4.partial"
             tmp_dst.unlink(missing_ok=True)
 
+            free_gb = get_free_space_gb()
+            if free_gb < 0.5:
+                # ffmpeg failing identically across unrelated files at the same
+                # moment is the classic signature of the disk actually being
+                # full (ENOSPC) rather than a per-video codec problem. Fail
+                # fast with a clear reason instead of burning a retry on a
+                # cryptic exit code.
+                raise RuntimeError(f"Only {free_gb:.2f}GB free — refusing to encode (likely disk-full failure).")
+
             proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-y", "-i", str(src), "-c", "copy", "-movflags", "+faststart", str(tmp_dst),
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                "ffmpeg", "-y", "-i", str(src),
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart",
+                "-f", "mp4", str(tmp_dst),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
-            await proc.wait()
+            _stdout, stderr_data = await proc.communicate()
 
             if proc.returncode != 0 or not tmp_dst.exists() or tmp_dst.stat().st_size == 0:
                 tmp_dst.unlink(missing_ok=True)
-                raise RuntimeError(f"ffmpeg encode failed (exit code {proc.returncode}).")
+                err_text = (stderr_data or b"").decode(errors="ignore").strip()
+                # Keep only the tail -- ffmpeg's actual error is almost always
+                # in the last few lines, and trace.log shouldn't balloon.
+                err_tail = "\n".join(err_text.splitlines()[-25:]) if err_text else "(ffmpeg produced no stderr output)"
+                db.log_trace(jid, f"ffmpeg stderr (exit {proc.returncode}):\n{err_tail}")
+                raise RuntimeError(f"ffmpeg encode failed (exit code {proc.returncode}) -- see trace log for stderr.")
 
             tmp_dst.rename(dst)  # only a fully-written file is ever visible as "encoded"
 
@@ -928,21 +1063,6 @@ class UploaderEngine:
 
             await self.db.update_item_status(item_id, "done")
 
-        try:
-            latest_job = await self.db.get_job(jid)
-            if latest_job and latest_job.get('tracker_id'):
-                final_text = (
-                    f"`[❖] ＴＡＳＫ :` `{latest_job['title'][:18]}..`\n"
-                    f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
-                    f"`✅ PHASE : COMPLETED`\n"
-                    f"`📤 ROUTE : {CHANNEL_ID}`\n"
-                    f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`"
-                )
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ DISMISS", callback_data=f"delmsg|{latest_job['tracker_id']}")]])
-                await safe_edit(self.app, latest_job['chat_id'], latest_job['tracker_id'], final_text, kb)
-        except Exception as e:
-            self.db.log_trace(jid, f"Failed to push final completion card: {e}")
-
         await self.db.delete_job(jid)
         shutil.rmtree(JOBS_DIR / f"JOB_{jid}", ignore_errors=True)
 
@@ -1071,7 +1191,8 @@ async def render_dashboard(db: JobScheduler, tab: str = "playlists", exp_pl: str
     return text, InlineKeyboardMarkup(kb)
 
 
-def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.Queue, up_q: asyncio.Queue):
+def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.Queue, up_q: asyncio.Queue,
+                  dl_pool: "WorkerPool", enc_pool: "WorkerPool", up_pool: "WorkerPool"):
 
     @app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["vk_dash"]))
     async def auto_catch_playlist(_, msg: Message):
@@ -1118,6 +1239,45 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                 log.error(f"VK API Extraction failed: {e}")
             return None
 
+        def extract_via_vk_wallpost(wall_url: str):
+            """
+            Handles vk.com/vk.ru wall post links (e.g. wall-223870924_29924),
+            which the playlist/album extractor above never matches (its
+            regexes only recognize 'playlist/' and 'album_' URLs). Resolves
+            the video(s) attached to the post via the VK API using the same
+            token-based Ghost Protocol approach as the playlist path -- this
+            avoids yt-dlp's cookie-dependent 'vk:wallpost' extractor, which
+            fails outright ("only available for registered users") on any
+            video VK gates behind a logged-in session unless valid, current
+            cookies happen to be loaded.
+            """
+            VK_TOKEN = getattr(config, "VK_TOKEN", None)
+            if not VK_TOKEN: return None
+
+            match = re.search(r'wall(-?\d+)_(\d+)', wall_url)
+            if not match: return None
+
+            try:
+                import vk_api
+                vk_session = vk_api.VkApi(token=VK_TOKEN)
+                vk = vk_session.get_api()
+
+                owner_id, post_id = match.group(1), match.group(2)
+                posts = vk.wall.getById(posts=f"{owner_id}_{post_id}")
+                if not posts:
+                    return None
+
+                videos = []
+                for att in posts[0].get('attachments', []):
+                    if att.get('type') == 'video':
+                        v = att['video']
+                        v_url = f"https://vk.com/video{v['owner_id']}_{v['id']}"
+                        videos.append({'url': v_url, 'title': v.get('title', 'VK Video')})
+                return videos or None
+            except Exception as e:
+                log.error(f"VK Wallpost API extraction failed: {e}")
+            return None
+
         def extract_via_ytdlp(playlist_url: str):
             cookie_path = "vk_temp_cookies.txt"
             if VK_COOKIES:
@@ -1141,6 +1301,8 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
 
         try:
             entries = await asyncio.to_thread(extract_via_vk_api, url)
+            if entries is None:
+                entries = await asyncio.to_thread(extract_via_vk_wallpost, url)
             if entries is None:
                 entries = await asyncio.to_thread(extract_via_ytdlp, url)
 
@@ -1168,6 +1330,45 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
         text, kb = await render_dashboard(db, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid)
         m = await msg.reply(text, reply_markup=kb)
         _dash_msg_id, _dash_chat_id = m.id, m.chat.id
+
+    @app.on_message(filters.command(["vk_workers"]) & filters.user(OWNER_ID))
+    async def cmd_workers(_, msg: Message):
+        args = msg.command[1:]
+
+        if not args:
+            return await msg.reply(
+                "`WORKER POOLS`\n"
+                f"`  DL  : {dl_pool.current_count()}/{dl_pool.target}`\n"
+                f"`  ENC : {enc_pool.current_count()}/{enc_pool.target}`\n"
+                f"`  UP  : {up_pool.current_count()}/{up_pool.target}`\n\n"
+                "Usage: `/vk_workers dl=5 enc=3 up=2`\n"
+                "(you can set just one, e.g. `/vk_workers dl=1` to slow downloads only)"
+            )
+
+        changes = {}
+        for arg in args:
+            if "=" in arg:
+                k, v = arg.split("=", 1)
+                if k.lower() in ("dl", "enc", "up") and v.lstrip("-").isdigit():
+                    changes[k.lower()] = int(v)
+
+        if not changes:
+            return await msg.reply("Couldn't parse that. Usage: `/vk_workers dl=5 enc=3 up=2`")
+
+        lines = []
+        pools = {"dl": dl_pool, "enc": enc_pool, "up": up_pool}
+        for key, new_target in changes.items():
+            pool = pools[key]
+            before = pool.current_count()
+            await pool.adjust(new_target)
+            arrow = "→" if new_target >= before else "↘"
+            lines.append(f"{key.upper()} {before} {arrow} {new_target}")
+
+        await msg.reply(
+            "✅ " + " | ".join(lines) +
+            "\n\nGrowing takes effect immediately. Shrinking takes effect as "
+            "current jobs finish -- nothing gets killed mid-download/encode/upload."
+        )
 
     @app.on_callback_query()
     async def handle_callbacks(_, cb: CallbackQuery):
@@ -1217,13 +1418,35 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
             pl_id = cb.data.split("|")[1]
             await db.update_playlist(pl_id, status="paused")
             _expanded_pl = pl_id
-            await cb.answer("⏸ Playlist Paused. Queue held.", show_alert=True)
+
+            pl = await db.get_playlist(pl_id)
+            all_jobs = await db.get_active_jobs()
+            pl_jobs = [j for j in all_jobs if j.get('playlist_id') == pl_id]
+            completed = pl['downloaded'] if pl else 0
+            total = pl['total'] if pl else 0
+            in_flight = len(pl_jobs)
+            still_waiting = max(0, total - completed - in_flight)
+
+            await cb.answer(
+                "⏸ PLAYLIST PAUSED\n\n"
+                f"✅ Completed: {completed}/{total}\n"
+                f"🔄 In progress right now (will finish naturally, not killed): {in_flight}\n"
+                f"⏳ Not yet started (frozen until Resume): {still_waiting}\n\n"
+                "No new videos will start -- including after a crash/reboot -- "
+                "until you hit Resume.",
+                show_alert=True
+            )
 
         elif cb.data.startswith("res|"):
             pl_id = cb.data.split("|")[1]
             await db.update_playlist(pl_id, status="active")
             _expanded_pl = pl_id
-            await cb.answer("▶️ Playlist Resumed.", show_alert=True)
+            held_count = len(await db.get_held_jobs(pl_id))
+            await cb.answer(
+                f"▶️ Playlist Resumed."
+                + (f" Releasing {held_count} held job(s) within a few seconds." if held_count else ""),
+                show_alert=True
+            )
 
         elif cb.data.startswith("kill|"):
             pl_id = cb.data.split("|")[1]
@@ -1272,12 +1495,52 @@ async def terminal_loop(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.Qu
         sys.stdout.flush()
 
 
+class WorkerPool:
+    """
+    Lets worker counts per stage be adjusted at runtime (via /vk_workers)
+    without ever killing a worker mid-job. Growing the pool spawns new
+    worker tasks right away. Shrinking it just increments a retirement
+    counter -- each worker checks that counter only after it has finished
+    its current job and called task_done(), so nothing is ever cancelled
+    while holding a download/encode/upload (which could orphan a subprocess
+    or corrupt a partial file).
+    """
+    def __init__(self, name: str, worker_factory):
+        self.name = name
+        self._factory = worker_factory  # callable(pool) -> coroutine
+        self.tasks: list[asyncio.Task] = []
+        self.target = 0
+        self._retire_count = 0
+
+    def current_count(self) -> int:
+        self.tasks = [t for t in self.tasks if not t.done()]
+        return len(self.tasks)
+
+    async def adjust(self, new_target: int):
+        new_target = max(0, new_target)
+        current = self.current_count()
+        if new_target > current:
+            for _ in range(new_target - current):
+                self.tasks.append(asyncio.create_task(self._factory(self)))
+        elif new_target < current:
+            self._retire_count += (current - new_target)
+        self.target = new_target
+
+    def should_retire(self) -> bool:
+        """Workers call this after finishing a job (task_done() already
+        called) and before fetching the next one."""
+        if self._retire_count > 0:
+            self._retire_count -= 1
+            return True
+        return False
+
+
 async def worker_pipeline(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.Queue, up_q: asyncio.Queue, app: Client):
     dl_engine = DownloaderEngine(db, app)
     enc_engine = EncoderEngine()
     up_engine = UploaderEngine(db, app)
 
-    async def dl_worker():
+    async def dl_worker(pool: WorkerPool):
         while True:
             jid = await dl_q.get()
             try:
@@ -1295,8 +1558,10 @@ async def worker_pipeline(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.
                 log.exception(f"dl_worker unexpected failure for {jid}: {e}")
             finally:
                 dl_q.task_done()
+            if pool.should_retire():
+                return
 
-    async def enc_worker():
+    async def enc_worker(pool: WorkerPool):
         while True:
             jid = await enc_q.get()
             try:
@@ -1315,8 +1580,10 @@ async def worker_pipeline(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.
                 log.exception(f"enc_worker unexpected failure for {jid}: {e}")
             finally:
                 enc_q.task_done()
+            if pool.should_retire():
+                return
 
-    async def up_worker():
+    async def up_worker(pool: WorkerPool):
         while True:
             jid = await up_q.get()
             try:
@@ -1357,16 +1624,25 @@ async def worker_pipeline(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.
                 log.exception(f"up_worker unexpected failure for {jid}: {e}")
             finally:
                 up_q.task_done()
+            if pool.should_retire():
+                return
 
-    for _ in range(3): asyncio.create_task(dl_worker())
-    for _ in range(2): asyncio.create_task(enc_worker())
-    for _ in range(2): asyncio.create_task(up_worker())
+    dl_pool = WorkerPool("dl", dl_worker)
+    enc_pool = WorkerPool("enc", enc_worker)
+    up_pool = WorkerPool("up", up_worker)
+
+    await dl_pool.adjust(3)
+    await enc_pool.adjust(2)
+    await up_pool.adjust(2)
+
+    return dl_pool, enc_pool, up_pool
 
 
 # ──────────────────────────── BOOTSTRAP & REFRESHER ────────────────────
 
 async def dashboard_refresher(app: Client, db: JobScheduler):
     global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid
+    global _stack_msg_id, _stack_chat_id
     last_state_hash = {}
 
     while True:
@@ -1377,7 +1653,6 @@ async def dashboard_refresher(app: Client, db: JobScheduler):
 
             needs_update = False
             current_hash = {}
-            jobs_to_update = []
 
             pl_summary = str([(p['id'], p['status'], p['downloaded']) for p in playlists])
             if last_state_hash.get("playlists") != pl_summary:
@@ -1396,30 +1671,28 @@ async def dashboard_refresher(app: Client, db: JobScheduler):
 
                 if last_state_hash.get(jid) != state_str:
                     needs_update = True
-                    jobs_to_update.append(j)
 
             active_jids = set(current_hash.keys())
             known_jids = set(k for k in last_state_hash.keys() if k != "playlists")
             if active_jids != known_jids:
                 needs_update = True
 
-            for j in jobs_to_update:
-                if j.get('tracker_id') and j.get('chat_id'):
+            if needs_update:
+                if _stack_msg_id and _stack_chat_id:
                     try:
-                        card_text = _job_tracker_text(j)
-                        await safe_edit(app, j['chat_id'], j['tracker_id'], card_text, None)
+                        await safe_edit(app, _stack_chat_id, _stack_msg_id, render_stack_card(jobs), None)
                     except Exception:
                         pass
-
-            if _dash_msg_id and _dash_chat_id and needs_update:
-                text, kb = await render_dashboard(db, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid)
-                await safe_edit(app, _dash_chat_id, _dash_msg_id, text, kb)
 
                 for k in list(last_state_hash.keys()):
                     if k != "playlists" and k not in current_hash:
                         del last_state_hash[k]
                 for k, v in current_hash.items():
                     last_state_hash[k] = v
+
+            if _dash_msg_id and _dash_chat_id and needs_update:
+                text, kb = await render_dashboard(db, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid)
+                await safe_edit(app, _dash_chat_id, _dash_msg_id, text, kb)
 
         except Exception:
             log.exception("dashboard_refresher error")
@@ -1441,29 +1714,33 @@ async def main():
     for jid in recovered["up"]:
         await up_q.put(jid)
 
-    if recovered["dl"] or recovered["enc"] or recovered["up"]:
+    if recovered["dl"] or recovered["enc"] or recovered["up"] or recovered["held"]:
         log.info(
             f"Recovered from previous session: "
             f"{len(recovered['dl'])} to (re)download, "
             f"{len(recovered['enc'])} to (re)encode, "
-            f"{len(recovered['up'])} to (re)upload/finalize."
+            f"{len(recovered['up'])} to (re)upload/finalize, "
+            f"{len(recovered['held'])} held (paused playlist -- will resume when unpaused)."
         )
     # --- END CRASH RECOVERY ---
 
-    setup_router(app, db, dl_q, enc_q, up_q)
-
     async with app:
         log.info("VK Playlist Bot Online via MTProto.")
-        asyncio.create_task(playlist_drip_feed_loop(db, dl_q))
-        asyncio.create_task(worker_pipeline(db, dl_q, enc_q, up_q, app))
+        dl_pool, enc_pool, up_pool = await worker_pipeline(db, dl_q, enc_q, up_q, app)
+        setup_router(app, db, dl_q, enc_q, up_q, dl_pool, enc_pool, up_pool)
+        asyncio.create_task(playlist_drip_feed_loop(db, dl_q, enc_q, up_q, dl_pool, enc_pool, up_pool))
         asyncio.create_task(terminal_loop(db, dl_q, enc_q, up_q))
         asyncio.create_task(dashboard_refresher(app, db))
 
         if OWNER_ID:
             global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid
+            global _stack_msg_id, _stack_chat_id
             text, kb = await render_dashboard(db, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid)
             m = await app.send_message(OWNER_ID, text, reply_markup=kb)
             _dash_msg_id, _dash_chat_id = m.id, m.chat.id
+
+            stack_msg = await app.send_message(OWNER_ID, render_stack_card(await db.get_active_jobs()))
+            _stack_msg_id, _stack_chat_id = stack_msg.id, stack_msg.chat.id
 
             try:
                 await app.unpin_all_chat_messages(m.chat.id)
