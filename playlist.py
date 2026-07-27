@@ -60,7 +60,15 @@ except Exception as e:
 # TELEGRAM CLIENTS
 # ============================================================
 bot_app = Client("bot_session", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.VK_BOT)
-user_app = Client("user_session", api_id=config.API_ID, api_hash=config.API_HASH)
+
+# SPEED UPGRADE: Increase max_concurrent_transmissions and internal workers
+user_app = Client(
+    "user_session",
+    api_id=config.API_ID,
+    api_hash=config.API_HASH,
+    max_concurrent_transmissions=DL_WORKERS,
+    workers=10
+)
 
 # ============================================================
 # PERSISTENCE LAYER (SQLite, WAL, crash-safe)
@@ -70,7 +78,6 @@ def _connect():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
-
 
 def _init_db():
     conn = _connect()
@@ -86,6 +93,7 @@ def _init_db():
             idx INTEGER,
             status TEXT,
             file_path TEXT,
+            caption TEXT,
             updated_at REAL
         )
     """)
@@ -98,9 +106,7 @@ def _init_db():
     conn.commit()
     conn.close()
 
-
 _init_db()
-
 
 def _db_execute(query, params=(), fetch=None):
     conn = _connect()
@@ -116,24 +122,21 @@ def _db_execute(query, params=(), fetch=None):
     finally:
         conn.close()
 
-
 async def db_execute(query, params=(), fetch=None):
-    # Offloaded to a thread so SQLite I/O never blocks the event loop.
     return await asyncio.to_thread(_db_execute, query, params, fetch)
-
 
 async def save_job(job):
     await db_execute(
         """INSERT INTO jobs (job_id, chat_id, msg_chat_id, msg_id, album_id, album_name,
-                              query, idx, status, file_path, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                              query, idx, status, file_path, caption, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(job_id) DO UPDATE SET status=excluded.status,
                                               file_path=excluded.file_path,
                                               updated_at=excluded.updated_at""",
         (job['job_id'], job['chat_id'], job['msg_chat_id'], job['msg_id'], job['album_id'],
-         job['album_name'], job['query'], job['idx'], job['status'], job.get('file_path'), time.time())
+         job['album_name'], job['query'], job['idx'], job['status'], job.get('file_path'),
+         job.get('caption', ''), time.time())
     )
-
 
 async def update_job_status(job_id, status, file_path=None):
     if file_path is not None:
@@ -143,18 +146,15 @@ async def update_job_status(job_id, status, file_path=None):
         await db_execute("UPDATE jobs SET status=?, updated_at=? WHERE job_id=?",
                           (status, time.time(), job_id))
 
-
 async def delete_job(job_id):
     await db_execute("DELETE FROM jobs WHERE job_id=?", (job_id,))
 
-
 async def get_incomplete_jobs():
     return await db_execute(
-        """SELECT job_id, chat_id, msg_chat_id, msg_id, album_id, album_name, query, idx, status, file_path
+        """SELECT job_id, chat_id, msg_chat_id, msg_id, album_id, album_name, query, idx, status, file_path, caption
            FROM jobs WHERE status != 'done'""",
         fetch="all"
     )
-
 
 async def set_control(key, value):
     await db_execute(
@@ -162,27 +162,30 @@ async def set_control(key, value):
         (key, str(value))
     )
 
-
 async def get_control(key, default=None):
     row = await db_execute("SELECT value FROM control WHERE key=?", (key,), fetch="one")
     return row[0] if row else default
 
+async def is_msg_in_db(msg_chat_id, msg_id):
+    """DEDUPLICATION: Checks if a Telegram message ID is already in the database."""
+    row = await db_execute(
+        "SELECT status FROM jobs WHERE msg_chat_id=? AND msg_id=?", 
+        (msg_chat_id, msg_id), fetch="one"
+    )
+    return bool(row)
 
 # ============================================================
 # GLOBAL STATE
 # ============================================================
-download_queue = asyncio.Queue()                       # job descriptors only (cheap, no files)
-upload_queue = asyncio.Queue(maxsize=MAX_STAGED_FILES)  # bounded -> caps files staged on disk
+download_queue = asyncio.Queue()                       
+upload_queue = asyncio.Queue(maxsize=MAX_STAGED_FILES) 
 active_jobs = {}
 user_states = {}
 dashboard_msg = None
 is_queue_paused = False
 
-# Set = "go ahead and start new downloads". Cleared = "pause: stop starting new ones".
-# Upload workers never wait on this — anything already downloaded still gets uploaded.
 pause_event = asyncio.Event()
 pause_event.set()
-
 
 class ProgressFileReader:
     """Custom file reader that tracks upload progress for aiohttp."""
@@ -201,14 +204,11 @@ class ProgressFileReader:
     def close(self):
         self.f.close()
 
-
 def update_metrics(job_id, rich_task_id, action, current, total):
-    if total == 0:
-        return
+    if total == 0: return
     percent = (current / total) * 100
     job = active_jobs.get(job_id)
-    if not job:
-        return
+    if not job: return
 
     now = time.time()
     elapsed = now - job['start_time']
@@ -225,11 +225,9 @@ def update_metrics(job_id, rich_task_id, action, current, total):
     job.update({'progress': percent, 'speed': speed_str, 'eta': eta_str, 'action': action})
     progress_ui.update(rich_task_id, completed=percent)
 
-
 def free_space_gb(path=DOWNLOAD_DIR):
     _, _, free = shutil.disk_usage(path)
     return free / (1024 ** 3)
-
 
 async def wait_for_disk_space():
     warned = False
@@ -239,18 +237,16 @@ async def wait_for_disk_space():
             warned = True
         await asyncio.sleep(5)
 
-
 # ============================================================
-# DOWNLOAD WORKERS (separate pool)
+# DOWNLOAD WORKERS
 # ============================================================
 async def download_worker(worker_id):
     while True:
-        # Blocks here if paused — does NOT touch anything already in flight.
         await pause_event.wait()
         job = await download_queue.get()
         rich_task = None
         try:
-            await pause_event.wait()       # re-check right before starting this job
+            await pause_event.wait()       
             await wait_for_disk_space()
 
             job_id = job['job_id']
@@ -281,8 +277,6 @@ async def download_worker(worker_id):
             if file_path:
                 job['file_path'] = file_path
                 await update_job_status(job_id, "downloaded", file_path=file_path)
-                # Blocks here if upload_queue is full -> this IS the backpressure that
-                # stops 600 videos from filling the disk before uploads catch up.
                 await upload_queue.put(job)
             else:
                 await update_job_status(job_id, "pending")
@@ -293,9 +287,8 @@ async def download_worker(worker_id):
             active_jobs.pop(job['job_id'], None)
             download_queue.task_done()
 
-
 # ============================================================
-# UPLOAD WORKERS (separate pool — always runs, ignores pause)
+# UPLOAD WORKERS
 # ============================================================
 async def upload_worker(worker_id):
     async with aiohttp.ClientSession() as session:
@@ -320,10 +313,11 @@ async def upload_worker(worker_id):
                 rich_task = progress_ui.add_task(f"[magenta]📤 UP {display_name}", total=100, name=display_name)
                 await update_job_status(job_id, "uploading")
 
+                # CAPTION UPGRADE: Pass the saved Telegram caption to VK
                 upload_info = await asyncio.to_thread(
                     vk.video.save,
                     name=f"{job['album_name']} - Part {job['idx']}",
-                    description=f"Imported from Telegram ({job['query']})",
+                    description=job.get('caption', f"Imported from Telegram ({job['query']})"),
                     album_id=job['album_id']
                 )
 
@@ -338,12 +332,13 @@ async def upload_worker(worker_id):
                 reader.close()
 
                 await update_job_status(job_id, "done")
-                await delete_job(job_id)
+                # DEDUPLICATION UPGRADE: We no longer delete the job from the DB. 
+                # This ensures `is_msg_in_db` remembers it forever.
                 delete_file_on_exit = True
 
             except Exception as e:
                 console.print(f"[bold red]UP failed {display_name}: {e}[/bold red]")
-                await update_job_status(job_id, "downloaded")  # keep file, retry upload later
+                await update_job_status(job_id, "downloaded") 
                 await upload_queue.put(job)
                 await asyncio.sleep(3)
 
@@ -358,7 +353,6 @@ async def upload_worker(worker_id):
                 active_jobs.pop(job_id, None)
                 upload_queue.task_done()
 
-
 # ============================================================
 # CRASH / REBOOT RECOVERY
 # ============================================================
@@ -366,19 +360,17 @@ async def recover_jobs():
     global is_queue_paused
     rows = await get_incomplete_jobs()
     for row in rows:
-        job_id, chat_id, msg_chat_id, msg_id, album_id, album_name, query, idx, status, file_path = row
+        job_id, chat_id, msg_chat_id, msg_id, album_id, album_name, query, idx, status, file_path, caption = row
         job = {
             'job_id': job_id, 'chat_id': chat_id, 'msg_chat_id': msg_chat_id, 'msg_id': msg_id,
             'album_id': album_id, 'album_name': album_name, 'query': query, 'idx': idx,
-            'file_path': file_path
+            'file_path': file_path, 'caption': caption
         }
         if status in ("downloaded", "uploading") and file_path and os.path.exists(file_path):
-            # Already have the file — go straight back to uploading, no re-download needed.
             await update_job_status(job_id, "downloaded")
             job['file_path'] = file_path
             await upload_queue.put(job)
         else:
-            # 'pending', interrupted 'downloading', or file went missing — clean up and redo.
             if file_path and os.path.exists(file_path):
                 try:
                     os.remove(file_path)
@@ -398,7 +390,6 @@ async def recover_jobs():
         console.print("[bold yellow]⏸️ Resuming in PAUSED state (as left before shutdown).[/bold yellow]")
     else:
         pause_event.set()
-
 
 # ============================================================
 # TELEGRAM DASHBOARD LOOP
@@ -441,7 +432,6 @@ async def dashboard_updater():
         except Exception:
             pass
 
-
 # ============================================================
 # BOT HANDLERS
 # ============================================================
@@ -468,8 +458,8 @@ async def handle_user_input(client, message):
             await message.reply_text("⚠️ Invalid numeric ID.")
             return
 
-        status_msg = await message.reply_text("🔎 Searching...")
-        found_msgs = []
+        status_msg = await message.reply_text("🔎 Searching and filtering duplicates...")
+        raw_found_msgs = []
         processed_groups = set()
 
         try:
@@ -480,27 +470,42 @@ async def handle_user_input(client, message):
                         album_msgs = await user_app.get_media_group(target_group_id, msg.id)
                         for album_msg in album_msgs:
                             if album_msg.video:
-                                found_msgs.append(album_msg)
+                                raw_found_msgs.append(album_msg)
                 else:
                     if msg.video:
-                        found_msgs.append(msg)
+                        raw_found_msgs.append(msg)
         except Exception as e:
             await status_msg.edit_text(f"❌ Error accessing group: `{e}`")
             user_states.pop(chat_id, None)
             return
 
-        if not found_msgs:
-            await status_msg.edit_text("❌ No videos found.")
+        # DEDUPLICATION UPGRADE: Filter out previously uploaded videos
+        new_msgs = []
+        skipped_count = 0
+        
+        for msg in raw_found_msgs:
+            if await is_msg_in_db(msg.chat.id, msg.id):
+                skipped_count += 1
+            else:
+                new_msgs.append(msg)
+
+        if not new_msgs:
+            await status_msg.edit_text(
+                f"❌ No *new* videos found.\n(Skipped {skipped_count} already processed).", 
+                parse_mode=ParseMode.MARKDOWN
+            )
             user_states.pop(chat_id, None)
             return
 
-        state['found_msgs'] = found_msgs
-        start_kbd = InlineKeyboardMarkup([[InlineKeyboardButton(f"🚀 Queue {len(found_msgs)} videos", callback_data="queue_transfer")]])
+        state['found_msgs'] = new_msgs
+        start_kbd = InlineKeyboardMarkup([[InlineKeyboardButton(f"🚀 Queue {len(new_msgs)} new videos", callback_data="queue_transfer")]])
         await status_msg.edit_text(
-            f"📊 **Found {len(found_msgs)} videos** for `{state['query']}`.\nPress below to add to Worker Queue.",
+            f"📊 **Search Results for** `{state['query']}`\n"
+            f"🆕 New Videos: *{len(new_msgs)}*\n"
+            f"⏭️ Skipped (Already Processed): *{skipped_count}*\n\n"
+            f"Press below to add to Worker Queue.",
             parse_mode=ParseMode.MARKDOWN, reply_markup=start_kbd
         )
-
 
 @bot_app.on_callback_query()
 async def handle_buttons(client, callback):
@@ -511,7 +516,7 @@ async def handle_buttons(client, callback):
     if data == "toggle_pause":
         is_queue_paused = not is_queue_paused
         if is_queue_paused:
-            pause_event.clear()   # DL workers stop pulling NEW jobs; in-flight ones finish & upload
+            pause_event.clear()   
         else:
             pause_event.set()
         await set_control("paused", "1" if is_queue_paused else "0")
@@ -544,11 +549,14 @@ async def handle_buttons(client, callback):
             return await callback.message.edit_text("❌ Failed to create VK Album.")
 
         for idx, msg in enumerate(state['found_msgs'], start=1):
+            # CAPTION UPGRADE: Capture the Telegram caption
+            caption_text = msg.caption if msg.caption else f"Imported from Telegram ({state['query']})"
+
             job_id = f"{chat_id}_{album_name}_{msg.id}_{idx}"
             job = {
                 'job_id': job_id, 'chat_id': chat_id, 'msg_chat_id': msg.chat.id, 'msg_id': msg.id,
                 'album_id': target_album_id, 'album_name': album_name, 'query': state['query'],
-                'idx': idx, 'status': 'pending', 'file_path': None
+                'idx': idx, 'status': 'pending', 'file_path': None, 'caption': caption_text
             }
             await save_job(job)
             await download_queue.put(job)
@@ -559,11 +567,9 @@ async def handle_buttons(client, callback):
         if not dashboard_msg:
             dashboard_msg = await client.send_message(chat_id, "⚙️ Initializing Dashboard...")
 
-
 @bot_app.on_message(filters.command("start"))
 async def start_cmd(client, message):
     await message.reply_text("👋 **Advanced Queue Bot**\nSend a hashtag to start.", parse_mode=ParseMode.MARKDOWN)
-
 
 # ============================================================
 # MAIN
@@ -572,7 +578,6 @@ async def main():
     await user_app.start()
     await bot_app.start()
 
-    # Rebuild queues from disk BEFORE workers start, so nothing races the recovery pass.
     await recover_jobs()
 
     asyncio.create_task(dashboard_updater())
