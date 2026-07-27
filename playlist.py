@@ -292,114 +292,73 @@ async def upload_worker(worker_id):
 # ============================================================
 # DASHBOARD RENDERING ENGINE (Tabs & Buttons)
 # ============================================================
+async def render_dashboard():
+    """Builds and instantly edits the pinned message."""
+    chat_id = await get_control("dashboard_chat_id")
+    msg_id = await get_control("dashboard_msg_id")
+    if not chat_id or not msg_id: return
+    
+    queued_dl = download_queue.qsize()
+    staged_up = upload_queue.qsize()
+    active_dls = [j for j in active_jobs.values() if j['action'] == "📥 DL"]
+    active_ups = [j for j in active_jobs.values() if j['action'] == "📤 UP"]
+
+    text = ""
+    buttons = []
+
+    if ui_state == "MAIN":
+        state_emoji = "⏸️ PAUSED" if is_queue_paused else "⚡ RUNNING"
+        text = (f"📊 **GLOBAL TRANSFER ENGINE**\n{state_emoji} | 💾 Free Disk: {free_space_gb():.1f} GB\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📥 **Downloading:** {len(active_dls)} Active | {queued_dl} Queued\n"
+                f"📦 **Staged on Disk:** {staged_up} Files\n"
+                f"📤 **Uploading:** {len(active_ups)} Active\n"
+                f"━━━━━━━━━━━━━━━━━━\n")
+        
+        buttons.append([
+            InlineKeyboardButton(f"📥 View DLs ({len(active_dls)})", callback_data="ui_DL_VIEW"),
+            InlineKeyboardButton(f"📤 View UPs ({len(active_ups)})", callback_data="ui_UP_VIEW")
+        ])
+        buttons.append([
+            InlineKeyboardButton("▶️ Resume" if is_queue_paused else "⏸️ Pause", callback_data="toggle_pause"),
+            InlineKeyboardButton("🛑 Clear All Pendings", callback_data="clear_queue")
+        ])
+
+    elif ui_state in ["DL_VIEW", "UP_VIEW"]:
+        target_list = active_dls if ui_state == "DL_VIEW" else active_ups
+        icon = "📥 DOWNLOADING" if ui_state == "DL_VIEW" else "📤 UPLOADING"
+        text = f"{icon} **({len(target_list)} Active Workers)**\n━━━━━━━━━━━━━━━━━━\n"
+        
+        for job in target_list:
+            filled = int(job['progress'] / 10)
+            bar = "🟩" * filled + "⬜" * (10 - filled)
+            text += f"▶️ **{job['name']}**\n↳ {bar} {job['progress']:.1f}% ({job['speed']})\n\n"
+            # Add individual kill switch
+            buttons.append([InlineKeyboardButton(f"💀 Kill {job['name']}", callback_data=f"kill_{job['job_id']}")])
+
+        if not target_list: text += "No active jobs in this category.\n"
+        buttons.append([InlineKeyboardButton("🔙 Back to Main", callback_data="ui_MAIN")])
+
+    try:
+        await bot_app.edit_message_text(
+            chat_id=int(chat_id), 
+            message_id=int(msg_id), 
+            text=text, 
+            parse_mode=ParseMode.MARKDOWN, 
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    except Exception:
+        pass # Ignore message not modified errors
+
 async def dashboard_updater():
+    """Background loop that passively updates the progress bars."""
     while True:
         await asyncio.sleep(4)
-        chat_id = await get_control("dashboard_chat_id")
-        msg_id = await get_control("dashboard_msg_id")
-        if not chat_id or not msg_id: continue
-        
-        queued_dl = download_queue.qsize()
-        staged_up = upload_queue.qsize()
-        active_dls = [j for j in active_jobs.values() if j['action'] == "📥 DL"]
-        active_ups = [j for j in active_jobs.values() if j['action'] == "📤 UP"]
-
-        text = ""
-        buttons = []
-
-        if ui_state == "MAIN":
-            state_emoji = "⏸️ PAUSED" if is_queue_paused else "⚡ RUNNING"
-            text = (f"📊 **GLOBAL TRANSFER ENGINE**\n{state_emoji} | 💾 Free Disk: {free_space_gb():.1f} GB\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📥 **Downloading:** {len(active_dls)} Active | {queued_dl} Queued\n"
-                    f"📦 **Staged on Disk:** {staged_up} Files\n"
-                    f"📤 **Uploading:** {len(active_ups)} Active\n"
-                    f"━━━━━━━━━━━━━━━━━━\n")
-            
-            buttons.append([
-                InlineKeyboardButton(f"📥 View DLs ({len(active_dls)})", callback_data="ui_DL_VIEW"),
-                InlineKeyboardButton(f"📤 View UPs ({len(active_ups)})", callback_data="ui_UP_VIEW")
-            ])
-            buttons.append([
-                InlineKeyboardButton("▶️ Resume" if is_queue_paused else "⏸️ Pause", callback_data="toggle_pause"),
-                InlineKeyboardButton("🛑 Clear All Pendings", callback_data="clear_queue")
-            ])
-
-        elif ui_state in ["DL_VIEW", "UP_VIEW"]:
-            target_list = active_dls if ui_state == "DL_VIEW" else active_ups
-            icon = "📥 DOWNLOADING" if ui_state == "DL_VIEW" else "📤 UPLOADING"
-            text = f"{icon} **({len(target_list)} Active Workers)**\n━━━━━━━━━━━━━━━━━━\n"
-            
-            for job in target_list:
-                filled = int(job['progress'] / 10)
-                bar = "🟩" * filled + "⬜" * (10 - filled)
-                text += f"▶️ **{job['name']}**\n↳ {bar} {job['progress']:.1f}% ({job['speed']})\n\n"
-                # Add individual kill switch
-                buttons.append([InlineKeyboardButton(f"💀 Kill {job['name']}", callback_data=f"kill_{job['job_id']}")])
-
-            if not target_list: text += "No active jobs in this category.\n"
-            buttons.append([InlineKeyboardButton("🔙 Back to Main", callback_data="ui_MAIN")])
-
-        try:
-            await bot_app.edit_message_text(chat_id=int(chat_id), message_id=int(msg_id), text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
-        except Exception:
-            pass # Ignore message not modified errors
+        await render_dashboard()
 
 # ============================================================
 # BOT HANDLERS & CALLBACKS
 # ============================================================
-@bot_app.on_message(filters.command("start"))
-async def start_cmd(client, message):
-    msg = await message.reply_text("⚙️ Booting Global Dashboard...\n(Pinning message...)")
-    try: await msg.pin(both_sides=True)
-    except: pass
-    await set_control("dashboard_chat_id", message.chat.id)
-    await set_control("dashboard_msg_id", msg.id)
-    await message.reply_text("👋 Dashboard Ready! Send a hashtag to start.")
-
-@bot_app.on_message(filters.private & filters.text & ~filters.command(["start", "help"]))
-async def handle_user_input(client, message):
-    chat_id = message.chat.id
-    state = user_states.get(chat_id, {})
-
-    if not state.get('awaiting_group'):
-        search_query = message.text.strip()
-        search_query = search_query if search_query.startswith("#") else f"#{search_query}"
-        user_states[chat_id] = {'query': search_query, 'album_name': search_query.replace("#", ""), 'awaiting_group': True}
-        return await message.reply_text(f"🔍 Search: *{search_query}*\n📌 Send the **Group Chat ID**.", parse_mode=ParseMode.MARKDOWN)
-
-    try: target_group_id = int(message.text.strip())
-    except: return await message.reply_text("⚠️ Invalid numeric ID.")
-
-    status_msg = await message.reply_text("🔎 Searching and filtering duplicates...")
-    raw_found, processed_groups = [], set()
-
-    try:
-        async for msg in user_app.search_messages(chat_id=target_group_id, query=state['query']):
-            if msg.media_group_id:
-                if msg.media_group_id not in processed_groups:
-                    processed_groups.add(msg.media_group_id)
-                    album_msgs = await user_app.get_media_group(target_group_id, msg.id)
-                    for am in album_msgs:
-                        if am.video: raw_found.append(am)
-            elif msg.video: raw_found.append(msg)
-    except Exception as e:
-        user_states.pop(chat_id, None)
-        return await status_msg.edit_text(f"❌ Error accessing group: `{e}`")
-
-    new_msgs, skipped_count = [], 0
-    for msg in raw_found:
-        if await is_msg_in_db(msg.chat.id, msg.id): skipped_count += 1
-        else: new_msgs.append(msg)
-
-    if not new_msgs:
-        user_states.pop(chat_id, None)
-        return await status_msg.edit_text(f"❌ No *new* videos found.\n(Skipped {skipped_count} already processed).", parse_mode=ParseMode.MARKDOWN)
-
-    state['found_msgs'] = new_msgs
-    kbd = InlineKeyboardMarkup([[InlineKeyboardButton(f"🚀 Queue {len(new_msgs)} videos", callback_data="queue_transfer")]])
-    await status_msg.edit_text(f"📊 **Found** `{state['query']}`\n🆕 New: *{len(new_msgs)}* | ⏭️ Skipped: *{skipped_count}*", parse_mode=ParseMode.MARKDOWN, reply_markup=kbd)
-
 @bot_app.on_callback_query()
 async def handle_buttons(client, callback):
     global is_queue_paused, ui_state
@@ -408,6 +367,7 @@ async def handle_buttons(client, callback):
 
     if data.startswith("ui_"):
         ui_state = data.replace("ui_", "")
+        await render_dashboard() # INSTANTLY redraw the UI when clicked
         return await callback.answer()
 
     elif data.startswith("kill_"):
@@ -415,12 +375,14 @@ async def handle_buttons(client, callback):
         cancelled_jobs.add(job_id)
         await update_job_status(job_id, "cancelled")
         await callback.answer("💀 Poison pill dropped. Job aborting...", show_alert=True)
+        await render_dashboard() # Update UI instantly to remove the killed job
 
     elif data == "toggle_pause":
         is_queue_paused = not is_queue_paused
         if is_queue_paused: pause_event.clear()   
         else: pause_event.set()
         await set_control("paused", "1" if is_queue_paused else "0")
+        await render_dashboard()
         await callback.answer(f"Queue {'Paused' if is_queue_paused else 'Resumed'}")
 
     elif data == "clear_queue":
@@ -430,6 +392,7 @@ async def handle_buttons(client, callback):
             download_queue.task_done()
             await update_job_status(job['job_id'], "cancelled")
             cleared += 1
+        await render_dashboard()
         await callback.answer(f"Cleared {cleared} pending downloads.", show_alert=True)
 
     elif data == "queue_transfer":
@@ -449,16 +412,18 @@ async def handle_buttons(client, callback):
             return await callback.message.edit_text("❌ Failed to resolve VK Album.")
 
         for idx, msg in enumerate(state['found_msgs'], start=1):
-            job_id = f"{msg.chat.id}_{msg.id}" # Shortened to respect 64-byte limit
+            job_id = f"{msg.chat.id}_{msg.id}" 
             job = {'job_id': job_id, 'chat_id': chat_id, 'msg_chat_id': msg.chat.id, 'msg_id': msg.id, 'album_id': target_album_id, 'album_name': album_name, 'query': state['query'], 'idx': idx, 'status': 'pending', 'file_path': None, 'caption': msg.caption if msg.caption else f"Imported from Telegram ({state['query']})"}
             await save_job(job)
             await download_queue.put(job)
-            cancelled_jobs.discard(job_id) # Remove from poison pill tracker if requeued
+            cancelled_jobs.discard(job_id)
 
         user_states.pop(chat_id, None)
         await callback.message.delete()
         if not await get_control("dashboard_msg_id"):
-            await start_cmd(client, callback.message) # Fallback if dashboard doesn't exist
+            await start_cmd(client, callback.message)
+        else:
+            await render_dashboard() # Instantly show the new numbers in the dashboard
 
 # ============================================================
 # STARTUP
