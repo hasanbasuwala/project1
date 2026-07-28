@@ -235,6 +235,13 @@ def free_space_gb(path=DOWNLOAD_DIR):
 def vk_title_for(album_name, idx):
     return f"{album_name} - P{idx}"
 
+def display_title(album_name, idx, caption):
+    """The actual VK video title/name. Prefers the parsed caption
+    (e.g. 'My Friend 2') and only falls back to the generic
+    'Album - P<idx>' form when no caption was parsed."""
+    caption = (caption or "").strip()
+    return caption if caption else vk_title_for(album_name, idx)
+
 async def refresh_vk_cache(album_id):
     try:
         items = await asyncio.to_thread(vk.video.get, owner_id=my_vk_id, album_id=album_id, count=200)
@@ -498,7 +505,7 @@ async def upload_worker(worker_id):
                 rich_task = progress_ui.add_task(f"[magenta]📤 UP {display_name}", total=100, name=display_name)
                 await update_job_status(job_id, "uploading")
 
-                title = vk_title_for(job['album_name'], job['idx'])
+                title = display_title(job['album_name'], job['idx'], job.get('caption', ''))
                 upload_info = await asyncio.to_thread(vk.video.save, name=title, description=job.get('caption', ''), album_id=job['album_id'])
 
                 def up_progress(current, total):
@@ -514,7 +521,7 @@ async def upload_worker(worker_id):
                 reader.close()
 
                 vk_video_title_cache.setdefault(job['album_id'], set()).add(title)
-                await update_job_status(job_id, "done")
+                await update_job_status(job_id, "done")  # title/name = display_title(...)
                 delete_file_on_exit = True
                 await on_job_finished(job)
 
@@ -857,7 +864,8 @@ async def handle_buttons(client, callback):
         non_dupe_msgs, skipped_dupes = [], 0
         for msg in state['found_msgs']:
             idx = getattr(msg, '_relative_idx', 1)
-            title = vk_title_for(album_name, idx)
+            caption = getattr(msg, '_custom_caption', "")
+            title = display_title(album_name, idx, caption)
             if await vk_title_exists(album_id, title):
                 skipped_dupes += 1
             else:
