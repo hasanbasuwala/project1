@@ -1,4 +1,5 @@
 import os
+import io
 import time
 import shutil
 import sqlite3
@@ -31,25 +32,7 @@ DOWNLOAD_DIR = "SysCache/vk_downloads"
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# ---- Persistent logging ----
-import logging
-LOG_DIR = "SysCache/logs"
-os.makedirs(LOG_DIR, exist_ok=True)
-LOG_FILE = os.path.join(LOG_DIR, "vk_bot.log")
-
-_file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
-_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
-file_logger = logging.getLogger("vk_bot")
-file_logger.setLevel(logging.INFO)
-file_logger.addHandler(_file_handler)
-file_logger.propagate = False
-
 console = Console()
-
-def log(plain_msg, rich_msg=None, level="info"):
-    console.print(rich_msg if rich_msg is not None else plain_msg)
-    getattr(file_logger, level, file_logger.info)(plain_msg)
-
 progress_ui = Progress(
     TextColumn("[bold blue]{task.fields[name]}", justify="right"),
     BarColumn(bar_width=None),
@@ -68,7 +51,7 @@ try:
     my_vk_id = vk_session.method('users.get')[0]['id']
     console.print(f"[bold green]✅ VK Connected: {my_vk_id}[/bold green]")
 except Exception as e:
-    log(f"Failed to connect to VK: {e}", f"[bold red]❌ Failed to connect to VK: {e}[/bold red]", level="error")
+    console.print(f"[bold red]❌ Failed to connect to VK: {e}[/bold red]")
     exit(1)
 
 bot_app = Client("bot_session", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.VK_BOT)
@@ -154,8 +137,6 @@ download_queue = asyncio.Queue()
 upload_queue = asyncio.Queue(maxsize=MAX_STAGED_FILES)
 active_jobs = {}
 cancelled_jobs = set() 
-upload_attempts = {}
-MAX_UPLOAD_ATTEMPTS = 3
 user_states = {}
 is_queue_paused = False
 ui_state = "MAIN" 
@@ -167,24 +148,30 @@ def free_space_gb(path=DOWNLOAD_DIR):
     _, _, free = shutil.disk_usage(path)
     return free / (1024 ** 3)
 
-import io
-
-class ProgressFileReader(io.RawIOBase):
+class ProgressFileReader(io.IOBase):
     def __init__(self, filename, callback):
         self.f = open(filename, 'rb')
         self.callback = callback
         self.total = os.path.getsize(filename)
         self.read_bytes = 0
-    def readable(self):
-        return True
+
     def read(self, size=-1):
         chunk = self.f.read(size)
         self.read_bytes += len(chunk)
         self.callback(self.read_bytes, self.total)
         return chunk
+
     def close(self):
         self.f.close()
-        super().close()
+
+    def tell(self):
+        return self.f.tell()
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        return self.f.seek(offset, whence)
+
+    def fileno(self):
+        return self.f.fileno()
 
 def update_metrics(task_key, rich_task_id, action, current, total):
     if total == 0: return
@@ -202,14 +189,34 @@ def update_metrics(task_key, rich_task_id, action, current, total):
     })
     progress_ui.update(rich_task_id, completed=percent)
 
-def build_video_title(job):
-    caption = (job.get('caption') or '').strip()
-    if caption and not caption.startswith("Imported from Telegram"):
-        title = caption.splitlines()[0].strip()
-        if len(title) > 100:
-            title = title[:97] + "..."
-        return title or f"{job['album_name']} - P{job['idx']}"
-    return f"{job['album_name']} - P{job['idx']}"
+# ============================================================
+# ASYNC NATIVE FAST DOWNLOADER
+# ============================================================
+async def async_fast_download(client, message, file_path, progress_callback, job_id):
+    """
+    Async-native high-speed downloader.
+    Streams network chunks asynchronously and offloads disk writes to a thread pool 
+    to prevent blocking the asyncio event loop on slow Termux storage.
+    """
+    file_size = message.video.file_size
+    downloaded = 0
+    
+    def write_chunk(chunk, f):
+        f.write(chunk)
+        
+    with open(file_path, "wb") as f:
+        async for chunk in client.stream_media(message):
+            if job_id in cancelled_jobs:
+                raise Exception("ForceAbort")
+            
+            # Non-blocking disk I/O
+            await asyncio.to_thread(write_chunk, chunk, f)
+            downloaded += len(chunk)
+            
+            # Update metrics
+            progress_callback(downloaded, file_size)
+            
+    return file_path
 
 # ============================================================
 # WORKERS
@@ -237,22 +244,21 @@ async def download_worker(worker_id):
             await update_job_status(job_id, "downloading")
 
             def dl_progress(current, total):
-                if job_id in cancelled_jobs: raise Exception("ForceAbort")
                 update_metrics(dl_key, rich_task, "📥 DL", current, total)
 
             msg = await user_app.get_messages(job['msg_chat_id'], job['msg_id'])
-            expected_size = getattr(msg.video, "file_size", None)
-            file_path = await user_app.download_media(msg.video, file_name=os.path.join(DOWNLOAD_DIR, ""), progress=dl_progress)
+            target_file_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp4")
 
-            if file_path and expected_size and os.path.getsize(file_path) != expected_size:
-                actual_size = os.path.getsize(file_path)
-                log(f"DL size mismatch {display_name}: got {actual_size} bytes, expected {expected_size}. Discarding and retrying.",
-                    f"[bold red]⚠️ DL incomplete for {display_name} ({actual_size}/{expected_size} bytes). Retrying.[/bold red]", level="warning")
-                try: os.remove(file_path)
-                except OSError: pass
-                file_path = None
-                await update_job_status(job_id, "pending")
-            elif file_path:
+            # Executing our integrated high-speed downloader
+            file_path = await async_fast_download(
+                client=user_app, 
+                message=msg, 
+                file_path=target_file_path, 
+                progress_callback=dl_progress, 
+                job_id=job_id
+            )
+
+            if file_path and os.path.exists(file_path):
                 job['file_path'] = file_path
                 await update_job_status(job_id, "downloaded", file_path=file_path)
                 await upload_queue.put(job)
@@ -261,23 +267,22 @@ async def download_worker(worker_id):
 
         except Exception as e:
             if str(e) == "ForceAbort":
-                log(f"Aborted DL: {display_name}", f"[bold yellow]💀 Aborted DL: {display_name}[/bold yellow]", level="warning")
+                console.print(f"[bold yellow]💀 Aborted DL: {display_name}[/bold yellow]")
                 delete_file_on_exit = True
             else:
-                log(f"DL failed {display_name}: {e}", f"[bold red]DL failed {display_name}: {e}[/bold red]", level="error")
+                console.print(f"[bold red]DL failed {display_name}: {e}[/bold red]")
                 await update_job_status(job_id, "pending")
         finally:
             if delete_file_on_exit and file_path and os.path.exists(file_path):
                 try: os.remove(file_path)
-                except OSError: pass
+                except: pass
             if rich_task is not None: progress_ui.remove_task(rich_task)
             active_jobs.pop(dl_key, None)
             download_queue.task_done()
 
 async def upload_worker(worker_id):
-    # Added 1-hour timeout to prevent 500 Server Errors on large files
-    timeout = aiohttp.ClientTimeout(total=3600)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    # Disabled timeout to handle 3GB+ files gracefully
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as session:
         while True:
             job = await upload_queue.get()
             job_id = job['job_id']
@@ -301,67 +306,45 @@ async def upload_worker(worker_id):
                 rich_task = progress_ui.add_task(f"[magenta]📤 UP {display_name}", total=100, name=display_name)
                 await update_job_status(job_id, "uploading")
 
-                upload_info = await asyncio.to_thread(
-                    vk.video.save,
-                    name=build_video_title(job),
-                    description=job.get('caption', ''),
-                    album_id=job['album_id']
-                )
+                upload_info = await asyncio.to_thread(vk.video.save, name=f"{job['album_name']} - P{job['idx']}", description=job.get('caption', ''), album_id=job['album_id'])
 
                 def up_progress(current, total):
                     if job_id in cancelled_jobs: raise Exception("ForceAbort")
                     update_metrics(up_key, rich_task, "📤 UP", current, total)
 
                 reader = ProgressFileReader(file_path, up_progress)
-                file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
                 data = aiohttp.FormData()
                 data.add_field('video_file', reader, filename=os.path.basename(file_path))
                 
                 async with session.post(upload_info['upload_url'], data=data) as resp:
-                    body_text = await resp.text()
-                    try:
-                        upload_result = await resp.json(content_type=None)
-                    except Exception:
-                        raise Exception(f"Upload endpoint returned non-JSON (status {resp.status}, {file_size_mb:.1f}MB file): {body_text[:300]}")
-                    if resp.status != 200 or ('error' in upload_result if isinstance(upload_result, dict) else False):
-                        raise Exception(f"Upload endpoint error (status {resp.status}): {upload_result}")
+                    await resp.json()
                 reader.close()
 
                 await update_job_status(job_id, "done")
-                upload_attempts.pop(job_id, None)
                 delete_file_on_exit = True
 
             except Exception as e:
                 if str(e) == "ForceAbort":
-                    log(f"Aborted UP: {display_name}", f"[bold yellow]💀 Aborted UP: {display_name}[/bold yellow]", level="warning")
-                    upload_attempts.pop(job_id, None)
+                    console.print(f"[bold yellow]💀 Aborted UP: {display_name}[/bold yellow]")
                     delete_file_on_exit = True
                 else:
-                    log(f"UP failed {display_name}: {e}", f"[bold red]UP failed {display_name}: {e}[/bold red]", level="error")
-                    upload_attempts[job_id] = upload_attempts.get(job_id, 0) + 1
-
-                    if upload_attempts[job_id] >= MAX_UPLOAD_ATTEMPTS:
-                        log(f"{display_name} failed upload {MAX_UPLOAD_ATTEMPTS}x in a row — discarding file and re-downloading from scratch.", f"[bold red]🔁 {display_name}: {MAX_UPLOAD_ATTEMPTS} upload failures. Forcing fresh re-download.[/bold red]", level="error")
-                        upload_attempts.pop(job_id, None)
-                        delete_file_on_exit = True
-                        await update_job_status(job_id, "pending", file_path=None)
-                        await download_queue.put(job)
-                    else:
-                        await update_job_status(job_id, "downloaded")
-                        await upload_queue.put(job)
+                    console.print(f"[bold red]UP failed {display_name}: {e}[/bold red]")
+                    await update_job_status(job_id, "downloaded") 
+                    await upload_queue.put(job)
                     await asyncio.sleep(3)
             finally:
                 if delete_file_on_exit and file_path and os.path.exists(file_path):
                     try: os.remove(file_path)
-                    except OSError: pass
+                    except: pass
                 if rich_task is not None: progress_ui.remove_task(rich_task)
                 active_jobs.pop(up_key, None)
                 upload_queue.task_done()
 
 # ============================================================
-# DASHBOARD RENDERING ENGINE 
+# DASHBOARD RENDERING ENGINE (Tabs & Buttons)
 # ============================================================
 async def render_dashboard():
+    """Builds and instantly edits the pinned message."""
     chat_id = await get_control("dashboard_chat_id")
     msg_id = await get_control("dashboard_msg_id")
     if not chat_id or not msg_id: return
@@ -373,11 +356,6 @@ async def render_dashboard():
 
     text = ""
     buttons = []
-    global_row = [
-        InlineKeyboardButton("▶️ Resume" if is_queue_paused else "⏸️ Pause", callback_data="toggle_pause"),
-        InlineKeyboardButton("💀 Kill Active", callback_data="kill_all"),
-        InlineKeyboardButton("🔄 Refresh", callback_data="refresh"),
-    ]
 
     if ui_state == "MAIN":
         state_emoji = "⏸️ PAUSED" if is_queue_paused else "⚡ RUNNING"
@@ -392,8 +370,10 @@ async def render_dashboard():
             InlineKeyboardButton(f"📥 View DLs ({len(active_dls)})", callback_data="ui_DL_VIEW"),
             InlineKeyboardButton(f"📤 View UPs ({len(active_ups)})", callback_data="ui_UP_VIEW")
         ])
-        buttons.append(global_row)
-        buttons.append([InlineKeyboardButton("🛑 Clear All Pendings", callback_data="clear_queue")])
+        buttons.append([
+            InlineKeyboardButton("▶️ Resume" if is_queue_paused else "⏸️ Pause", callback_data="toggle_pause"),
+            InlineKeyboardButton("🛑 Clear All Pendings", callback_data="clear_queue")
+        ])
 
     elif ui_state in ["DL_VIEW", "UP_VIEW"]:
         target_list = active_dls if ui_state == "DL_VIEW" else active_ups
@@ -407,18 +387,21 @@ async def render_dashboard():
             buttons.append([InlineKeyboardButton(f"💀 Kill {job['name']}", callback_data=f"kill_{job['job_id']}")])
 
         if not target_list: text += "No active jobs in this category.\n"
-        buttons.append(global_row)
         buttons.append([InlineKeyboardButton("🔙 Back to Main", callback_data="ui_MAIN")])
 
     try:
         await bot_app.edit_message_text(
-            chat_id=int(chat_id), message_id=int(msg_id), text=text, 
-            parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons)
+            chat_id=int(chat_id), 
+            message_id=int(msg_id), 
+            text=text, 
+            parse_mode=ParseMode.MARKDOWN, 
+            reply_markup=InlineKeyboardMarkup(buttons)
         )
     except Exception:
         pass 
 
 async def dashboard_updater():
+    """Background loop that passively updates the progress bars."""
     while True:
         await asyncio.sleep(4)
         await render_dashboard()
@@ -433,32 +416,9 @@ async def start_cmd(client, message):
     except: pass
     await set_control("dashboard_chat_id", message.chat.id)
     await set_control("dashboard_msg_id", msg.id)
-    await message.reply_text("👋 Dashboard Ready! Send a hashtag to start, or use /kill #SearchQuery.")
+    await message.reply_text("👋 Dashboard Ready! Send a hashtag to start.")
 
-@bot_app.on_message(filters.command("kill"))
-async def kill_query_cmd(client, message):
-    if len(message.command) < 2:
-        return await message.reply_text("⚠️ Usage: `/kill #SearchQuery`")
-    
-    target_query = " ".join(message.command[1:]).strip()
-    target_query = target_query if target_query.startswith("#") else f"#{target_query}"
-    
-    rows = await db_execute("SELECT job_id FROM jobs WHERE query=? AND status != 'done' AND status != 'cancelled'", (target_query,), fetch="all")
-    
-    if not rows:
-        return await message.reply_text(f"No active or pending jobs found for `{target_query}`.")
-    
-    count = 0
-    for row in rows:
-        job_id = row[0]
-        cancelled_jobs.add(job_id)
-        await update_job_status(job_id, "cancelled")
-        count += 1
-        
-    await message.reply_text(f"💀 Killed {count} active/pending jobs for `{target_query}`.")
-    await render_dashboard()
-
-@bot_app.on_message(filters.private & filters.text & ~filters.command(["start", "help", "kill"]))
+@bot_app.on_message(filters.private & filters.text & ~filters.command(["start", "help"]))
 async def handle_user_input(client, message):
     chat_id = message.chat.id
     state = user_states.get(chat_id, {})
@@ -470,7 +430,7 @@ async def handle_user_input(client, message):
         return await message.reply_text(f"🔍 Search: *{search_query}*\n📌 Send the **Group Chat ID**.", parse_mode=ParseMode.MARKDOWN)
 
     try: target_group_id = int(message.text.strip())
-    except ValueError: return await message.reply_text("⚠️ Invalid numeric ID.")
+    except: return await message.reply_text("⚠️ Invalid numeric ID.")
 
     status_msg = await message.reply_text("🔎 Searching and filtering duplicates...")
     raw_found, processed_groups = [], set()
@@ -498,12 +458,7 @@ async def handle_user_input(client, message):
         return await status_msg.edit_text(f"❌ No *new* videos found.\n(Skipped {skipped_count} already processed).", parse_mode=ParseMode.MARKDOWN)
 
     state['found_msgs'] = new_msgs
-    state['next_idx'] = 1 
-    
-    kbd = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🧪 Test 1 Video First", callback_data="queue_test")],
-        [InlineKeyboardButton(f"🚀 Queue All {len(new_msgs)}", callback_data="queue_transfer")]
-    ])
+    kbd = InlineKeyboardMarkup([[InlineKeyboardButton(f"🚀 Queue {len(new_msgs)} videos", callback_data="queue_transfer")]])
     await status_msg.edit_text(f"📊 **Found** `{state['query']}`\n🆕 New: *{len(new_msgs)}* | ⏭️ Skipped: *{skipped_count}*", parse_mode=ParseMode.MARKDOWN, reply_markup=kbd)
 
 @bot_app.on_callback_query()
@@ -517,25 +472,12 @@ async def handle_buttons(client, callback):
         await render_dashboard() 
         return await callback.answer()
 
-    elif data.startswith("kill_") and data != "kill_all":
+    elif data.startswith("kill_"):
         job_id = data.replace("kill_", "")
         cancelled_jobs.add(job_id)
         await update_job_status(job_id, "cancelled")
         await callback.answer("💀 Poison pill dropped. Job aborting...", show_alert=True)
         await render_dashboard() 
-
-    elif data == "kill_all":
-        count = 0
-        for job in list(active_jobs.values()):
-            cancelled_jobs.add(job['job_id'])
-            await update_job_status(job['job_id'], "cancelled")
-            count += 1
-        await render_dashboard()
-        await callback.answer(f"💀 Killing {count} active job(s)...", show_alert=True)
-
-    elif data == "refresh":
-        await render_dashboard()
-        await callback.answer("🔄 Refreshed")
 
     elif data == "toggle_pause":
         is_queue_paused = not is_queue_paused
@@ -555,11 +497,10 @@ async def handle_buttons(client, callback):
         await render_dashboard()
         await callback.answer(f"Cleared {cleared} pending downloads.", show_alert=True)
 
-    elif data == "queue_test":
+    elif data == "queue_transfer":
         state = user_states.get(chat_id)
-        if not state or not state.get('found_msgs'): 
-            return await callback.answer("Expired session. Search again.")
-        await callback.answer("Queuing Test Video...")
+        if not state: return await callback.answer("Expired session.")
+        await callback.answer("Adding to queue...")
 
         album_name = state['album_name']
         target_album_id = None
@@ -569,57 +510,10 @@ async def handle_buttons(client, callback):
             if not target_album_id:
                 new_album = await asyncio.to_thread(vk.video.addAlbum, title=album_name)
                 target_album_id = new_album if isinstance(new_album, int) else new_album['album_id']
-            state['album_id'] = target_album_id 
         except Exception:
             return await callback.message.edit_text("❌ Failed to resolve VK Album.")
 
-        msg = state['found_msgs'].pop(0)
-        idx = state['next_idx']
-        state['next_idx'] += 1
-        
-        job_id = f"{msg.chat.id}_{msg.id}" 
-        job = {'job_id': job_id, 'chat_id': chat_id, 'msg_chat_id': msg.chat.id, 'msg_id': msg.id, 'album_id': target_album_id, 'album_name': album_name, 'query': state['query'], 'idx': idx, 'status': 'pending', 'file_path': None, 'caption': msg.caption if msg.caption else f"Imported from Telegram ({state['query']})"}
-        await save_job(job)
-        await download_queue.put(job)
-        cancelled_jobs.discard(job_id)
-
-        remaining = len(state['found_msgs'])
-        if remaining > 0:
-            await callback.message.edit_text(
-                f"🧪 **Test Mode Active:** Queued Part {idx}.\n"
-                f"📦 Remaining: {remaining} videos on standby.\n\n"
-                f"Check the global dashboard to watch it upload. If it succeeds, queue the rest below.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton(f"🚀 Queue Remaining ({remaining})", callback_data="queue_transfer")
-                ]])
-            )
-        else:
-            user_states.pop(chat_id, None)
-            await callback.message.delete()
-            await render_dashboard()
-
-    elif data == "queue_transfer":
-        state = user_states.get(chat_id)
-        if not state or not state.get('found_msgs'): 
-            return await callback.answer("Expired session.")
-        await callback.answer("Adding to queue...")
-
-        album_name = state['album_name']
-        target_album_id = state.get('album_id') 
-
-        if not target_album_id:
-            try:
-                existing = await asyncio.to_thread(vk.video.getAlbums, owner_id=my_vk_id, count=100)
-                target_album_id = next((alb['id'] for alb in existing['items'] if alb['title'].lower() == album_name.lower()), None)
-                if not target_album_id:
-                    new_album = await asyncio.to_thread(vk.video.addAlbum, title=album_name)
-                    target_album_id = new_album if isinstance(new_album, int) else new_album['album_id']
-            except Exception:
-                return await callback.message.edit_text("❌ Failed to resolve VK Album.")
-
-        for msg in state['found_msgs']:
-            idx = state['next_idx']
-            state['next_idx'] += 1
+        for idx, msg in enumerate(state['found_msgs'], start=1):
             job_id = f"{msg.chat.id}_{msg.id}" 
             job = {'job_id': job_id, 'chat_id': chat_id, 'msg_chat_id': msg.chat.id, 'msg_id': msg.id, 'album_id': target_album_id, 'album_name': album_name, 'query': state['query'], 'idx': idx, 'status': 'pending', 'file_path': None, 'caption': msg.caption if msg.caption else f"Imported from Telegram ({state['query']})"}
             await save_job(job)
@@ -637,7 +531,6 @@ async def handle_buttons(client, callback):
 # STARTUP
 # ============================================================
 async def main():
-    global is_queue_paused
     await user_app.start()
     await bot_app.start()
 
@@ -651,7 +544,7 @@ async def main():
             else:
                 if row[9] and os.path.exists(row[9]):
                     try: os.remove(row[9])
-                    except OSError: pass
+                    except: pass
                 await update_job_status(job['job_id'], "pending", file_path="")
                 job['file_path'] = None
                 await download_queue.put(job)
