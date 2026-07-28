@@ -559,26 +559,43 @@ async def handle_buttons(client, callback):
         if not state: return await callback.answer("Expired session.")
         await callback.answer("Adding to queue...")
 
-        album_name = state['album_name']
-        target_album_id = None
-        try:
-            existing = await asyncio.to_thread(vk.video.getAlbums, owner_id=my_vk_id, count=100)
-            target_album_id = next((alb['id'] for alb in existing['items'] if alb['title'].lower() == album_name.lower()), None)
-            if not target_album_id:
-                new_album = await asyncio.to_thread(vk.video.addAlbum, title=album_name)
-                target_album_id = new_album if isinstance(new_album, int) else new_album['album_id']
-        except Exception:
-            return await callback.message.edit_text("❌ Failed to resolve VK Album.")
+        # We cache VK albums so we don't spam the VK API if multiple videos go to the same album
+        album_cache = {} 
+        
+        for msg in state['found_msgs']:
+            # Pull the unique properties we assigned during the Search phase
+            album_name = getattr(msg, '_custom_album', state['query'].replace("#", ""))
+            caption = getattr(msg, '_custom_caption', "")
+            idx = getattr(msg, '_relative_idx', 1)
+            
+            # Resolve VK Album lazily for each video's true album name
+            if album_name not in album_cache:
+                try:
+                    existing = await asyncio.to_thread(vk.video.getAlbums, owner_id=my_vk_id, count=100)
+                    target_album_id = next((alb['id'] for alb in existing['items'] if alb['title'].lower() == album_name.lower()), None)
+                    if not target_album_id:
+                        new_album = await asyncio.to_thread(vk.video.addAlbum, title=album_name)
+                        target_album_id = new_album if isinstance(new_album, int) else new_album['album_id']
+                    album_cache[album_name] = target_album_id
+                except Exception:
+                    continue # Skip if VK API fails
 
-        for idx, msg in enumerate(state['found_msgs'], start=1):
-            job_id = f"{msg.chat.id}_{msg.id}" 
-            job = {'job_id': job_id, 'chat_id': chat_id, 'msg_chat_id': msg.chat.id, 'msg_id': msg.id, 'album_id': target_album_id, 'album_name': album_name, 'query': state['query'], 'idx': idx, 'status': 'pending', 'file_path': None, 'caption': msg.caption if msg.caption else f"Imported from Telegram ({state['query']})"}
+            job_id = f"{msg.chat.id}_{msg.id}"
+            job = {
+                'job_id': job_id, 'chat_id': chat_id, 'msg_chat_id': msg.chat.id, 
+                'msg_id': msg.id, 'album_id': album_cache.get(album_name), 'album_name': album_name, 
+                'query': state['query'], 'idx': idx, 'status': 'pending', 
+                'file_path': None, 'caption': caption
+            }
+            
             await save_job(job)
             await download_queue.put(job)
             cancelled_jobs.discard(job_id)
 
         user_states.pop(chat_id, None)
         await callback.message.delete()
+        
+        # Refresh the UI
         if not await get_control("dashboard_msg_id"):
             await start_cmd(client, callback.message)
         else:
