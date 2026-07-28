@@ -415,61 +415,104 @@ async def handle_user_input(client, message):
     if not state.get('awaiting_group'):
         search_query = message.text.strip()
         search_query = search_query if search_query.startswith("#") else f"#{search_query}"
-        user_states[chat_id] = {'query': search_query, 'album_name': search_query.replace("#", ""), 'awaiting_group': True}
+        user_states[chat_id] = {'query': search_query, 'awaiting_group': True}
         return await message.reply_text(f"🔍 Search: *{search_query}*\n📌 Send the **Group Chat ID**.", parse_mode=ParseMode.MARKDOWN)
 
-    try: target_group_id = int(message.text.strip())
-    except: return await message.reply_text("⚠️ Invalid numeric ID.")
+    try:
+        target_group_id = int(message.text.strip())
+    except ValueError:
+        return await message.reply_text("⚠️ Invalid numeric ID.")
 
-    status_msg = await message.reply_text("🔎 Searching and applying smart filters...")
+    status_msg = await message.reply_text("🔎 Scanning media group and applying Master Index logic...")
     raw_found, processed_groups = [], set()
 
     try:
-        query_lower = state['query'].lower()
         async for msg in user_app.search_messages(chat_id=target_group_id, query=state['query']):
             if msg.media_group_id:
                 if msg.media_group_id not in processed_groups:
                     processed_groups.add(msg.media_group_id)
                     album_msgs = await user_app.get_media_group(target_group_id, msg.id)
                     
-                    has_individual_captions = any(am.caption and query_lower in am.caption.lower() for am in album_msgs)
+                    # Sort to guarantee Index 1, 2, 3... order
+                    album_msgs = sorted(album_msgs, key=lambda x: x.id)
                     
-                    if has_individual_captions:
-                        for am in album_msgs:
-                            if am.video and am.caption and query_lower in am.caption.lower():
+                    # 1. Locate the Master Index (first caption starting with #)
+                    master_caption = ""
+                    for am in album_msgs:
+                        if am.caption and am.caption.strip().startswith("#"):
+                            master_caption = am.caption
+                            break
+                            
+                    # 2. Apply the Top-Down vs Inline Logic
+                    track_data = {}
+                    if master_caption:
+                        lines = [line.strip() for line in master_caption.strip().split('\n') if line.strip()]
+                        
+                        # Scenario 2: Top-Down Match (Check the very first line)
+                        is_top_match = False
+                        if lines and state['query'].lower() in lines[0].lower():
+                            is_top_match = True
+                        
+                        # Parse all subsequent lines
+                        for line in lines[1:]:
+                            match = re.match(r'^(\d+)\s*-\s*(.*)', line)
+                            if match:
+                                idx_str, rest_of_line = match.groups()
+                                
+                                # Scenario 1: Inline Match (if Top-Down failed)
+                                is_inline_match = state['query'].lower() in line.lower()
+                                
+                                # If either rule passes, extract the data
+                                if is_top_match or is_inline_match:
+                                    
+                                    # Parse Caption: Text inside () or fallback to the whole line
+                                    bracket_match = re.search(r"\(([^)]*)\)", rest_of_line)
+                                    track_caption = bracket_match.group(1).strip() if bracket_match else rest_of_line.strip()
+                                    
+                                    # Save it into a dictionary mapped by the video number (idx)
+                                    track_data[int(idx_str)] = track_caption
+
+                    # 3. Filter the actual videos using our parsed track_data
+                    for i, am in enumerate(album_msgs, start=1):
+                        if not am.video:
+                            continue
+                            
+                        # If a master index existed, only include videos that passed the logic
+                        if master_caption:
+                            if i in track_data:
+                                am._custom_album = state['query'].replace("#", "")
+                                am._custom_caption = track_data[i]
+                                am._relative_idx = i
                                 raw_found.append(am)
-                    else:
-                        main_caption = next((am.caption for am in album_msgs if am.caption), "")
-                        if query_lower in main_caption.lower():
-                            valid_indices = set()
+                        else:
+                            # Fallback if no Master Index was found at all
+                            am._custom_album = state['query'].replace("#", "")
+                            am._custom_caption = am.caption or f"Imported ({state['query']})"
+                            am._relative_idx = i
+                            raw_found.append(am)
                             
-                            for line in main_caption.split('\n'):
-                                if query_lower in line.lower():
-                                    match = re.search(r'^\s*(\d+)', line)
-                                    if match:
-                                        valid_indices.add(int(match.group(1)) - 1)
-                            
-                            if valid_indices:
-                                for idx, am in enumerate(album_msgs):
-                                    if idx in valid_indices and am.video:
-                                        raw_found.append(am)
-                            else:
-                                for am in album_msgs:
-                                    if am.video: raw_found.append(am)
-            elif msg.video: 
+            elif msg.video:
+                # Single video fallback (not an album)
+                msg._custom_album = state['query'].replace("#", "")
+                msg._custom_caption = msg.caption or f"Imported ({state['query']})"
+                msg._relative_idx = 1
                 raw_found.append(msg)
+                
     except Exception as e:
         user_states.pop(chat_id, None)
         return await status_msg.edit_text(f"❌ Error accessing group: `{e}`")
 
+    # Deduplication logic
     new_msgs, skipped_count = [], 0
     for msg in raw_found:
-        if await is_msg_in_db(msg.chat.id, msg.id): skipped_count += 1
-        else: new_msgs.append(msg)
+        if await is_msg_in_db(msg.chat.id, msg.id):
+            skipped_count += 1
+        else:
+            new_msgs.append(msg)
 
     if not new_msgs:
         user_states.pop(chat_id, None)
-        return await status_msg.edit_text(f"❌ No *new* videos found.\n(Skipped {skipped_count} already processed).", parse_mode=ParseMode.MARKDOWN)
+        return await status_msg.edit_text(f"❌ No *new* matching videos found.\n(Skipped {skipped_count} already processed).", parse_mode=ParseMode.MARKDOWN)
 
     state['found_msgs'] = new_msgs
     kbd = InlineKeyboardMarkup([[InlineKeyboardButton(f"🚀 Queue {len(new_msgs)} videos", callback_data="queue_transfer")]])
