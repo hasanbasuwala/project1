@@ -275,10 +275,16 @@ def update_metrics(task_key, rich_task_id, action, current, total):
     progress_ui.update(rich_task_id, completed=percent)
 
 # ============================================================
-# HIGH-SPEED PARALLEL DOWNLOAD ENGINE
+# HIGH-SPEED PARALLEL DOWNLOAD ENGINE (v2 - DC Safe)
 # ============================================================
+import math
+
+# Use 1 MB as the base chunk size since MTProto blocks are 1MB
+CHUNK_SIZE = 1024 * 1024           
+MEM_BUFFER_SIZE = 8 * 1024 * 1024  # 8 MB: RAM buffer before flushing to disk
+
 def get_part_count(file_size):
-    """Dynamic Part Allocation based on file size (Priority 1)"""
+    """Dynamic Part Allocation based on file size"""
     mb = file_size / (1024 * 1024)
     if mb < 200: return 2
     elif mb < 1024: return 4
@@ -298,96 +304,83 @@ class ProgressTracker:
             self.downloaded += bytes_added
             self.callback(self.downloaded, self.total)
 
-async def _download_segment(client, location, start_offset, end_offset, part_file, job_id, tracker):
-    """Downloads a specific byte range into a memory buffer, then directly writes to disk (Priority 2 & 3)."""
-    buffer = bytearray()
-    downloaded = 0
-    current_offset = start_offset
-    bytes_to_download = end_offset - start_offset
-
-    # Priority 2: Direct blocking file open (No Threading)
-    with open(part_file, "wb") as f:
-        while downloaded < bytes_to_download:
-            if job_id in cancelled_jobs:
-                raise Exception("ForceAbort")
-            await pause_event.wait()
-
-            chunk_req = min(CHUNK_SIZE, bytes_to_download - downloaded)
-            
-            # Isolated Retry Logic: Only this segment retries on failure
-            retries = 3
-            while retries > 0:
-                try:
-                    res = await client.invoke(
-                        GetFile(
-                            location=location,
-                            offset=current_offset,
-                            limit=chunk_req
-                        )
-                    )
-                    break
-                except Exception as e:
-                    retries -= 1
-                    if retries == 0: 
-                        raise e
-                    await asyncio.sleep(2)
-
-            chunk_data = res.bytes
-            if not chunk_data:
-                break # Premature EOF
+async def _download_segment(client, message, chunk_offset, chunk_limit, part_file, job_id, tracker):
+    """Downloads chunks natively via Pyrogram (which handles DC migrations) using memory buffers."""
+    retries = 3
+    while retries > 0:
+        downloaded_this_attempt = 0
+        try:
+            buffer = bytearray()
+            # Direct blocking file open (No Threading context switches)
+            with open(part_file, "wb") as f:
+                async for chunk in client.stream_media(message, limit=chunk_limit, offset=chunk_offset):
+                    if job_id in cancelled_jobs:
+                        raise Exception("ForceAbort")
+                    await pause_event.wait()
+                    
+                    buffer.extend(chunk)
+                    downloaded_this_attempt += len(chunk)
+                    await tracker.update(len(chunk))
+                    
+                    # Large Memory Buffering: Only write to disk when buffer hits 8 MB
+                    if len(buffer) >= MEM_BUFFER_SIZE:
+                        f.write(buffer)
+                        buffer.clear()
                 
-            # Priority 3: Large Memory Buffering
-            buffer.extend(chunk_data)
-            downloaded += len(chunk_data)
-            current_offset += len(chunk_data)
+                # Flush any remaining data at the end of the segment
+                if buffer:
+                    f.write(buffer)
+                    buffer.clear()
             
-            await tracker.update(len(chunk_data))
-
-            # Priority 2 & 3: Direct non-threaded flush when buffer is full
-            if len(buffer) >= MEM_BUFFER_SIZE:
-                f.write(buffer)
-                buffer.clear()
-                
-        # Flush remaining data in buffer
-        if buffer:
-            f.write(buffer)
-            buffer.clear()
+            break  # Segment completed successfully!
+            
+        except Exception as e:
+            if str(e) == "ForceAbort":
+                raise
+            retries -= 1
+            # Rollback the progress bar by the amount we downloaded before the failure
+            await tracker.update(-downloaded_this_attempt)
+            if retries == 0: 
+                raise e
+            await asyncio.sleep(2)
 
 async def async_fast_download(client, message, file_path, progress_callback, job_id):
-    """Replaces standard stream_media with Parallel Segmented Download Pipeline"""
+    """Parallel Segmented Pipeline using chunk offsets"""
     file_size = message.video.file_size
+    
+    # Calculate chunks instead of bytes (1 chunk = 1 MB)
+    total_chunks = math.ceil(file_size / CHUNK_SIZE)
     parts_count = get_part_count(file_size)
     
-    # Resolve MTProto File Location
-    file_id_obj = FileId.decode(message.video.file_id)
-    location = InputDocumentFileLocation(
-        id=file_id_obj.media_id,
-        access_hash=file_id_obj.access_hash,
-        file_reference=file_id_obj.file_reference,
-        thumb_size=""
-    )
+    if total_chunks <= 1:
+        parts_count = 1
 
-    # Calculate MTProto-Aligned Byte Ranges
-    part_size = (file_size // parts_count) // ALIGNMENT * ALIGNMENT
+    base_chunks = total_chunks // parts_count
+    remainder = total_chunks % parts_count
+
+    # Distribute chunks across workers
     ranges = []
+    current_offset = 0
     for i in range(parts_count):
-        start = i * part_size
-        end = file_size if i == parts_count - 1 else start + part_size
-        ranges.append((start, end))
+        limit = base_chunks + (1 if i < remainder else 0)
+        ranges.append((current_offset, limit))
+        current_offset += limit
 
     tracker = ProgressTracker(file_size, progress_callback)
     part_files = [f"{file_path}.part{i}" for i in range(parts_count)]
 
     # Spawn Parallel Tasks
     tasks = []
-    for i, (start_offset, end_offset) in enumerate(ranges):
+    for i, (chunk_offset, chunk_limit) in enumerate(ranges):
+        if chunk_limit == 0: 
+            continue
         tasks.append(
             asyncio.create_task(
                 _download_segment(
                     client=client,
-                    location=location,
-                    start_offset=start_offset,
-                    end_offset=end_offset,
+                    message=message,
+                    chunk_offset=chunk_offset,
+                    chunk_limit=chunk_limit,
                     part_file=part_files[i],
                     job_id=job_id,
                     tracker=tracker
@@ -398,17 +391,18 @@ async def async_fast_download(client, message, file_path, progress_callback, job
     # Await all chunks
     await asyncio.gather(*tasks)
 
-    # Merge Temporary Parts Sequentially (Priority 3: Buffered Disk Reads)
+    # Merge Temporary Parts Sequentially (Buffered Disk Reads)
     with open(file_path, 'wb') as outfile:
         for part in part_files:
-            with open(part, 'rb') as infile:
-                while True:
-                    chunk = infile.read(MEM_BUFFER_SIZE)
-                    if not chunk:
-                        break
-                    outfile.write(chunk)
-            # Cleanup temporary part
-            os.remove(part)
+            if os.path.exists(part):
+                with open(part, 'rb') as infile:
+                    while True:
+                        chunk = infile.read(MEM_BUFFER_SIZE)
+                        if not chunk:
+                            break
+                        outfile.write(chunk)
+                # Cleanup temporary part immediately after merging it
+                os.remove(part)
 
     return file_path
 
