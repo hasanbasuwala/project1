@@ -492,6 +492,10 @@ class ProgressFileReader(io.IOBase):
         self.total = os.path.getsize(filename)
         self.read_bytes = 0
 
+    def __len__(self):
+        # THIS IS CRITICAL: Tells aiohttp the exact file size so it doesn't use chunked encoding
+        return self.total
+
     def read(self, size=-1):
         target_size = MEM_BUFFER_SIZE if size == -1 or size < MEM_BUFFER_SIZE else size
         chunk = self.f.read(target_size)
