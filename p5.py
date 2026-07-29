@@ -377,11 +377,12 @@ CHUNK_SIZE = 1024 * 1024
 MEM_BUFFER_SIZE = 8 * 1024 * 1024  
 
 def get_part_count(file_size):
+    """Conservative Part Allocation to prevent Telegram FloodWaits"""
     mb = file_size / (1024 * 1024)
-    if mb < 200: return 2
-    elif mb < 1024: return 4
-    elif mb < 3072: return 6
-    else: return 8
+    if mb < 200: return 1      # Small files don't need parallel connections
+    elif mb < 1024: return 2   # Medium files: 2 parallel parts
+    elif mb < 3072: return 3   # Large files: 3 parallel parts
+    else: return 4             # Massive files: max 4 parallel parts
 
 class ProgressTracker:
     def __init__(self, total, callback):
@@ -449,6 +450,7 @@ async def async_fast_download(client, message, file_path, progress_callback, job
     tracker = ProgressTracker(file_size, progress_callback)
     part_files = [f"{file_path}.part{i}" for i in range(parts_count)]
 
+    # Spawn Parallel Tasks
     tasks = []
     for i, (chunk_offset, chunk_limit) in enumerate(ranges):
         if chunk_limit == 0: 
@@ -466,8 +468,8 @@ async def async_fast_download(client, message, file_path, progress_callback, job
                 )
             )
         )
-
-    await asyncio.gather(*tasks)
+        # Stagger requests by 0.5s to prevent Telegram FloodWait flags
+        await asyncio.sleep(0.5)
 
     with open(file_path, 'wb') as outfile:
         for part in part_files:
