@@ -263,8 +263,34 @@ async def dashboard_loop():
 @bot_app.on_message(filters.command("start") & filters.private)
 async def start_cmd(client, message):
     msg = await message.reply_text("⚙️ Booting Dashboard...")
+    # Saves your private chat ID so the dashboard updates here
     await set_control("dash_chat", message.chat.id)
     await set_control("dash_msg", msg.id)
+    await render_dashboard()
+
+@bot_app.on_message(filters.command("scan") & filters.private)
+async def scan_history_cmd(client, message):
+    status_msg = await message.reply_text("🔎 Scanning group history for missed videos... This might take a moment.")
+    staged_count = 0
+    
+    try:
+        # Searches the target group using your user session
+        async for msg in user_app.search_messages(chat_id=config.TARGET_GROUP_ID, filter=filters.video):
+            caption = msg.caption or ""
+            match = re.search(r'(#\w+)', caption)
+            if match:
+                hashtag = match.group(1)
+                await db_execute(
+                    "INSERT OR IGNORE INTO staging (msg_id, chat_id, hashtag, caption) VALUES (?,?,?,?)", 
+                    (msg.id, msg.chat.id, hashtag, caption)
+                )
+                staged_count += 1
+                
+        await status_msg.edit_text(f"✅ Scan complete! Found {staged_count} historical videos. Check the dashboard.")
+        await render_dashboard()
+        
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error during scan: {e}")
 
 @bot_app.on_message(filters.chat(config.TARGET_GROUP_ID) & filters.video)
 async def group_scanner(client, message):
@@ -376,11 +402,18 @@ async def main():
             else:
                 await download_queue.put(job)
 
-    asyncio.create_task(dashboard_loop())
+    # Boot Dashboard if it was previously set up
+    dash_chat = await get_control("dash_chat")
+    if dash_chat:
+        print("🟢 Previous dashboard located. Resuming UI updates...")
+        asyncio.create_task(dashboard_loop())
+    else:
+        print("⚠️ No dashboard found. Please go to the bot in Telegram and send /start to generate it.")
+
     for _ in range(DL_WORKERS): asyncio.create_task(download_worker())
     for _ in range(UP_WORKERS): asyncio.create_task(upload_worker())
     
-    print("🚀 System Online. Listening to target group and waiting for commands...")
+    print("🚀 System Online. Passively monitoring target group...")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
