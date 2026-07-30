@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import asyncio
 import aiohttp
+import requests
 import vk_api
 from collections import deque
 from pyrogram import Client, filters
