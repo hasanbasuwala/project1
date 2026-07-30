@@ -706,9 +706,13 @@ async def upload_worker(worker_id):
 
                 reader = ProgressFileReader(file_path, up_progress)
                 data = aiohttp.FormData()
-                data.add_field('video_file', reader, filename=os.path.basename(file_path))
+                # Explicitly set content_type to video/mp4 to prevent 406 errors
+                data.add_field('video_file', reader, filename=os.path.basename(file_path), content_type='video/mp4')
 
                 async with session.post(upload_info['upload_url'], data=data) as resp:
+                    if resp.status != 200:
+                        raw_error = await resp.text()
+                        raise Exception(f"VK Server Error {resp.status}: {raw_error[:200]}")
                     await resp.json()
                 reader.close()
 
