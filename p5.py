@@ -489,33 +489,34 @@ async def async_fast_download(client, message, file_path, progress_callback, job
 # ============================================================
 class ProgressFileReader(io.IOBase):
     def __init__(self, filename, callback):
-        self.f = io.BufferedReader(open(filename, 'rb'), buffer_size=MEM_BUFFER_SIZE)
-        self.callback = callback
-        self.total = os.path.getsize(filename)
-        self.read_bytes = 0
-
-    def __len__(self):
-        # THIS IS CRITICAL: Tells aiohttp the exact file size so it doesn't use chunked encoding
-        return self.total
+        self._f = open(filename, 'rb')
+        self._callback = callback
+        self._total = os.path.getsize(filename)
+        self._read_bytes = 0
 
     def read(self, size=-1):
-        target_size = MEM_BUFFER_SIZE if size == -1 or size < MEM_BUFFER_SIZE else size
-        chunk = self.f.read(target_size)
-        self.read_bytes += len(chunk)
-        self.callback(self.read_bytes, self.total)
+        chunk = self._f.read(size)
+        self._read_bytes += len(chunk)
+        if self._callback:
+            self._callback(self._read_bytes, self._total)
         return chunk
 
-    def close(self):
-        self.f.close()
+    def fileno(self):
+        return self._f.fileno()
 
     def tell(self):
-        return self.f.tell()
+        return self._f.tell()
 
     def seek(self, offset, whence=io.SEEK_SET):
-        return self.f.seek(offset, whence)
+        res = self._f.seek(offset, whence)
+        self._read_bytes = self._f.tell()
+        return res
 
-    def fileno(self):
-        return self.f.fileno()
+    def close(self):
+        self._f.close()
+        
+    def __len__(self):
+        return self._total
 
 # ============================================================
 # JOB COMPLETION / PLAYLIST BOOKKEEPING
