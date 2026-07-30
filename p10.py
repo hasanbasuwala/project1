@@ -1979,13 +1979,18 @@ async def main():
     await user_app.start()
     await bot_app.start()
 
-    # 1. Register BotFather Style Command Menu
+    # 1. Register BotFather Command Menu
     await bot_app.set_bot_commands([
         BotCommand("start", "⚙️ Master Dashboard"),
         BotCommand("monitorselected", "🎯 Selective Sync (/MonitorSelected)"),
         BotCommand("monitoralways", "📡 Continuous Auto-Sync (/MonitorAlways)"),
         BotCommand("monitor", "👁️ Monitor Chat History")
     ])
+
+    # 2. Sync VK State to SQLite (Self-Healing Recovery)
+    await sync_vk_to_local_db()
+
+    # ... [Rest of your existing startup logic] ...
     console.print("[bold green]✅ BotFather command menu set.[/bold green]")
 
     # 2. Restore Persistent Global Pause State
