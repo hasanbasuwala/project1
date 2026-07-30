@@ -505,8 +505,15 @@ async def async_fast_download(client, message, file_path, progress_callback, job
         # Stagger requests by 0.5s to prevent Telegram FloodWait flags
         await asyncio.sleep(0.5)
 
-    # 🛑 ADD THIS LINE: Wait for all parallel downloads to finish!
-    await asyncio.gather(*tasks)
+    # Wait for all parallel downloads to finish, but handle failures safely!
+    try:
+        await asyncio.gather(*tasks)
+    except Exception as e:
+        # If one chunk fails, kill all the other background chunks
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        raise e  # Pass the error up so the worker can retry properly
 
     # Now stitch the completed parts together
     with open(file_path, 'wb') as outfile:
