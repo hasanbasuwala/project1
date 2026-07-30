@@ -233,7 +233,13 @@ async def get_control(key, default=None):
     return row[0] if row else default
 
 async def is_msg_in_db(msg_chat_id, msg_id):
-    row = await db_execute("SELECT status FROM jobs WHERE msg_chat_id=? AND msg_id=?", (msg_chat_id, msg_id), fetch="one")
+    # Checks if this exact message ID is already marked 'done' or currently in queue/downloading
+    row = await db_execute(
+        """SELECT status FROM jobs 
+           WHERE (msg_id=? OR job_id=?) AND status != 'cancelled'""", 
+        (msg_id, f"{msg_chat_id}_{msg_id}"), 
+        fetch="one"
+    )
     return bool(row)
 
 async def create_playlist(chat_id, query, album_name, album_id, total):
