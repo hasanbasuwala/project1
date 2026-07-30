@@ -40,6 +40,13 @@ ALIGNMENT = 1024 * 1024            # 1 MB: MTProto strict offset alignment
 SCHEDULER_INFLIGHT_TARGET = DL_WORKERS * 2
 SCHEDULER_TICK = 0.5
 
+# Caps TOTAL concurrent stream_media segments across ALL download workers combined.
+# Without this, a burst of requeued jobs (e.g. many corrupt files found at once) can
+# each spin up to 4 parallel parts x DL_WORKERS simultaneously, overwhelming the
+# single Pyrogram session (FloodWaits, broken pipe).
+GLOBAL_MAX_CONCURRENT_SEGMENTS = 6
+global_segment_semaphore = asyncio.Semaphore(GLOBAL_MAX_CONCURRENT_SEGMENTS)
+
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -423,37 +430,38 @@ class ProgressTracker:
             self.callback(self.downloaded, self.total)
 
 async def _download_segment(client, message, chunk_offset, chunk_limit, part_file, job_id, tracker):
-    retries = 3
-    while retries > 0:
-        downloaded_this_attempt = 0
-        try:
-            buffer = bytearray()
-            with open(part_file, "wb") as f:
-                async for chunk in client.stream_media(message, limit=chunk_limit, offset=chunk_offset):
-                    if job_id in cancelled_jobs:
-                        raise Exception("ForceAbort")
-                    await pause_event.wait()
-                    
-                    buffer.extend(chunk)
-                    downloaded_this_attempt += len(chunk)
-                    await tracker.update(len(chunk))
-                    
-                    if len(buffer) >= MEM_BUFFER_SIZE:
+    async with global_segment_semaphore:
+        retries = 3
+        while retries > 0:
+            downloaded_this_attempt = 0
+            try:
+                buffer = bytearray()
+                with open(part_file, "wb") as f:
+                    async for chunk in client.stream_media(message, limit=chunk_limit, offset=chunk_offset):
+                        if job_id in cancelled_jobs:
+                            raise Exception("ForceAbort")
+                        await pause_event.wait()
+
+                        buffer.extend(chunk)
+                        downloaded_this_attempt += len(chunk)
+                        await tracker.update(len(chunk))
+
+                        if len(buffer) >= MEM_BUFFER_SIZE:
+                            f.write(buffer)
+                            buffer.clear()
+
+                    if buffer:
                         f.write(buffer)
                         buffer.clear()
-                
-                if buffer:
-                    f.write(buffer)
-                    buffer.clear()
-            break
-        except Exception as e:
-            if str(e) == "ForceAbort":
-                raise
-            retries -= 1
-            await tracker.update(-downloaded_this_attempt)
-            if retries == 0: 
-                raise e
-            await asyncio.sleep(2)
+                break
+            except Exception as e:
+                if str(e) == "ForceAbort":
+                    raise
+                retries -= 1
+                await tracker.update(-downloaded_this_attempt)
+                if retries == 0:
+                    raise e
+                await asyncio.sleep(2)
 
 async def async_fast_download(client, message, file_path, progress_callback, job_id):
     file_size = message.video.file_size
@@ -766,6 +774,21 @@ async def upload_worker(worker_id):
 
             if not file_path or not os.path.exists(file_path):
                 await update_job_status(job_id, "waiting", file_path=None)
+                if job.get('playlist_id'):
+                    enqueue_playlist_job(job['playlist_id'], job)
+                else:
+                    await download_queue.put(job)
+                continue
+
+            # Validate BEFORE every upload attempt (not just at startup). Without this,
+            # a corrupt/truncated file that fails upload gets pushed straight back into
+            # upload_queue and retries forever with the same bad file.
+            if not await _validate_video_file(file_path):
+                console.print(f"[bold red]⚠️ Corrupt file detected before upload, requeueing for redownload: {file_path}[/bold red]")
+                try: os.remove(file_path)
+                except: pass
+                job['file_path'] = None
+                await update_job_status(job_id, "waiting", file_path="")
                 if job.get('playlist_id'):
                     enqueue_playlist_job(job['playlist_id'], job)
                 else:
