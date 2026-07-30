@@ -313,7 +313,12 @@ def update_metrics(task_key, rich_task_id, action, current, total):
         'eta': f"{int(eta_sec // 60)}m {int(eta_sec % 60)}s",
         'action': action
     })
-    progress_ui.update(rich_task_id, completed=percent)
+    
+    # 🛑 ADD THIS TRY/EXCEPT BLOCK
+    try:
+        progress_ui.update(rich_task_id, completed=percent)
+    except KeyError:
+        pass  # The progress bar was already removed, ignore the update
 
 # ============================================================
 # MONITORING WORKFLOW ENGINE
