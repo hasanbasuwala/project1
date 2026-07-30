@@ -5,6 +5,7 @@ import time
 import shutil
 import sqlite3
 import asyncio
+import subprocess
 import requests
 import vk_api
 from collections import deque
@@ -562,10 +563,40 @@ def _sync_vk_upload(upload_url, file_path, progress_callback, job_id):
     try:
         files = {'video_file': (os.path.basename(file_path), reader, 'video/mp4')}
         resp = requests.post(upload_url, files=files, timeout=None)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            # Surface the actual VK response body instead of just the status code,
+            # so future failures are diagnosable without re-adding print statements.
+            raise Exception(f"VK upload {resp.status_code}: {resp.text[:300]}")
         return resp.json()
     finally:
         reader.close()
+
+# ------------------------------------------------------------
+# FIX #3: Corrupt "recovered" files getting pushed straight to upload
+#
+# On restart, jobs with status "downloaded"/"uploading" whose file still
+# exists on disk were trusted blindly and shoved into upload_queue with no
+# integrity check. If a previous run crashed or was killed mid-download,
+# the file can be truncated (classic symptom: "moov atom not found") --
+# VK's upload server correctly 406s on it, and the job silently loops.
+# This validates with ffprobe before trusting a recovered file; anything
+# invalid gets deleted and requeued for a fresh download instead.
+# ------------------------------------------------------------
+async def _validate_video_file(file_path):
+    def _run():
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", file_path],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode != 0:
+                return False
+            duration = result.stdout.strip()
+            return bool(duration) and float(duration) > 0
+        except Exception:
+            return False
+    return await asyncio.to_thread(_run)
 
 # ============================================================
 # JOB COMPLETION / PLAYLIST BOOKKEEPING
@@ -1378,8 +1409,22 @@ async def main():
             status, file_path = row[10], row[11]
 
             if status in ("downloaded", "uploading") and file_path and os.path.exists(file_path):
-                await update_job_status(job['job_id'], "downloaded")
-                await upload_queue.put(job)
+                if await _validate_video_file(file_path):
+                    await update_job_status(job['job_id'], "downloaded")
+                    await upload_queue.put(job)
+                else:
+                    console.print(f"[bold red]⚠️ Corrupt recovered file, requeueing for redownload: {file_path}[/bold red]")
+                    try: os.remove(file_path)
+                    except: pass
+                    job['file_path'] = None
+                    await update_job_status(job['job_id'], "waiting", file_path="")
+                    if job['is_pilot']:
+                        await update_job_status(job['job_id'], "queued")
+                        await download_queue.put(job)
+                    elif job['playlist_id']:
+                        enqueue_playlist_job(job['playlist_id'], job)
+                    else:
+                        await download_queue.put(job)
             elif status == "cancelled":
                 continue
             else:
