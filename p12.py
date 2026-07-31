@@ -769,7 +769,7 @@ class ProgressTracker:
             self.downloaded += bytes_added
             self.callback(self.downloaded, self.total)
 
-async def _download_segment(client, message, chunk_offset, chunk_limit, part_file, job_id, tracker):
+async def _download_segment(client, file_id, chunk_offset, chunk_limit, part_file, job_id, tracker):
     async with global_segment_semaphore:
         retries = 5
         while retries > 0:
@@ -777,7 +777,8 @@ async def _download_segment(client, message, chunk_offset, chunk_limit, part_fil
             try:
                 buffer = bytearray()
                 with open(part_file, "wb") as f:
-                    async for chunk in client.stream_media(message, limit=chunk_limit, offset=chunk_offset):
+                    # Pass file_id instead of message object to prevent Pyrogram re-fetches
+                    async for chunk in client.stream_media(file_id, limit=chunk_limit, offset=chunk_offset):
                         if job_id in cancelled_jobs:
                             raise Exception("ForceAbort")
                         await pause_event.wait()
@@ -801,11 +802,17 @@ async def _download_segment(client, message, chunk_offset, chunk_limit, part_fil
                 await tracker.update(-downloaded_this_attempt)
                 if retries == 0:
                     raise e
-                console.print(f"[yellow]⚠️ Network dip during segment download (Job {job_id}), retrying in 3s... ({retries} left)[/yellow]")
-                await asyncio.sleep(3)
+                console.print(f"[yellow]⚠️ Network dip ({e.__class__.__name__}), retrying in 5s... ({retries} left)[/yellow]")
+                await asyncio.sleep(5) # Wait longer for Telegram DC to forgive the IP
 
 async def async_fast_download(client, message, file_path, progress_callback, job_id):
-    file_size = message.video.file_size
+    media = message.video or message.document
+    if not media:
+        raise Exception("No valid media found in message.")
+        
+    file_size = media.file_size
+    file_id = media.file_id  # Extract raw file_id
+    
     total_chunks = math.ceil(file_size / CHUNK_SIZE)
     parts_count = get_part_count(file_size)
     
@@ -833,7 +840,7 @@ async def async_fast_download(client, message, file_path, progress_callback, job
             asyncio.create_task(
                 _download_segment(
                     client=client,
-                    message=message,
+                    file_id=file_id,
                     chunk_offset=chunk_offset,
                     chunk_limit=chunk_limit,
                     part_file=part_files[i],
@@ -842,7 +849,8 @@ async def async_fast_download(client, message, file_path, progress_callback, job
                 )
             )
         )
-        await asyncio.sleep(0.5)
+        # Increase stagger to 1.5s so Telegram doesn't flag multiple instant parallel requests
+        await asyncio.sleep(1.5)  
 
     try:
         await asyncio.gather(*tasks)
