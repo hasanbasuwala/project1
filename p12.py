@@ -69,7 +69,7 @@ except Exception as e:
     exit(1)
 
 bot_app = Client("bot_session", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.VK_BOT)
-user_app = Client("user_session", api_id=config.API_ID, api_hash=config.API_HASH, max_concurrent_transmissions=12, workers=10)
+user_app = Client("user_session", api_id=config.API_ID, api_hash=config.API_HASH, max_concurrent_transmissions=5, workers=10)
 # ============================================================
 # DATABASE & PERSISTENCE
 # ============================================================
