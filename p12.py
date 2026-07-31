@@ -2285,8 +2285,10 @@ async def main():
                     parse_mode=ParseMode.MARKDOWN
                 )
 
+    # 7. Recover Queue State from Database
+    # FIX: Exclude 'done' and 'cancelled' jobs entirely so we don't try to download vk_sync dummy entries
     rows = await db_execute(
-        "SELECT job_id, playlist_id, chat_id, msg_chat_id, msg_id, album_id, album_name, query, idx, is_pilot, status, file_path, caption, tier FROM jobs",
+        "SELECT job_id, playlist_id, chat_id, msg_chat_id, msg_id, album_id, album_name, query, idx, is_pilot, status, file_path, caption, tier FROM jobs WHERE status NOT IN ('done', 'cancelled')",
         fetch="all"
     )
     recovered = 0
@@ -2312,27 +2314,33 @@ async def main():
                     except: pass
                     job['file_path'] = None
                     await update_job_status(job['job_id'], "waiting", file_path="")
+                    
                     if job['is_pilot']:
                         await update_job_status(job['job_id'], "queued")
                         await target_q.put(job)
                     elif job['playlist_id']:
-                        enqueue_playlist_job(job['playlist_id'], job)
+                        pl_row = await get_playlist(job['playlist_id'])
+                        if pl_row and pl_row[5] in ("RUNNING", "PILOT_RUNNING"):
+                            enqueue_playlist_job(job['playlist_id'], job)
                     else:
                         await target_q.put(job)
-            elif status == "cancelled":
-                continue
             else:
                 if file_path and os.path.exists(file_path):
                     try: os.remove(file_path)
                     except: pass
                 job['file_path'] = None
                 await update_job_status(job['job_id'], "waiting", file_path="")
+                
                 if job['is_pilot']:
                     await update_job_status(job['job_id'], "queued")
                     await target_q.put(job)
                 elif job['playlist_id']:
-                    enqueue_playlist_job(job['playlist_id'], job)
+                    # FIX: Only push to the active scheduler if the playlist isn't waiting for pilot confirmation
+                    pl_row = await get_playlist(job['playlist_id'])
+                    if pl_row and pl_row[5] in ("RUNNING", "PILOT_RUNNING"):
+                        enqueue_playlist_job(job['playlist_id'], job)
                 else:
+                    await update_job_status(job['job_id'], "queued")
                     await target_q.put(job)
             recovered += 1
         console.print(f"[bold yellow]♻️ Recovered {recovered} jobs.[/bold yellow]")
