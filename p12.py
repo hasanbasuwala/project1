@@ -850,7 +850,7 @@ async def async_fast_download(client, message, file_path, progress_callback, job
             )
         )
         # Increase stagger to 1.5s so Telegram doesn't flag multiple instant parallel requests
-        await asyncio.sleep(1.5)  
+        await asyncio.sleep(0.3)  
 
     try:
         await asyncio.gather(*tasks)
