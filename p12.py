@@ -26,8 +26,8 @@ import config
 # ============================================================
 # CONFIG & INITIALIZATION
 # ============================================================
-DL_WORKERS = 2
-UP_WORKERS = 2
+DL_WORKERS = 3
+UP_WORKERS = 3
 MAX_STAGED_FILES = 4
 MIN_FREE_GB = 2.0
 DB_PATH = "SysCache/vk_queue.db"
@@ -40,7 +40,7 @@ ALIGNMENT = 1024 * 1024            # 1 MB: MTProto strict offset alignment
 SCHEDULER_INFLIGHT_TARGET = DL_WORKERS * 2
 SCHEDULER_TICK = 0.5
 
-GLOBAL_MAX_CONCURRENT_SEGMENTS = 3
+GLOBAL_MAX_CONCURRENT_SEGMENTS = 5
 global_segment_semaphore = asyncio.Semaphore(GLOBAL_MAX_CONCURRENT_SEGMENTS)
 
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
