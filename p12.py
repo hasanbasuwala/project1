@@ -26,9 +26,9 @@ import config
 # ============================================================
 # CONFIG & INITIALIZATION
 # ============================================================
-DL_WORKERS = 3
-UP_WORKERS = 3
-MAX_STAGED_FILES = 6
+DL_WORKERS = 2
+UP_WORKERS = 2
+MAX_STAGED_FILES = 4
 MIN_FREE_GB = 2.0
 DB_PATH = "SysCache/vk_queue.db"
 DOWNLOAD_DIR = "SysCache/vk_downloads"
@@ -40,7 +40,7 @@ ALIGNMENT = 1024 * 1024            # 1 MB: MTProto strict offset alignment
 SCHEDULER_INFLIGHT_TARGET = DL_WORKERS * 2
 SCHEDULER_TICK = 0.5
 
-GLOBAL_MAX_CONCURRENT_SEGMENTS = 6
+GLOBAL_MAX_CONCURRENT_SEGMENTS = 3
 global_segment_semaphore = asyncio.Semaphore(GLOBAL_MAX_CONCURRENT_SEGMENTS)
 
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -69,8 +69,7 @@ except Exception as e:
     exit(1)
 
 bot_app = Client("bot_session", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.VK_BOT)
-user_app = Client("user_session", api_id=config.API_ID, api_hash=config.API_HASH, max_concurrent_transmissions=30, workers=10)
-
+user_app = Client("user_session", api_id=config.API_ID, api_hash=config.API_HASH)
 # ============================================================
 # DATABASE & PERSISTENCE
 # ============================================================
