@@ -278,7 +278,9 @@ async def sync_vk_to_local_db():
     synced_count = 0
     deleted_duplicates_count = 0
     deleted_broken_count = 0
-    seen_msg_ids = set()
+    
+    # CHANGED: Now a dictionary mapping msg_id -> video_id
+    seen_msg_ids = {} 
 
     try:
         albums_resp = await asyncio.to_thread(vk.video.getAlbums, owner_id=my_vk_id, count=100)
@@ -326,15 +328,17 @@ async def sync_vk_to_local_db():
                         msg_id = int(match.group(1))
                         
                         if msg_id in seen_msg_ids:
-                            try:
-                                await asyncio.to_thread(vk.video.delete, owner_id=my_vk_id, video_id=video_id)
-                                deleted_duplicates_count += 1
-                                console.print(f"[bold yellow]🗑️ Purged duplicate VK video ID {video_id} (TG_{msg_id})[/bold yellow]")
-                            except Exception:
-                                pass
+                            # NEW LOGIC: Only delete if it's an actual different video file on VK
+                            if seen_msg_ids[msg_id] != video_id:
+                                try:
+                                    await asyncio.to_thread(vk.video.delete, owner_id=my_vk_id, video_id=video_id)
+                                    deleted_duplicates_count += 1
+                                    console.print(f"[bold yellow]🗑️ Purged duplicate VK video ID {video_id} (TG_{msg_id})[/bold yellow]")
+                                except Exception:
+                                    pass
                             continue
                         
-                        seen_msg_ids.add(msg_id)
+                        seen_msg_ids[msg_id] = video_id
                         job_id = f"vk_recovered_{msg_id}"
                         
                         await db_execute(
@@ -351,8 +355,8 @@ async def sync_vk_to_local_db():
 
         # Sync monitored_messages flag with actual live VK videos
         if seen_msg_ids:
-            placeholders = ','.join('?' for _ in seen_msg_ids)
-            await db_execute(f"UPDATE monitored_messages SET is_queued=1 WHERE msg_id IN ({placeholders})", tuple(seen_msg_ids))
+            placeholders = ','.join('?' for _ in seen_msg_ids.keys())
+            await db_execute(f"UPDATE monitored_messages SET is_queued=1 WHERE msg_id IN ({placeholders})", tuple(seen_msg_ids.keys()))
 
         console.print(f"[bold green]✅ VK Sync Complete: {synced_count} indexed, {deleted_duplicates_count} dupes purged, {deleted_broken_count} broken videos purged.[/bold green]")
         return synced_count, deleted_duplicates_count, deleted_broken_count
