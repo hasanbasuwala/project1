@@ -2,10 +2,14 @@ import asyncio
 import json
 import os
 import re
+import sys
 import time
 from datetime import datetime
 from pyrogram import Client, filters, compose
-from pyrogram.errors import FloodWait, UserRestricted
+from pyrogram.errors import (
+    FloodWait, UserRestricted, SessionRevoked, AuthKeyUnregistered,
+    AuthKeyDuplicated, UserDeactivated,
+)
 
 import config
 
@@ -658,22 +662,48 @@ async def direct_stopbot(client, message):
     os._exit(0)
 
 
+FATAL_AUTH_ERRORS = (SessionRevoked, AuthKeyUnregistered, AuthKeyDuplicated, UserDeactivated)
+
+async def _safe_stop_all():
+    """Stop any client that's still marked connected. Without this, a
+    partial compose() failure (one client started, the other didn't)
+    leaves the started client "connected" from Pyrogram's point of view,
+    so the next compose() attempt immediately fails with
+    "Client is already connected" instead of actually retrying."""
+    for client in (user, bot):
+        try:
+            if client.is_connected:
+                await client.stop()
+        except Exception:
+            pass
+
 async def main_startup():
     print("Starting Userbot and Control Bot safely...")
     backoff = 10
+    asyncio.create_task(network_watchdog())
     while True:
         try:
-            asyncio.create_task(network_watchdog())
             await compose([user, bot])
             # compose() only returns on a clean shutdown (e.g. /stopbot uses os._exit,
             # so normally we won't even get here) — break out if it does.
             break
+        except FATAL_AUTH_ERRORS as e:
+            print(f"🚫 FATAL AUTH ERROR: {e}")
+            print("This account's session has been invalidated — most likely someone hit "
+                  "'Terminate all sessions' in Telegram (Settings > Devices), or logged the "
+                  "account out elsewhere. Retrying cannot fix this.")
+            print("Fix: delete the affected .session file(s) in this folder and rerun the "
+                  "script to log back in. Exiting now instead of looping forever.")
+            await _safe_stop_all()
+            sys.exit(1)
         except NETWORK_ERRORS as e:
             print(f"⚠️ Lost connection during startup/runtime ({e}). Retrying in {backoff}s...")
+            await _safe_stop_all()
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 120)  # exponential backoff, capped at 2 min
         except Exception as e:
             print(f"❌ Unexpected fatal error: {e}. Retrying in {backoff}s...")
+            await _safe_stop_all()
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 120)
 
