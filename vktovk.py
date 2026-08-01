@@ -972,7 +972,7 @@ async def render_dashboard(db: JobScheduler, tab: str = "playlists", exp_pl: str
 def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.Queue, up_q: asyncio.Queue,
                   dl_pool: "WorkerPool", enc_pool: "WorkerPool", up_pool: "WorkerPool"):
 
-    @app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["vk_dash"]))
+    @app.on_message(filters.regex(r"https?://") & filters.user(OWNER_ID))
     async def auto_catch_playlist(_, msg: Message):
         text = msg.text.strip()
         if not ("http://" in text or "https://" in text): return
