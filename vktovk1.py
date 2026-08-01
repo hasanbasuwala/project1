@@ -963,7 +963,9 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
             # Only intercept if they are in an active scan prompt
             msg.continue_propagation()
             
-        album_name = msg.text.strip()
+        # FIX: Strip the '#' from the beginning and clear any trailing spaces
+        album_name = msg.text.strip().lstrip('#').strip()
+        
         pending = session['pending_upload']
         m = await msg.reply(f"🔍 Resolving album '{album_name}' & checking for duplicates...")
         
@@ -977,10 +979,13 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
 
         def dedupe_and_prepare():
             vk = get_vk_api()
+            # This helper is already case-insensitive (e.g. 'name' matches 'Name')
             target_album_id = get_or_create_vk_album(vk, album_name)
             existing_ids = get_existing_vk_db_ids(vk, target_album_id)
             missing = [vid for vid in items_to_process if vid['unique_id'] not in existing_ids]
             return target_album_id, missing
+
+        # ... [The rest of the function remains exactly the same]
 
         try:
             target_album_id, missing_videos = await asyncio.to_thread(dedupe_and_prepare)
