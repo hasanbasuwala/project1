@@ -677,29 +677,44 @@ async def _safe_stop_all():
         except Exception:
             pass
 
+import pyrogram
+
 # --- STARTUP ROUTINE ---
 async def main():
     print("Starting clients...")
     
-    # Start the watchdog as a background task. 
-    # (It has an initial 5s sleep, so it will wait for clients to connect)
+    # 1. Start clients FIRST before making any API calls
+    await user.start()
+    await bot.start()
+    
+    # 2. Now safe to interact with Telegram
     asyncio.create_task(network_watchdog())
     await set_system_state("🟢", "Optimal", "💤 Idle")
     
-    print("✅ AutoScan System is Online and Monitoring.")
+    print("✅ AutoScan System is Online and Monitoring. Press Ctrl+C to stop.")
     
-    # compose() automatically starts the clients, keeps them running (idle), 
-    # and shuts them down cleanly when you press Ctrl+C.
-    await compose([user, bot])
+    try:
+        # 3. Keep the script running
+        await pyrogram.idle()
+    finally:
+        # 4. If Ctrl+C is pressed, Pyrogram's idle() unlocks and we safely disconnect.
+        # This prevents the "attached to a different loop" zombie error.
+        print("\nDisconnecting clients safely...")
+        if user.is_initialized:
+            await user.stop()
+        if bot.is_initialized:
+            await bot.stop()
+        print("🛑 Shutdown complete.")
 
 if __name__ == "__main__":
     try:
-        # Using get_event_loop instead of asyncio.run() prevents the Pyrogram 
-        # "attached to a different loop" error on shutdown in Python 3.10+
-        loop = asyncio.get_event_loop()
+        # Python 3.10+ and 3.13 strict loop handling
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         loop.run_until_complete(main())
     except KeyboardInterrupt:
-        print("\n🛑 Shutdown signal received. Exited cleanly.")
+        # Expected exit, ignore the stack trace
+        pass
     except Exception as e:
         print(f"\n❌ Exited with error: {e}")
 
