@@ -677,36 +677,29 @@ async def _safe_stop_all():
         except Exception:
             pass
 
-async def main_startup():
-    print("Starting Userbot and Control Bot safely...")
-    backoff = 10
+# --- STARTUP ROUTINE ---
+async def main():
+    print("Starting clients...")
+    
+    # Start the watchdog as a background task. 
+    # (It has an initial 5s sleep, so it will wait for clients to connect)
     asyncio.create_task(network_watchdog())
-    while True:
-        try:
-            await compose([user, bot])
-            # compose() only returns on a clean shutdown (e.g. /stopbot uses os._exit,
-            # so normally we won't even get here) — break out if it does.
-            break
-        except FATAL_AUTH_ERRORS as e:
-            print(f"🚫 FATAL AUTH ERROR: {e}")
-            print("This account's session has been invalidated — most likely someone hit "
-                  "'Terminate all sessions' in Telegram (Settings > Devices), or logged the "
-                  "account out elsewhere. Retrying cannot fix this.")
-            print("Fix: delete the affected .session file(s) in this folder and rerun the "
-                  "script to log back in. Exiting now instead of looping forever.")
-            await _safe_stop_all()
-            sys.exit(1)
-        except NETWORK_ERRORS as e:
-            print(f"⚠️ Lost connection during startup/runtime ({e}). Retrying in {backoff}s...")
-            await _safe_stop_all()
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 120)  # exponential backoff, capped at 2 min
-        except Exception as e:
-            print(f"❌ Unexpected fatal error: {e}. Retrying in {backoff}s...")
-            await _safe_stop_all()
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 120)
+    await set_system_state("🟢", "Optimal", "💤 Idle")
+    
+    print("✅ AutoScan System is Online and Monitoring.")
+    
+    # compose() automatically starts the clients, keeps them running (idle), 
+    # and shuts them down cleanly when you press Ctrl+C.
+    await compose([user, bot])
 
-if __name__ == '__main__':
-    # Initialize dashboard on boot
-    asyncio.run(main_startup())
+if __name__ == "__main__":
+    try:
+        # Using get_event_loop instead of asyncio.run() prevents the Pyrogram 
+        # "attached to a different loop" error on shutdown in Python 3.10+
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Shutdown signal received. Exited cleanly.")
+    except Exception as e:
+        print(f"\n❌ Exited with error: {e}")
+
