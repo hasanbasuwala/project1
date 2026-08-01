@@ -54,6 +54,8 @@ SEGMENT_STAGGER_SECONDS = 1.2
 # FIX: tolerance for verifying a downloaded segment/file is complete. Segments or final
 # files short by more than this fraction are treated as corrupt/truncated and retried,
 # instead of silently being passed along to VK as a "valid" (but broken) video.
+# NOTE: superseded by exact byte-for-byte segment/file size verification below —
+# kept only in case a tolerance-based fallback is ever wanted again.
 SIZE_MISMATCH_TOLERANCE = 0.01  # 1%
 
 # NETWORK HEALTH / CIRCUIT BREAKER
@@ -67,6 +69,16 @@ NETWORK_ERROR_WINDOW = 90        # seconds - rolling window used to count errors
 NETWORK_ERROR_THRESHOLD = 6      # this many errors within the window trips the breaker
 NETWORK_COOLDOWN_SECONDS = 45    # how long to pause all transfers once tripped
 RECONNECT_MIN_INTERVAL = 60      # don't reconnect more than once per minute
+
+# FIX: post-upload reliability. Even a perfectly downloaded file can come out
+# "unavailable" on VK because VK's own transcode pipeline flaked on that specific
+# upload. Instead of trusting a successful HTTP response from the upload endpoint,
+# we poll VK afterwards to confirm the video actually processed, and if it didn't,
+# we automatically re-save + re-upload the same (already-validated) local file a
+# bounded number of times before giving up and alerting the user.
+MAX_VK_REUPLOAD_RETRIES = 2      # extra re-save+re-upload attempts after the first
+VK_VERIFY_MAX_WAIT_SECONDS = 120 # how long to wait for VK to finish processing a video
+VK_VERIFY_POLL_INTERVAL = 15     # seconds between polls while waiting
 
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -464,6 +476,10 @@ user_states = {}
 ui_state = "MAIN"
 monitor_page = 0
 
+# FIX: tracks how many VK re-save+re-upload attempts a job has already used, so we
+# don't retry forever if VK keeps failing to process a given file.
+vk_reupload_attempts: dict[str, int] = {}
+
 playlist_queues: dict[str, deque] = {}
 playlist_order: deque = deque()
 vk_video_title_cache: dict[int, set] = {}
@@ -551,6 +567,36 @@ async def get_or_create_vk_album(album_name):
             console.print(f"[bold red]❌ Failed to resolve/create VK album '{album_name}': {e} (Attempt {attempt+1}/3)[/bold red]")
             await asyncio.sleep(2 * (attempt + 1))
     return None
+
+async def verify_vk_video_ready(owner_id, video_id):
+    """Poll VK after an upload to confirm the video actually processed into a
+    playable state, rather than trusting a 200 response from the upload endpoint.
+    VK's own transcode pipeline can occasionally fail on an otherwise-perfect upload,
+    which is the most common cause of a small persistent 'video unavailable' rate even
+    after the local file has been fully validated. Returns True once VK reports a real
+    duration, False if it's still broken (duration 0, not processing) after the grace
+    period."""
+    waited = 0
+    while waited <= VK_VERIFY_MAX_WAIT_SECONDS:
+        await asyncio.sleep(VK_VERIFY_POLL_INTERVAL)
+        waited += VK_VERIFY_POLL_INTERVAL
+        try:
+            resp = await asyncio.to_thread(vk.video.get, owner_id=owner_id, videos=f"{owner_id}_{video_id}")
+            items = resp.get('items', [])
+            if not items:
+                continue
+            v = items[0]
+            duration = v.get('duration', 0)
+            processing = v.get('processing', 0)
+            if duration and duration > 0:
+                return True
+            if not processing and duration == 0 and waited >= VK_VERIFY_POLL_INTERVAL * 2:
+                # Given it at least two full poll cycles to rule out a brief in-between
+                # state before declaring it genuinely broken.
+                return False
+        except Exception as e:
+            console.print(f"[yellow]⚠️ VK verify poll failed: {e}[/yellow]")
+    return False
 
 def enqueue_playlist_job(playlist_id, job):
     playlist_queues.setdefault(playlist_id, deque()).append(job)
@@ -857,7 +903,7 @@ class ProgressTracker:
             self.downloaded += bytes_added
             self.callback(self.downloaded, self.total)
 
-async def _download_segment(client, file_id, chunk_offset, chunk_limit, part_file, job_id, tracker):
+async def _download_segment(client, file_id, chunk_offset, chunk_limit, part_file, job_id, tracker, expected_bytes):
     async with global_segment_semaphore:
         retries = 5
         while retries > 0:
@@ -888,18 +934,17 @@ async def _download_segment(client, file_id, chunk_offset, chunk_limit, part_fil
                         f.write(buffer)
                         buffer.clear()
 
-                # FIX: verify the segment actually received the number of bytes it was
-                # asked for. Pyrogram's stream_media can end early (connection dip,
-                # DC hiccup) WITHOUT raising, which previously let a truncated segment
-                # silently pass through, get concatenated, pass ffprobe's duration
-                # check, and get uploaded to VK as a "video unavailable" file.
-                expected_bytes = chunk_limit * CHUNK_SIZE
+                # FIX: verify the segment received EXACTLY the number of bytes it was
+                # supposed to (expected_bytes is computed precisely by the caller,
+                # accounting for the file's true final partial chunk — no guessing
+                # tolerance here). Pyrogram's stream_media can end early or return a
+                # slightly short/garbled stream on a connection dip WITHOUT raising,
+                # which previously let a subtly-off segment silently pass through, get
+                # concatenated, pass ffprobe's duration check, and get uploaded to VK
+                # as a "video unavailable" file. A byte-for-byte match is required now.
                 actual_bytes = os.path.getsize(part_file) if os.path.exists(part_file) else 0
-                # allow shrinkage up to one chunk (the last chunk of the whole file is
-                # very often smaller than CHUNK_SIZE) plus a small tolerance
-                min_acceptable = expected_bytes - CHUNK_SIZE - int(expected_bytes * SIZE_MISMATCH_TOLERANCE)
-                if actual_bytes < max(0, min_acceptable):
-                    raise Exception(f"SegmentSizeMismatch: got {actual_bytes}, expected ~{expected_bytes}")
+                if actual_bytes != expected_bytes:
+                    raise Exception(f"SegmentSizeMismatch: got {actual_bytes} bytes, expected exactly {expected_bytes}")
 
                 break
             except Exception as e:
@@ -942,6 +987,10 @@ async def async_fast_download(client, message, file_path, progress_callback, job
     base_chunks = total_chunks // parts_count
     remainder = total_chunks % parts_count
 
+    # FIX: precompute the exact byte size of the file's final (possibly partial) chunk,
+    # so every segment's expected byte count can be exact rather than tolerance-based.
+    last_chunk_size = file_size - (total_chunks - 1) * CHUNK_SIZE if total_chunks > 0 else 0
+
     ranges = []
     current_offset = 0
     for i in range(parts_count):
@@ -956,6 +1005,18 @@ async def async_fast_download(client, message, file_path, progress_callback, job
     for i, (chunk_offset, chunk_limit) in enumerate(ranges):
         if chunk_limit == 0: 
             continue
+
+        # FIX: work out the exact number of bytes THIS segment should contain. Every
+        # segment except the one covering the file's final chunk expects a full
+        # chunk_limit * CHUNK_SIZE bytes; the segment that includes the last chunk of
+        # the whole file expects that last chunk's true (possibly smaller) size.
+        includes_final_chunk = (chunk_offset + chunk_limit) >= total_chunks
+        if includes_final_chunk:
+            full_chunks_in_segment = chunk_limit - 1
+            expected_bytes = full_chunks_in_segment * CHUNK_SIZE + last_chunk_size
+        else:
+            expected_bytes = chunk_limit * CHUNK_SIZE
+
         tasks.append(
             asyncio.create_task(
                 _download_segment(
@@ -965,7 +1026,8 @@ async def async_fast_download(client, message, file_path, progress_callback, job
                     chunk_limit=chunk_limit,
                     part_file=part_files[i],
                     job_id=job_id,
-                    tracker=tracker
+                    tracker=tracker,
+                    expected_bytes=expected_bytes
                 )
             )
         )
@@ -999,19 +1061,18 @@ async def async_fast_download(client, message, file_path, progress_callback, job
                         outfile.write(chunk)
                 os.remove(part)
 
-    # FIX: final integrity check on the fully concatenated file. This is the last
-    # line of defense before the file goes to _validate_video_file/ffprobe, which
-    # only checks for a nonzero duration and can pass on a truncated MP4 whose
-    # moov atom is intact but whose media data is cut short. If the assembled file
-    # doesn't match Telegram's reported size (within tolerance), delete it and fail
-    # loudly so the job gets requeued instead of quietly reaching VK broken.
+    # FIX: final integrity check on the fully concatenated file, now an EXACT match
+    # against Telegram's reported file_size rather than a tolerance band. Since every
+    # segment above is already verified byte-exact, the assembled file should match
+    # exactly; any mismatch here means something (e.g. a part file got skipped) still
+    # slipped through, so fail loudly and requeue rather than let it reach VK broken.
     final_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
-    if final_size < file_size * (1 - SIZE_MISMATCH_TOLERANCE):
+    if final_size != file_size:
         try:
             os.remove(file_path)
         except Exception:
             pass
-        raise Exception(f"IncompleteDownload: assembled {final_size} bytes, expected {file_size} bytes")
+        raise Exception(f"IncompleteDownload: assembled {final_size} bytes, expected exactly {file_size} bytes")
 
     return file_path
 
@@ -1072,6 +1133,33 @@ async def _validate_video_file(file_path):
                 return False
             duration = result.stdout.strip()
             return bool(duration) and float(duration) > 0
+        except Exception:
+            return False
+    return await asyncio.to_thread(_run)
+
+async def _deep_validate_video_file(file_path):
+    """Goes beyond _validate_video_file's duration check. A byte-range that arrives
+    slightly wrong (e.g. a retried segment landing at a subtly different offset) can
+    still produce a file with an intact moov atom and a correct-looking duration while
+    the actual frame/audio data is corrupted mid-stream — ffprobe alone won't catch
+    that. This decodes every stream end-to-end with ffmpeg and fails on any decode
+    error, which is what actually determines whether VK (or any player) can play the
+    file back cleanly."""
+    def _run():
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-v", "error", "-i", file_path, "-map", "0", "-f", "null", "-"],
+                capture_output=True, text=True, timeout=300
+            )
+            # ffmpeg -v error only writes to stderr on actual decode errors; a clean
+            # decode returns 0 with empty stderr.
+            return result.returncode == 0 and not result.stderr.strip()
+        except subprocess.TimeoutExpired:
+            # Very large/long files may need more than 300s to decode; treat a timeout
+            # as inconclusive rather than a hard failure so we don't loop-requeue a
+            # perfectly fine but huge file forever.
+            console.print(f"[yellow]⚠️ Deep validation timed out for {os.path.basename(file_path)}, skipping deep check.[/yellow]")
+            return True
         except Exception:
             return False
     return await asyncio.to_thread(_run)
@@ -1143,6 +1231,43 @@ async def on_job_finished(job):
         _, _, _, _, _, status, total, completed, failed, skipped = row
         if status not in ("KILLED", "COMPLETED") and (completed + failed + skipped) >= total:
             await set_playlist_status(playlist_id, "COMPLETED")
+
+async def on_job_permanently_failed(job, reason):
+    """A video that repeatedly failed to process on VK's side (or otherwise couldn't
+    be salvaged) after exhausting all auto-retries. Bump playlist bookkeeping as a
+    failure (not a silent drop), clean up the job row, and notify the dashboard chat
+    directly so the user knows to manually investigate this specific video instead of
+    it just quietly vanishing from the queue."""
+    playlist_id = job.get('playlist_id')
+    display_name = f"{job.get('query')} (Pt.{job.get('idx')})"
+    vk_reupload_attempts.pop(job['job_id'], None)
+    await delete_job_row(job['job_id'])
+
+    if playlist_id:
+        await bump_playlist(playlist_id, failed_delta=1)
+        row = await get_playlist(playlist_id)
+        if row:
+            _, _, _, _, _, status, total, completed, failed, skipped = row
+            if status not in ("KILLED", "COMPLETED") and (completed + failed + skipped) >= total:
+                await set_playlist_status(playlist_id, "COMPLETED")
+
+    dashboard_chat_id = await get_control("dashboard_chat_id")
+    if dashboard_chat_id:
+        try:
+            await bot_app.send_message(
+                chat_id=int(dashboard_chat_id),
+                text=(
+                    f"⚠️ **Upload Failed Permanently**\n\n"
+                    f"Video: **{display_name}**\n"
+                    f"Chat: `{job.get('msg_chat_id')}` | Msg ID: `{job.get('msg_id')}`\n"
+                    f"Reason: {reason}\n\n"
+                    f"This video was skipped after repeated attempts. You may want to check "
+                    f"the source file manually or re-trigger it."
+                ),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception:
+            pass
 
 async def continue_playlist(playlist_id):
     rows = await db_execute(
@@ -1337,7 +1462,7 @@ async def upload_worker(worker_id):
                     await download_queue_t2.put(job)
                 continue
 
-            if not await _validate_video_file(file_path):
+            if not await _validate_video_file(file_path) or not await _deep_validate_video_file(file_path):
                 console.print(f"[bold red]⚠️ Corrupt file detected before upload, requeueing for redownload: {file_path}[/bold red]")
                 try: os.remove(file_path)
                 except: pass
@@ -1381,29 +1506,69 @@ async def upload_worker(worker_id):
             await update_job_status(job_id, "uploading")
 
             title = display_title(job['album_name'], job['idx'], job.get('caption', ''), job['msg_id'])
-            
-            upload_info = None
-            for attempt in range(5):
-                try:
-                    upload_info = await asyncio.to_thread(
-                        vk.video.save, 
-                        name=title, 
-                        description=job.get('caption', ''), 
-                        album_id=album_id
-                    )
-                    break
-                except Exception as e:
-                    console.print(f"[yellow]⚠️ VK save API call failed ({e}), retrying {attempt+1}/5...[/yellow]")
-                    await asyncio.sleep(4)
-
-            if not upload_info:
-                raise Exception("VKVideoSaveFailed")
 
             def up_progress(current, total):
                 if job_id in cancelled_jobs: raise Exception("ForceAbort")
                 update_metrics(up_key, rich_task, "📤 UP", current, total)
 
-            await asyncio.to_thread(_sync_vk_upload, upload_info['upload_url'], file_path, up_progress, job_id)
+            # FIX: the save->upload->verify cycle now loops. A successful HTTP response
+            # from VK's upload endpoint does NOT guarantee the video actually processed
+            # into a playable state — VK's own transcode pipeline can fail on an
+            # otherwise-perfect file. verify_vk_video_ready() polls VK afterwards; if it
+            # comes back broken, we delete the broken VK entry and re-save + re-upload
+            # the SAME already-validated local file (cheap — no redownload needed) up to
+            # MAX_VK_REUPLOAD_RETRIES times before giving up and alerting the user.
+            upload_succeeded = False
+            last_video_id = None
+            last_owner_id = None
+
+            for save_attempt in range(MAX_VK_REUPLOAD_RETRIES + 1):
+                upload_info = None
+                for attempt in range(5):
+                    try:
+                        upload_info = await asyncio.to_thread(
+                            vk.video.save,
+                            name=title,
+                            description=job.get('caption', ''),
+                            album_id=album_id
+                        )
+                        break
+                    except Exception as e:
+                        console.print(f"[yellow]⚠️ VK save API call failed ({e}), retrying {attempt+1}/5...[/yellow]")
+                        await asyncio.sleep(4)
+
+                if not upload_info:
+                    raise Exception("VKVideoSaveFailed")
+
+                await asyncio.to_thread(_sync_vk_upload, upload_info['upload_url'], file_path, up_progress, job_id)
+
+                video_id = upload_info.get('video_id')
+                owner_id = upload_info.get('owner_id', my_vk_id)
+                last_video_id, last_owner_id = video_id, owner_id
+
+                if video_id is None:
+                    # Can't verify without a video_id — trust the upload as before.
+                    upload_succeeded = True
+                    break
+
+                console.print(f"[cyan]⏳ Verifying VK processed '{display_name}' correctly...[/cyan]")
+                if await verify_vk_video_ready(owner_id, video_id):
+                    upload_succeeded = True
+                    break
+
+                console.print(f"[bold red]⚠️ VK reports '{display_name}' as unavailable after processing (attempt {save_attempt+1}/{MAX_VK_REUPLOAD_RETRIES+1}).[/bold red]")
+                try:
+                    await asyncio.to_thread(vk.video.delete, owner_id=owner_id, video_id=video_id)
+                except Exception:
+                    pass
+
+            if not upload_succeeded:
+                vk_reupload_attempts[job_id] = vk_reupload_attempts.get(job_id, 0) + 1
+                console.print(f"[bold red]❌ Giving up on '{display_name}' after {MAX_VK_REUPLOAD_RETRIES+1} VK save/upload attempts — video kept failing to process.[/bold red]")
+                await update_job_status(job_id, "failed_vk_verify")
+                await on_job_permanently_failed(job, "VK repeatedly failed to process this video after upload (unavailable).")
+                delete_file_on_exit = True
+                continue
 
             vk_video_title_cache.setdefault(album_id, set()).add(title)
             await update_job_status(job_id, "done") 
