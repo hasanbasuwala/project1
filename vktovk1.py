@@ -485,90 +485,156 @@ async def playlist_drip_feed_loop(db: JobScheduler, dl_q: asyncio.Queue, enc_q: 
 
 class DownloaderEngine:
     def __init__(self, db: JobScheduler, app: Client):
-        self.db = db; self.app = app
+        self.db = db
+        self.app = app
 
     def _extract_vk_api(self, url: str, jid: str) -> str | None:
+        VK_TOKEN = getattr(config, "VK_TOKEN", None)
+        if not VK_TOKEN: return None
         try:
-            vk = get_vk_api()
+            import vk_api
+            vk_session = vk_api.VkApi(token=VK_TOKEN)
+            vk = vk_session.get_api()
             video_id = None
             video_match = re.search(r'video(-?\d+_\d+)', url)
             if video_match: video_id = video_match.group(1)
-            
             if video_id:
                 vid_details = vk.video.get(videos=video_id)
                 if vid_details and vid_details.get('items'):
                     files = vid_details['items'][0].get('files', {})
-                    # Try to grab the highest quality direct MP4 URL first
-                    for q in ['mp4_1080', 'mp4_720', 'mp4_480', 'mp4_360']:
-                        if q in files: 
-                            cdn_url = files[q]
-                            # GHOST PROTOCOL: Spoof the CDN signature to GECKO
-                            if 'srcAg=' in cdn_url:
-                                cdn_url = re.sub(r'srcAg=[^&]+', 'srcAg=GECKO', cdn_url)
-                            else:
-                                cdn_url += '&srcAg=GECKO' if '?' in cdn_url else '?srcAg=GECKO'
-                            return cdn_url
+                    for q in ['mp4_1080', 'mp4_720', 'mp4_480', 'mp4_360', 'hls']:
+                        if q in files:
+                            self.db.log_trace(jid, f"[vk_api] Direct {q.upper()} CDN link extracted.")
+                            return files[q]
         except Exception as e:
-            print(f"VK API direct extraction failed: {e}")
+            self.db.log_trace(jid, f"[vk_api] Ghost Protocol Failed: {e}")
         return None
+
+    @staticmethod
+    def _get_free_port() -> int:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    @staticmethod
+    def _aria2_rpc_call(port: int, secret: str, method: str, params: list | None = None) -> dict:
+        payload = {"jsonrpc": "2.0", "id": "poll", "method": method, "params": [f"token:{secret}"] + (params or [])}
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/jsonrpc", data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return json.loads(resp.read())
+
+    async def _poll_aria2_progress(self, jid: str, port: int, secret: str, stop_event: asyncio.Event):
+        for _ in range(30):
+            if stop_event.is_set(): return
+            try:
+                await asyncio.to_thread(self._aria2_rpc_call, port, secret, "aria2.tellActive")
+                break
+            except Exception: await asyncio.sleep(0.5)
+
+        last_db_update = 0.0
+        seen_active = False
+        idle_ticks = 0
+        MAX_IDLE_TICKS = 8
+
+        while not stop_event.is_set():
+            try:
+                resp = await asyncio.to_thread(self._aria2_rpc_call, port, secret, "aria2.tellActive")
+                active = resp.get("result", [])
+            except Exception:
+                active = None
+
+            if active:
+                seen_active = True
+                idle_ticks = 0
+                completed = sum(int(d.get("completedLength", 0)) for d in active)
+                total = sum(int(d.get("totalLength", 0)) for d in active)
+                speed_bps = sum(int(d.get("downloadSpeed", 0)) for d in active)
+
+                pct = (completed / total * 100.0) if total else 0.0
+                speed_str = f"{speed_bps / (1024 * 1024):.2f}MiB/s" if speed_bps else "~"
+                if speed_bps > 0 and total > completed:
+                    eta_sec = int((total - completed) / speed_bps)
+                    eta_str = f"{eta_sec // 60}m{eta_sec % 60}s"
+                else: eta_str = "~"
+
+                global _live_ui_text
+                _live_ui_text[jid] = f"[aria2] {pct:.1f}% at {speed_str} ETA {eta_str}"
+
+                now = time.time()
+                if now - last_db_update >= 1.0:
+                    await self.db.update_job(jid, pct=pct, stage=f"downloading | {speed_str} | {eta_str}")
+                    last_db_update = now
+            elif seen_active:
+                try: await asyncio.to_thread(self._aria2_rpc_call, port, secret, "aria2.shutdown")
+                except Exception: pass
+                idle_ticks += 1
+                if idle_ticks >= MAX_IDLE_TICKS: return
+                seen_active = False
+            await asyncio.sleep(1.0)
 
     async def execute(self, job: dict):
         jid, original_url = job['id'], job['url']
         dl_dir = JOBS_DIR / f"JOB_{jid}" / "dl"
 
         await self.db.update_job(jid, stage="downloading | ~ | ~")
-        
-        # 1. Fetch direct CDN URL and apply Ghost Protocol signature
         extracted_cdn = await asyncio.to_thread(self._extract_vk_api, original_url, jid)
         target_url = extracted_cdn if extracted_cdn else original_url
 
-        rpc_port, rpc_secret = self._get_free_port(), secrets.token_hex(8)
-        
-        # 2. Hardcode a strictly matching Firefox UA for the GECKO spoof
-        ghost_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0"
+        rpc_port = self._get_free_port()
+        rpc_secret = secrets.token_hex(8)
 
         opts = {
-            "outtmpl": str(dl_dir / f"{jid}.%(ext)s"), 
+            "outtmpl": str(dl_dir / f"{jid}.%(ext)s"),
             "format": "bestvideo[height<=1080]+bestaudio/best",
             "merge_output_format": "mkv", 
-            "quiet": False, 
-            "noprogress": True, 
+            "quiet": False,
+            "noprogress": True,
             "no_warnings": True,
+            "compat_opts": {"allow-unsafe-ext"},
             "max_filesize": getattr(config, "VK_MAX_FILESIZE_BYTES", 2 * 1024 * 1024 * 1024),
             "external_downloader": "aria2c",
-            "http_headers": {"User-Agent": ghost_ua},  # Keep yt-dlp in sync
-            "external_downloader_args": {
-                "aria2c": [
-                    "-c", "-j", "16", "-x", "16", "-s", "16", "-k", "5M", 
-                    "--connect-timeout=15", "--timeout=15", "--max-tries=5", 
-                    "--summary-interval=0", "--enable-rpc=true", 
-                    f"--rpc-listen-port={rpc_port}", f"--rpc-secret={rpc_secret}", 
-                    "--rpc-listen-all=false",
-                    f"--header=User-Agent: {ghost_ua}" # Inject UA directly into aria2c
-                ]
-            }
+            "external_downloader_args": [
+                "-c", "-j", "16", "-x", "16", "-s", "16", "-k", "5M",
+                "--connect-timeout=15", "--timeout=15", "--max-tries=5",
+                "--summary-interval=0",
+                "--enable-rpc=true", f"--rpc-listen-port={rpc_port}",
+                f"--rpc-secret={rpc_secret}", "--rpc-listen-all=false",
+            ],
         }
 
-        # Ensure we don't trip yt-dlp's internal impersonation features if URL is already spoofed
-        if "impersonate" in opts and ("srcAg=" in target_url): 
+        custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        if "srcAg=GECKO" in target_url:
+            custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0"
+        elif "srcAg=SAFARI" in target_url:
+            custom_ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"
+
+        opts.setdefault("http_headers", {})
+        opts["http_headers"]["User-Agent"] = custom_ua
+        if "impersonate" in opts and ("srcAg=" in target_url):
             del opts["impersonate"]
 
         stop_event = asyncio.Event()
         poller_task = asyncio.create_task(self._poll_aria2_progress(jid, rpc_port, rpc_secret, stop_event))
-        try:
-            # We pass the completely unrolled and spoofed direct CDN URL to yt-dlp
-            await asyncio.to_thread(self._run_ytdlp, target_url, jid, opts)
+        try: await asyncio.to_thread(self._run_ytdlp, target_url, jid, opts)
         finally:
-            stop_event.set(); poller_task.cancel()
+            stop_event.set()
+            poller_task.cancel()
             try: await poller_task
             except asyncio.CancelledError: pass
 
     def _run_ytdlp(self, url: str, jid: str, base_opts: dict):
         opts = base_opts.copy()
-        opts["quiet"] = opts["noprogress"] = True
+        opts["quiet"] = True
+        opts["noprogress"] = True
+        self.db.log_trace(jid, "Executing aria2c-backed downloader...")
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl: ydl.extract_info(url, download=True)
-        except Exception as e: raise e
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info(url, download=True)
+        except Exception as e:
+            self.db.log_trace(jid, f"Download Error: {e}")
+            raise e
 
 
 class EncoderEngine:
