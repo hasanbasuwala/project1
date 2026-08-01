@@ -237,7 +237,7 @@ async def safe_copy(vault_id: int, chat_id: int, msg_id: int):
             return False
     return False
 
-async def process_history_sweep(chat_id: int, chat_title: str, target_tag: str = None, wipe_only: bool = False):
+async def process_history_sweep(chat_id: int, chat_title: str, target_tag: str = None, wipe_only: bool = False, delete_after: bool = True):
     await set_system_state("🟢", "Optimal", f"Gathering history from {chat_title}")
     messages_to_process = []
     
@@ -270,6 +270,7 @@ async def process_history_sweep(chat_id: int, chat_title: str, target_tag: str =
 
     processed_count = 0
     deleted_count = 0
+    copied_count = 0
     messages_to_process.reverse() 
 
     for msg in messages_to_process:
@@ -292,10 +293,12 @@ async def process_history_sweep(chat_id: int, chat_title: str, target_tag: str =
                     success = await safe_copy(vault_id, chat_id, msg.id)
 
         if success:
-            try:
-                await user.delete_messages(chat_id, msg.id)
-                deleted_count += 1
-            except: pass
+            copied_count += 1
+            if delete_after:
+                try:
+                    await user.delete_messages(chat_id, msg.id)
+                    deleted_count += 1
+                except: pass
 
         processed_count += 1
         
@@ -303,8 +306,13 @@ async def process_history_sweep(chat_id: int, chat_title: str, target_tag: str =
         if processed_count % 5 == 0:
             await set_system_state("🟢", "Optimal", f"Sweeping {chat_title} ({processed_count}/{total_count})")
 
-    mode = "wiped" if wipe_only else "vaulted and wiped"
-    asyncio.create_task(flash_message(f"✅ **Sweep Complete!**\n{chat_title}: {deleted_count} messages {mode}.", 20))
+    if wipe_only:
+        summary = f"{deleted_count} messages wiped."
+    elif delete_after:
+        summary = f"{deleted_count} messages vaulted and wiped."
+    else:
+        summary = f"{copied_count} messages copied to vault (originals kept)."
+    asyncio.create_task(flash_message(f"✅ **Sweep Complete!**\n{chat_title}: {summary}", 20))
     await set_system_state("🟢", "Optimal", "💤 Idle")
 
 
@@ -317,6 +325,7 @@ async def bot_start(client, message):
         "🔹 `/autoscan` - Scan history & active live monitor\n"
         "🔹 `/stopscan` - Stop monitoring a group\n"
         "🔹 `/vault` - Move a specific #tag (History)\n"
+        "🔹 `/copyonly` - Copy a #tag to vault, keep originals (History)\n"
         "🔹 `/wipe` - Delete a specific #tag (History)\n"
         "🔹 `/stopbot` - Shut down"
     )
@@ -329,7 +338,7 @@ async def cmd_dashboard(client, message):
     await update_dashboard()
     await message.delete() # keep chat clean
 
-@bot.on_message(filters.command(["autoscan", "stopscan", "vault", "wipe"]) & filters.user(config.OWNER_ID))
+@bot.on_message(filters.command(["autoscan", "stopscan", "vault", "wipe", "copyonly"]) & filters.user(config.OWNER_ID))
 async def initiate_command(client, message):
     cmd = message.command[0].lower()
     user_states[config.OWNER_ID] = {"action": cmd, "step": "need_group"}
@@ -342,7 +351,7 @@ async def bot_stopbot(client, message):
     await message.reply_text("🛑 **System Offline.**")
     os._exit(0)
 
-@bot.on_message(filters.text & filters.user(config.OWNER_ID) & ~filters.command(["start", "dashboard", "autoscan", "stopscan", "vault", "wipe", "stopbot"]))
+@bot.on_message(filters.text & filters.user(config.OWNER_ID) & ~filters.command(["start", "dashboard", "autoscan", "stopscan", "vault", "wipe", "copyonly", "stopbot"]))
 async def process_wizard_inputs(client, message):
     state = user_states.get(config.OWNER_ID)
     if not state: return 
@@ -363,7 +372,7 @@ async def process_wizard_inputs(client, message):
             try: await bot.delete_messages(config.OWNER_ID, state["prompt_msg"])
             except: pass
             
-            if action in ["vault", "wipe"]:
+            if action in ["vault", "wipe", "copyonly"]:
                 state["step"] = "need_tag"
                 prompt = await message.reply_text(f"🎯 Target: **{chat.title}**\nSend the exact **#hashtag**.")
                 state["prompt_msg"] = prompt.id
@@ -404,7 +413,9 @@ async def process_wizard_inputs(client, message):
         
         asyncio.create_task(flash_message(f"🚀 Initializing {action} for {tag} in {chat_title}..."))
         if action == "vault":
-            asyncio.create_task(process_history_sweep(chat_id, chat_title, target_tag=tag, wipe_only=False))
+            asyncio.create_task(process_history_sweep(chat_id, chat_title, target_tag=tag, wipe_only=False, delete_after=True))
+        elif action == "copyonly":
+            asyncio.create_task(process_history_sweep(chat_id, chat_title, target_tag=tag, wipe_only=False, delete_after=False))
         elif action == "wipe":
             asyncio.create_task(process_history_sweep(chat_id, chat_title, target_tag=tag, wipe_only=True))
 
