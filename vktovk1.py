@@ -493,87 +493,71 @@ class DownloaderEngine:
             video_id = None
             video_match = re.search(r'video(-?\d+_\d+)', url)
             if video_match: video_id = video_match.group(1)
+            
             if video_id:
                 vid_details = vk.video.get(videos=video_id)
                 if vid_details and vid_details.get('items'):
                     files = vid_details['items'][0].get('files', {})
-                    for q in ['mp4_1080', 'mp4_720', 'mp4_480', 'mp4_360', 'hls']:
-                        if q in files: return files[q]
-        except Exception: pass
+                    # Try to grab the highest quality direct MP4 URL first
+                    for q in ['mp4_1080', 'mp4_720', 'mp4_480', 'mp4_360']:
+                        if q in files: 
+                            cdn_url = files[q]
+                            # GHOST PROTOCOL: Spoof the CDN signature to GECKO
+                            if 'srcAg=' in cdn_url:
+                                cdn_url = re.sub(r'srcAg=[^&]+', 'srcAg=GECKO', cdn_url)
+                            else:
+                                cdn_url += '&srcAg=GECKO' if '?' in cdn_url else '?srcAg=GECKO'
+                            return cdn_url
+        except Exception as e:
+            print(f"VK API direct extraction failed: {e}")
         return None
-
-    @staticmethod
-    def _get_free_port() -> int:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]; s.close(); return port
-
-    @staticmethod
-    def _aria2_rpc_call(port: int, secret: str, method: str, params: list | None = None) -> dict:
-        payload = {"jsonrpc": "2.0", "id": "poll", "method": method, "params": [f"token:{secret}"] + (params or [])}
-        req = urllib.request.Request(f"http://127.0.0.1:{port}/jsonrpc", data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=3) as resp: return json.loads(resp.read())
-
-    async def _poll_aria2_progress(self, jid: str, port: int, secret: str, stop_event: asyncio.Event):
-        for _ in range(30):
-            if stop_event.is_set(): return
-            try: await asyncio.to_thread(self._aria2_rpc_call, port, secret, "aria2.tellActive"); break
-            except Exception: await asyncio.sleep(0.5)
-
-        last_db_update, seen_active, idle_ticks = 0.0, False, 0
-        while not stop_event.is_set():
-            try:
-                resp = await asyncio.to_thread(self._aria2_rpc_call, port, secret, "aria2.tellActive")
-                active = resp.get("result", [])
-            except Exception: active = None
-
-            if active:
-                seen_active, idle_ticks = True, 0
-                completed = sum(int(d.get("completedLength", 0)) for d in active)
-                total = sum(int(d.get("totalLength", 0)) for d in active)
-                speed_bps = sum(int(d.get("downloadSpeed", 0)) for d in active)
-
-                pct = (completed / total * 100.0) if total else 0.0
-                speed_str = f"{speed_bps / (1024 * 1024):.2f}MB/s" if speed_bps else "~"
-                eta_str = f"{int((total - completed) / speed_bps) // 60}m{int((total - completed) / speed_bps) % 60}s" if speed_bps > 0 and total > completed else "~"
-
-                now = time.time()
-                if now - last_db_update >= 1.0:
-                    await self.db.update_job(jid, pct=pct, stage=f"downloading | {speed_str} | {eta_str}")
-                    last_db_update = now
-            elif seen_active:
-                try: await asyncio.to_thread(self._aria2_rpc_call, port, secret, "aria2.shutdown")
-                except Exception: pass
-                idle_ticks += 1
-                if idle_ticks >= 8: return
-                seen_active = False
-            await asyncio.sleep(1.0)
 
     async def execute(self, job: dict):
         jid, original_url = job['id'], job['url']
         dl_dir = JOBS_DIR / f"JOB_{jid}" / "dl"
 
         await self.db.update_job(jid, stage="downloading | ~ | ~")
+        
+        # 1. Fetch direct CDN URL and apply Ghost Protocol signature
         extracted_cdn = await asyncio.to_thread(self._extract_vk_api, original_url, jid)
         target_url = extracted_cdn if extracted_cdn else original_url
 
         rpc_port, rpc_secret = self._get_free_port(), secrets.token_hex(8)
+        
+        # 2. Hardcode a strictly matching Firefox UA for the GECKO spoof
+        ghost_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0"
+
         opts = {
-            "outtmpl": str(dl_dir / f"{jid}.%(ext)s"), "format": "bestvideo[height<=1080]+bestaudio/best",
-            "merge_output_format": "mkv", "quiet": False, "noprogress": True, "no_warnings": True,
+            "outtmpl": str(dl_dir / f"{jid}.%(ext)s"), 
+            "format": "bestvideo[height<=1080]+bestaudio/best",
+            "merge_output_format": "mkv", 
+            "quiet": False, 
+            "noprogress": True, 
+            "no_warnings": True,
             "max_filesize": getattr(config, "VK_MAX_FILESIZE_BYTES", 2 * 1024 * 1024 * 1024),
             "external_downloader": "aria2c",
-            "external_downloader_args": [
-                "-c", "-j", "16", "-x", "16", "-s", "16", "-k", "5M", "--connect-timeout=15", "--timeout=15", 
-                "--max-tries=5", "--summary-interval=0", "--enable-rpc=true", f"--rpc-listen-port={rpc_port}",
-                f"--rpc-secret={rpc_secret}", "--rpc-listen-all=false"
-            ],
-            "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+            "http_headers": {"User-Agent": ghost_ua},  # Keep yt-dlp in sync
+            "external_downloader_args": {
+                "aria2c": [
+                    "-c", "-j", "16", "-x", "16", "-s", "16", "-k", "5M", 
+                    "--connect-timeout=15", "--timeout=15", "--max-tries=5", 
+                    "--summary-interval=0", "--enable-rpc=true", 
+                    f"--rpc-listen-port={rpc_port}", f"--rpc-secret={rpc_secret}", 
+                    "--rpc-listen-all=false",
+                    f"--header=User-Agent: {ghost_ua}" # Inject UA directly into aria2c
+                ]
+            }
         }
-        if "impersonate" in opts and ("srcAg=" in target_url): del opts["impersonate"]
+
+        # Ensure we don't trip yt-dlp's internal impersonation features if URL is already spoofed
+        if "impersonate" in opts and ("srcAg=" in target_url): 
+            del opts["impersonate"]
 
         stop_event = asyncio.Event()
         poller_task = asyncio.create_task(self._poll_aria2_progress(jid, rpc_port, rpc_secret, stop_event))
-        try: await asyncio.to_thread(self._run_ytdlp, target_url, jid, opts)
+        try:
+            # We pass the completely unrolled and spoofed direct CDN URL to yt-dlp
+            await asyncio.to_thread(self._run_ytdlp, target_url, jid, opts)
         finally:
             stop_event.set(); poller_task.cancel()
             try: await poller_task
