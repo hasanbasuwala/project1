@@ -51,25 +51,45 @@ async def get_or_create_vault(tag: str, original_chat_title: str):
         return None
 
 async def process_history_sweep(chat_id: int, chat_title: str, target_tag: str = None, wipe_only: bool = False):
-    """Sweeps history. If target_tag is provided, only processes that tag. If wipe_only, just deletes."""
+    """Sweeps history. If target_tag is provided, searches for it. Otherwise, scans all history."""
     await bot.send_message(config.OWNER_ID, f"🔄 **Starting sweep in {chat_title}**...\nGathering messages. This may take a moment.")
     
-    query = target_tag if target_tag else "#"
-    total_count = await user.search_messages_count(chat_id, query=query)
+    messages_to_process = []
     
-    if total_count == 0:
-        await bot.send_message(config.OWNER_ID, f"✅ No messages found for '{query}' in {chat_title}.")
+    try:
+        if target_tag:
+            # Telegram allows searching for specific words/tags like "#photo"
+            total_count = await user.search_messages_count(chat_id, query=target_tag)
+            if total_count == 0:
+                await bot.send_message(config.OWNER_ID, f"✅ No messages found for '{target_tag}' in {chat_title}.")
+                return
+                
+            status_msg = await bot.send_message(config.OWNER_ID, f"📊 Found {total_count} messages for '{target_tag}'. Fetching...")
+            
+            async for msg in user.search_messages(chat_id, query=target_tag):
+                messages_to_process.append(msg)
+        else:
+            # Telegram blocks searching for just "#", so we must scan the chat history directly
+            status_msg = await bot.send_message(config.OWNER_ID, f"📊 Scanning full chat history for any hashtags...")
+            
+            async for msg in user.get_chat_history(chat_id):
+                text = msg.text or msg.caption or ""
+                # Only keep messages that actually contain a hashtag to save memory
+                if "#" in text:
+                    messages_to_process.append(msg)
+                    
+            total_count = len(messages_to_process)
+            if total_count == 0:
+                await status_msg.edit_text(f"✅ No hashtagged messages found in {chat_title}.")
+                return
+            await status_msg.edit_text(f"📊 Found {total_count} hashtagged messages in history. Processing...")
+            
+    except Exception as e:
+        await bot.send_message(config.OWNER_ID, f"❌ Error gathering messages: {e}")
         return
-
-    status_msg = await bot.send_message(config.OWNER_ID, f"📊 Found {total_count} messages. Processing...")
 
     processed_count = 0
     deleted_count = 0
-    
-    messages_to_process = []
-    async for msg in user.search_messages(chat_id, query=query):
-        messages_to_process.append(msg)
-            
     messages_to_process.reverse() # Oldest to newest
 
     for msg in messages_to_process:
