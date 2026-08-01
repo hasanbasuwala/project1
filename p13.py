@@ -40,8 +40,33 @@ ALIGNMENT = 1024 * 1024            # 1 MB: MTProto strict offset alignment
 SCHEDULER_INFLIGHT_TARGET = DL_WORKERS * 2
 SCHEDULER_TICK = 0.5
 
-GLOBAL_MAX_CONCURRENT_SEGMENTS = 5
+# FIX: lowered from 5 -> 3. Too many concurrent raw MTProto segment streams sharing
+# the same session was causing "socket.send() raised exception / Broken pipe" errors
+# under load, especially on flaky connections. 3 is a safer ceiling.
+GLOBAL_MAX_CONCURRENT_SEGMENTS = 3
 global_segment_semaphore = asyncio.Semaphore(GLOBAL_MAX_CONCURRENT_SEGMENTS)
+
+# FIX: minimum delay (seconds) between kicking off parallel segment downloads for the
+# same file, so Telegram doesn't see a burst of simultaneous requests and start
+# dropping/resetting the connection.
+SEGMENT_STAGGER_SECONDS = 1.2
+
+# FIX: tolerance for verifying a downloaded segment/file is complete. Segments or final
+# files short by more than this fraction are treated as corrupt/truncated and retried,
+# instead of silently being passed along to VK as a "valid" (but broken) video.
+SIZE_MISMATCH_TOLERANCE = 0.01  # 1%
+
+# NETWORK HEALTH / CIRCUIT BREAKER
+# When a big batch (100+ videos) runs for a while, the same MTProto session can start
+# dropping writes ("socket.send() raised exception" / Broken pipe) under sustained
+# load even though individual segment retries succeed for a while. Instead of only
+# retrying the single segment that failed, track error frequency GLOBALLY: if too
+# many network errors happen in a short window, pause ALL transfers and force a
+# reconnect of the user session before resuming.
+NETWORK_ERROR_WINDOW = 90        # seconds - rolling window used to count errors
+NETWORK_ERROR_THRESHOLD = 6      # this many errors within the window trips the breaker
+NETWORK_COOLDOWN_SECONDS = 45    # how long to pause all transfers once tripped
+RECONNECT_MIN_INTERVAL = 60      # don't reconnect more than once per minute
 
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -69,7 +94,69 @@ except Exception as e:
     exit(1)
 
 bot_app = Client("bot_session", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.VK_BOT)
-user_app = Client("user_session", api_id=config.API_ID, api_hash=config.API_HASH, max_concurrent_transmissions=10, workers=10)
+user_app = Client("user_session", api_id=config.API_ID, api_hash=config.API_HASH, max_concurrent_transmissions=5, workers=10)
+
+# ============================================================
+# NETWORK HEALTH / CIRCUIT BREAKER STATE
+# ============================================================
+network_error_times = deque()
+network_cooldown_until = 0.0
+last_reconnect_time = 0.0
+reconnect_lock = asyncio.Lock()
+
+def _is_network_error(exc):
+    if isinstance(exc, (ConnectionError, OSError, TimeoutError)):
+        return True
+    msg = str(exc)
+    return any(s in msg for s in ("Broken pipe", "socket.send", "Connection reset"))
+
+async def record_network_error(exc):
+    """Call this whenever a download/upload hits a network-flavored error. If enough
+    of these land within NETWORK_ERROR_WINDOW seconds, trip the breaker: pause all
+    transfers for a cooldown and kick off a session reconnect in the background."""
+    global network_cooldown_until
+    now = time.time()
+    network_error_times.append(now)
+    while network_error_times and now - network_error_times[0] > NETWORK_ERROR_WINDOW:
+        network_error_times.popleft()
+
+    if len(network_error_times) >= NETWORK_ERROR_THRESHOLD and now >= network_cooldown_until:
+        network_cooldown_until = now + NETWORK_COOLDOWN_SECONDS
+        console.print(
+            f"[bold red]🚨 Network instability detected ({len(network_error_times)} errors in "
+            f"{NETWORK_ERROR_WINDOW}s). Pausing all transfers for {NETWORK_COOLDOWN_SECONDS}s "
+            f"and reconnecting the Telegram session...[/bold red]"
+        )
+        network_error_times.clear()
+        asyncio.create_task(reconnect_user_session())
+
+async def wait_out_network_cooldown():
+    """Workers call this before starting new network activity so a tripped breaker
+    actually stops new requests from piling onto an unhealthy connection."""
+    while time.time() < network_cooldown_until:
+        await asyncio.sleep(1)
+
+async def reconnect_user_session():
+    """Force-restart the Pyrogram user session. Guarded so only one reconnect runs at
+    a time and we don't reconnect more than once per RECONNECT_MIN_INTERVAL seconds
+    even if multiple workers trip the breaker around the same time."""
+    global last_reconnect_time
+    async with reconnect_lock:
+        now = time.time()
+        if now - last_reconnect_time < RECONNECT_MIN_INTERVAL:
+            return
+        last_reconnect_time = now
+        try:
+            console.print("[bold yellow]🔄 Restarting Telegram user session to recover from socket errors...[/bold yellow]")
+            try:
+                await user_app.stop()
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+            await user_app.start()
+            console.print("[bold green]✅ User session reconnected successfully.[/bold green]")
+        except Exception as e:
+            console.print(f"[bold red]❌ Failed to reconnect user session: {e}[/bold red]")
 
 # ============================================================
 # DATABASE & PERSISTENCE
@@ -271,23 +358,16 @@ async def list_playlists(limit=15):
         (limit,), fetch="all"
     )
 
-async def sync_vk_to_local_db(status_msg=None):
+async def sync_vk_to_local_db():
     """Fetches all albums/videos, purges unavailable/failed VK videos, 
     seeds SQLite with 'done' records, and purges duplicate [TG_ID] videos."""
     console.print("[bold cyan]🔄 Syncing state from VK and cleaning duplicate/broken uploads...[/bold cyan]")
-    if status_msg:
-        try:
-            await status_msg.edit_text(
-                "⚙️ **Booting Master Engine...**\n`[2/4]` 🔄 Syncing state from VK & purging broken/duplicate uploads...",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        except Exception:
-            pass
-
     synced_count = 0
     deleted_duplicates_count = 0
     deleted_broken_count = 0
-    seen_msg_ids = {}
+    
+    # CHANGED: Now a dictionary mapping msg_id -> video_id
+    seen_msg_ids = {} 
 
     try:
         albums_resp = await asyncio.to_thread(vk.video.getAlbums, owner_id=my_vk_id, count=100)
@@ -335,6 +415,7 @@ async def sync_vk_to_local_db(status_msg=None):
                         msg_id = int(match.group(1))
                         
                         if msg_id in seen_msg_ids:
+                            # NEW LOGIC: Only delete if it's an actual different video file on VK
                             if seen_msg_ids[msg_id] != video_id:
                                 try:
                                     await asyncio.to_thread(vk.video.delete, owner_id=my_vk_id, video_id=video_id)
@@ -780,10 +861,16 @@ async def _download_segment(client, file_id, chunk_offset, chunk_limit, part_fil
     async with global_segment_semaphore:
         retries = 5
         while retries > 0:
+            # FIX: if the circuit breaker has tripped (too many network errors across
+            # the whole batch recently), wait it out before hammering the connection
+            # with yet another attempt.
+            await wait_out_network_cooldown()
+
             downloaded_this_attempt = 0
             try:
                 buffer = bytearray()
                 with open(part_file, "wb") as f:
+                    # Pass file_id instead of message object to prevent Pyrogram re-fetches
                     async for chunk in client.stream_media(file_id, limit=chunk_limit, offset=chunk_offset):
                         if job_id in cancelled_jobs:
                             raise Exception("ForceAbort")
@@ -800,16 +887,43 @@ async def _download_segment(client, file_id, chunk_offset, chunk_limit, part_fil
                     if buffer:
                         f.write(buffer)
                         buffer.clear()
+
+                # FIX: verify the segment actually received the number of bytes it was
+                # asked for. Pyrogram's stream_media can end early (connection dip,
+                # DC hiccup) WITHOUT raising, which previously let a truncated segment
+                # silently pass through, get concatenated, pass ffprobe's duration
+                # check, and get uploaded to VK as a "video unavailable" file.
+                expected_bytes = chunk_limit * CHUNK_SIZE
+                actual_bytes = os.path.getsize(part_file) if os.path.exists(part_file) else 0
+                # allow shrinkage up to one chunk (the last chunk of the whole file is
+                # very often smaller than CHUNK_SIZE) plus a small tolerance
+                min_acceptable = expected_bytes - CHUNK_SIZE - int(expected_bytes * SIZE_MISMATCH_TOLERANCE)
+                if actual_bytes < max(0, min_acceptable):
+                    raise Exception(f"SegmentSizeMismatch: got {actual_bytes}, expected ~{expected_bytes}")
+
                 break
             except Exception as e:
                 if str(e) == "ForceAbort":
                     raise
                 retries -= 1
                 await tracker.update(-downloaded_this_attempt)
+
+                # FIX: feed network-flavored errors (broken pipe, socket.send, connection
+                # reset, etc.) into the global circuit breaker. A single segment retrying
+                # on its own doesn't tell us the SESSION is unhealthy — but if this is
+                # happening across many segments/jobs in a short window, the breaker trips
+                # and forces a full reconnect instead of everyone retrying into a dead pipe.
+                if _is_network_error(e):
+                    await record_network_error(e)
+
                 if retries == 0:
                     raise e
-                console.print(f"[yellow]⚠️ Network dip ({e.__class__.__name__}), retrying in 5s... ({retries} left)[/yellow]")
-                await asyncio.sleep(5)
+                # FIX: escalating backoff (5s, 10s, 15s, 20s) instead of a flat 5s, so
+                # repeated failures on the same segment back off progressively rather
+                # than retrying at a fixed rate into a connection that needs more time.
+                backoff = 5 * (5 - retries)
+                console.print(f"[yellow]⚠️ Network dip ({e.__class__.__name__}: {e}), retrying in {backoff}s... ({retries} left)[/yellow]")
+                await asyncio.sleep(backoff)
 
 async def async_fast_download(client, message, file_path, progress_callback, job_id):
     media = message.video or message.document
@@ -817,7 +931,7 @@ async def async_fast_download(client, message, file_path, progress_callback, job
         raise Exception("No valid media found in message.")
         
     file_size = media.file_size
-    file_id = media.file_id
+    file_id = media.file_id  # Extract raw file_id
     
     total_chunks = math.ceil(file_size / CHUNK_SIZE)
     parts_count = get_part_count(file_size)
@@ -855,7 +969,10 @@ async def async_fast_download(client, message, file_path, progress_callback, job
                 )
             )
         )
-        await asyncio.sleep(0.3)
+        # FIX: stagger part kickoffs using SEGMENT_STAGGER_SECONDS (was 0.3s, which
+        # didn't match the intent described in the inline comment and was too fast
+        # for Telegram to tolerate several concurrent fresh streams).
+        await asyncio.sleep(SEGMENT_STAGGER_SECONDS)
 
     try:
         await asyncio.gather(*tasks)
@@ -863,6 +980,12 @@ async def async_fast_download(client, message, file_path, progress_callback, job
         for task in tasks:
             if not task.done():
                 task.cancel()
+        # FIX: clean up any partial part files left behind on failure so a later
+        # retry doesn't get confused by stale, incomplete part files on disk.
+        for part in part_files:
+            if os.path.exists(part):
+                try: os.remove(part)
+                except: pass
         raise e
 
     with open(file_path, 'wb') as outfile:
@@ -875,6 +998,20 @@ async def async_fast_download(client, message, file_path, progress_callback, job
                             break
                         outfile.write(chunk)
                 os.remove(part)
+
+    # FIX: final integrity check on the fully concatenated file. This is the last
+    # line of defense before the file goes to _validate_video_file/ffprobe, which
+    # only checks for a nonzero duration and can pass on a truncated MP4 whose
+    # moov atom is intact but whose media data is cut short. If the assembled file
+    # doesn't match Telegram's reported size (within tolerance), delete it and fail
+    # loudly so the job gets requeued instead of quietly reaching VK broken.
+    final_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+    if final_size < file_size * (1 - SIZE_MISMATCH_TOLERANCE):
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
+        raise Exception(f"IncompleteDownload: assembled {final_size} bytes, expected {file_size} bytes")
 
     return file_path
 
@@ -1114,6 +1251,9 @@ async def download_worker(worker_id):
                 continue
 
             await pause_event.wait()
+            # FIX: if the circuit breaker is currently tripped, hold this job here
+            # rather than starting a fresh download attempt into an unhealthy session.
+            await wait_out_network_cooldown()
             while free_space_gb() < MIN_FREE_GB: await asyncio.sleep(5)
 
             active_jobs[dl_key] = {"name": display_name, "action": "📥 DL", "progress": 0, "speed": "0 MB/s", "eta": "Calc...", "start_time": time.time(), "job_id": job_id}
@@ -1129,8 +1269,11 @@ async def download_worker(worker_id):
                     msg = await user_app.get_messages(job['msg_chat_id'], job['msg_id'])
                     break
                 except Exception as e:
+                    if _is_network_error(e):
+                        await record_network_error(e)
                     console.print(f"[yellow]⚠️ Failed to fetch Telegram msg ({e}), retrying {attempt+1}/5...[/yellow]")
                     await asyncio.sleep(3)
+                    await wait_out_network_cooldown()
 
             if not msg:
                 raise Exception("FailedToFetchMessage")
@@ -1221,6 +1364,7 @@ async def upload_worker(worker_id):
                 await download_queue_t2.put(job) 
                 continue
 
+            # --- STRICT VK ALBUM VALIDATION ---
             album_id = job.get('album_id')
             album_name = job.get('album_name')
             if not album_id or album_id <= 0:
@@ -1322,7 +1466,13 @@ async def render_dashboard():
         tags_count = await db_execute("SELECT COUNT(*) FROM selected_tags", fetch="one")
         t_count = tags_count[0] if tags_count else 0
 
+        breaker_line = ""
+        if time.time() < network_cooldown_until:
+            remaining = int(network_cooldown_until - time.time())
+            breaker_line = f"🚨 **Network cooldown active** — resuming in ~{remaining}s\n"
+
         text = (f"📊 **GLOBAL TRANSFER ENGINE**\n{_engine_banner()} | 💾 Free Disk: {free_space_gb():.1f} GB\n"
+                f"{breaker_line}"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"📥 **Downloading:** {len(active_dls)} Active | {queued_dl} Queued\n"
                 f"📦 **Staged on Disk:** {staged_up} Files\n"
@@ -1583,6 +1733,7 @@ async def refresh_cmd(client, message):
         parse_mode=ParseMode.MARKDOWN
     )
 
+    # 1. Clear memory queues
     while not download_queue_t1.empty():
         download_queue_t1.get_nowait()
         download_queue_t1.task_done()
@@ -1599,6 +1750,7 @@ async def refresh_cmd(client, message):
     vk_video_title_cache.clear()
     vk_album_name_cache.clear()
 
+    # 2. Reset local tables
     await db_execute("DELETE FROM jobs WHERE status != 'done'")
     await db_execute("UPDATE monitored_messages SET is_queued=0")
 
@@ -1607,6 +1759,7 @@ async def refresh_cmd(client, message):
         parse_mode=ParseMode.MARKDOWN
     )
 
+    # 3. Resync live from VK
     synced_cnt, dupes_cnt, broken_cnt = await sync_vk_to_local_db()
 
     await status_msg.edit_text(
@@ -1616,6 +1769,7 @@ async def refresh_cmd(client, message):
 
     await asyncio.sleep(1)
 
+    # 4. Resume engine
     engine_state = ENGINE_RUNNING if prev_state == ENGINE_RUNNING else prev_state
     if engine_state == ENGINE_RUNNING:
         pause_event.set()
@@ -2151,30 +2305,9 @@ async def handle_buttons(client, callback):
 # ============================================================
 async def main():
     global engine_state
-    
-    # 1. Connect to Telegram FIRST
-    console.print("[bold yellow]Connecting to Telegram...[/bold yellow]")
     await user_app.start()
     await bot_app.start()
-    console.print("[bold green]✅ Telegram Connected![/bold green]")
 
-    # 2. Immediately send or update live boot message on Telegram
-    boot_msg = None
-    dashboard_chat_id = await get_control("dashboard_chat_id")
-    if dashboard_chat_id:
-        try:
-            boot_msg = await bot_app.send_message(
-                chat_id=int(dashboard_chat_id),
-                text="⚙️ **System Online / Boot Sequence Initiated...**\n`[1/4]` Bot connected to Telegram. Registering commands...",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            try: await boot_msg.pin(both_sides=True)
-            except: pass
-            await set_control("dashboard_msg_id", boot_msg.id)
-        except Exception as e:
-            console.print(f"[bold red]Failed to send boot message to Telegram: {e}[/bold red]")
-
-    # 3. Register Bot Commands
     await bot_app.set_bot_commands([
         BotCommand("start", "⚙️ Master Dashboard"),
         BotCommand("refresh", "🔄 Refresh DB & Resync VK"),
@@ -2183,31 +2316,34 @@ async def main():
         BotCommand("monitor", "👁️ Monitor Chat History")
     ])
 
-    # 4. Sync VK State with live updates sent to Telegram boot_msg
-    synced_cnt, dupes_cnt, broken_cnt = await sync_vk_to_local_db(status_msg=boot_msg)
+    await sync_vk_to_local_db()
 
-    if boot_msg:
-        try:
-            await boot_msg.edit_text(
-                f"⚙️ **Boot Sequence**\n`[3/4]` ♻️ Recovering queue & scanning monitored chats...\n_(Indexed: `{synced_cnt}`, Dupes Cleaned: `{dupes_cnt}`, Broken Cleaned: `{broken_cnt}`)_",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        except Exception:
-            pass
+    console.print("[bold green]✅ BotFather command menu set.[/bold green]")
 
-    # 5. Restore persistent engine state
     saved_state = await get_control("engine_state", ENGINE_RUNNING)
     engine_state = saved_state if saved_state in (ENGINE_RUNNING, ENGINE_PAUSED) else ENGINE_RUNNING
     if engine_state != ENGINE_RUNNING:
         pause_event.clear()
 
-    # 6. Resume background history scans
     monitored_targets = await db_execute("SELECT chat_identifier, resolved_id FROM monitored_chats", fetch="all")
     if monitored_targets:
         for c_id, r_id in monitored_targets:
             asyncio.create_task(scan_chat_history(c_id, r_id))
 
-    # 7. Recovery for Always-Monitors (/MonitorAlways)
+    dashboard_chat_id = await get_control("dashboard_chat_id")
+    if dashboard_chat_id:
+        try:
+            dash_msg = await bot_app.send_message(
+                chat_id=int(dashboard_chat_id),
+                text="⚙️ **System Online / Reboot Detected**\nBooting Master Dashboard...",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            try: await dash_msg.pin(both_sides=True)
+            except: pass
+            await set_control("dashboard_msg_id", dash_msg.id)
+        except Exception as e:
+            console.print(f"[bold red]Failed to auto-pin fresh dashboard on startup: {e}[/bold red]")
+
     always_groups = await db_execute("SELECT chat_id, chat_title, status, last_msg_id FROM always_monitors", fetch="all")
     if always_groups:
         for c_id, title, st, last_mid in always_groups:
@@ -2247,7 +2383,6 @@ async def main():
                     parse_mode=ParseMode.MARKDOWN
                 )
 
-    # 8. Recovery for Selective Monitors (/MonitorSelected)
     selected_groups = await db_execute("SELECT chat_id, chat_title, status, last_msg_id FROM selected_monitors", fetch="all")
     tags_rows = await db_execute("SELECT tag FROM selected_tags", fetch="all")
     registered_tags = [r[0] for r in tags_rows] if tags_rows else []
@@ -2304,7 +2439,8 @@ async def main():
                     parse_mode=ParseMode.MARKDOWN
                 )
 
-    # 9. Recover Pending Jobs (excluding 'done' and 'cancelled')
+    # 7. Recover Queue State from Database
+    # FIX: Exclude 'done' and 'cancelled' jobs entirely so we don't try to download vk_sync dummy entries
     rows = await db_execute(
         "SELECT job_id, playlist_id, chat_id, msg_chat_id, msg_id, album_id, album_name, query, idx, is_pilot, status, file_path, caption, tier FROM jobs WHERE status NOT IN ('done', 'cancelled')",
         fetch="all"
@@ -2353,6 +2489,7 @@ async def main():
                     await update_job_status(job['job_id'], "queued")
                     await target_q.put(job)
                 elif job['playlist_id']:
+                    # FIX: Only push to the active scheduler if the playlist isn't waiting for pilot confirmation
                     pl_row = await get_playlist(job['playlist_id'])
                     if pl_row and pl_row[5] in ("RUNNING", "PILOT_RUNNING"):
                         enqueue_playlist_job(job['playlist_id'], job)
@@ -2362,7 +2499,6 @@ async def main():
             recovered += 1
         console.print(f"[bold yellow]♻️ Recovered {recovered} jobs.[/bold yellow]")
 
-    # 10. Prime VK Cache
     active_playlists = await db_execute(
         "SELECT DISTINCT album_id FROM playlists WHERE status NOT IN ('KILLED','COMPLETED')", fetch="all"
     )
@@ -2370,22 +2506,10 @@ async def main():
         if album_id:
             await refresh_vk_cache(album_id)
 
-    # 11. Launch Workers & Render Dashboard
     asyncio.create_task(dashboard_updater())
     asyncio.create_task(scheduler_loop())
     for i in range(DL_WORKERS): asyncio.create_task(download_worker(i))
     for i in range(UP_WORKERS): asyncio.create_task(upload_worker(i))
-
-    if boot_msg:
-        try:
-            await boot_msg.edit_text(
-                "⚙️ **System Online / Boot Sequence Complete**\n`[4/4]` Loading Master Dashboard...",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        except Exception:
-            pass
-
-    await render_dashboard()
 
     with Live(progress_ui, console=console, refresh_per_second=4):
         console.print("[bold green]🚀 Master Engine Online. Bot menu ready![/bold green]")
