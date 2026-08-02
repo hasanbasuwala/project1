@@ -678,6 +678,24 @@ async def _safe_stop_all():
                 await client.stop()
         except Exception:
             pass
+            
+# --- DEBUGGING COMMANDS ---
+@bot.on_message(filters.command("ping"))
+async def ping_bot(client, message):
+    await message.reply_text("🏓 Control Bot is alive!")
+
+@user.on_message(filters.command("ping", prefixes=["/", "."]) & filters.me)
+async def ping_user(client, message):
+    await message.reply_text("🏓 Userbot is alive!")
+
+# CATCH-ALL: Will print literally anything the bots see
+@bot.on_message()
+async def bot_catch_all(client, message):
+    print(f"🤖 [BOT SAW] -> {message.chat.type}: {message.text or 'Media'}")
+
+@user.on_message(filters.me)
+async def user_catch_all(client, message):
+    print(f"👤 [USER SAW] -> {message.chat.type}: {message.text or 'Media'}")
 
 import pyrogram
 
