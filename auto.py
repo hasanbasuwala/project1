@@ -3,7 +3,8 @@ import json
 import os
 import re
 from datetime import datetime
-from pyrogram import Client, filters, compose
+from pyrogram import Client, filters
+import pyrogram
 from pyrogram.errors import FloodWait, UserRestricted
 from pyrogram.types import Message
 import config
@@ -63,11 +64,11 @@ def save_db():
 # ==========================================
 # 2. CLIENT INITIALIZATION
 # ==========================================
-user = Client("userbott_session", api_id=config.API_ID, api_hash=config.API_HASH)
-bot = Client("bott_session", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.SORT_TOKEN)
+user = Client("userbot_session", api_id=config.API_ID, api_hash=config.API_HASH)
+bot = Client("bot_session", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN)
 
 # ==========================================
-# 3. HELPER FUNCTIONS
+# 3. HELPER FUNCTIONS & DASHBOARD
 # ==========================================
 async def set_system_state(icon, text, action=None):
     sys_status["icon"] = icon
@@ -91,11 +92,13 @@ async def update_dashboard():
             await bot.edit_message_text(config.OWNER_ID, db["dashboard_msg_id"], dashboard_text)
         else:
             msg = await bot.send_message(config.OWNER_ID, dashboard_text)
+            await bot.pin_chat_message(config.OWNER_ID, msg.id, disable_notification=True)
             db["dashboard_msg_id"] = msg.id
             save_db()
     except Exception:
-        # If message was deleted or not found, send a new one
+        # If message was deleted or not found, send a new one and re-pin
         msg = await bot.send_message(config.OWNER_ID, dashboard_text)
+        await bot.pin_chat_message(config.OWNER_ID, msg.id, disable_notification=True)
         db["dashboard_msg_id"] = msg.id
         save_db()
 
@@ -174,13 +177,11 @@ async def process_history_sweep(chat_id: int, target_tag=None, delete_after=Fals
     async for msg in user.get_chat_history(chat_id):
         text = msg.text or msg.caption or ""
         
-        # If target_tag is provided, only grab messages with that exact tag
         if target_tag:
             norm_target = normalize_tag(target_tag)
             if norm_target in text.lower():
                 messages_to_process.append(msg)
         else:
-            # Full scan: grab anything with a hashtag
             if "#" in text:
                 messages_to_process.append(msg)
 
@@ -204,7 +205,6 @@ async def process_history_sweep(chat_id: int, target_tag=None, delete_after=Fals
         success_for_msg = False
         
         for tag in tags:
-            # Get original case of the tag if we extracted it, otherwise use provided
             original_tag = target_tag if target_tag else tag
             
             vault_id = await get_or_create_vault(original_tag)
@@ -307,16 +307,38 @@ async def network_watchdog():
 
 async def main():
     load_db()
-    print("Starting User and Bot clients...")
-    await compose([user, bot])
+    print("[Termux Logger] Initialization started...")
+
+    # 1. Start Bot Client and Ping
+    print("[Termux Logger] Starting Bot Client...")
+    await bot.start()
+    await bot.send_message(config.OWNER_ID, "🤖 **Bot Client Started Successfully!**")
+    print("[Termux Logger] ✅ Bot Client active.")
+
+    # 2. Start User Client and Ping
+    print("[Termux Logger] Starting User Client...")
+    await user.start()
+    await user.send_message("me", "👤 **Userbot Client Started Successfully!**")
+    print("[Termux Logger] ✅ User Client active.")
+
+    # 3. Kick off background tasks
     asyncio.create_task(network_watchdog())
+    print("[Termux Logger] Background watchdog running.")
+
+    # 4. Generate and Pin Dashboard
+    print("[Termux Logger] Pushing Dashboard to DMs...")
     await set_system_state("🟢", "System Idle", "Online")
-    print("Autoscan system is running.")
     
+    print("\n[Termux Logger] 🚀 Autoscan system is fully running! Waiting for commands...\n")
+    
+    # Keep the script alive
     await pyrogram.idle()
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nSystem gracefully stopped.")
+        print("\n[Termux Logger] Stopping clients...")
+        asyncio.run(user.stop())
+        asyncio.run(bot.stop())
+        print("[Termux Logger] System gracefully stopped.")
