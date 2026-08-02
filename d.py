@@ -1,376 +1,174 @@
 import asyncio
-import json
-import os
-import re
 from datetime import datetime
-from pyrogram import Client, filters, compose
-from pyrogram.errors import FloodWait, UserRestricted
-
+from pyrogram import Client, filters
+from pyrogram.errors import FloodWait
 import config
 
-DB_FILE = "autoscan_db.json"
+# Initialize the Pyrogram client using credentials from config.py
+app = Client("my_userbot", api_id=config.API_ID, api_hash=config.API_HASH)
 
-# --- DATABASE MANAGEMENT ---
-def load_db():
-    if not os.path.exists(DB_FILE):
-        return {
-            "monitored_groups": {}, # changed to dict to store titles: {id: title}
-            "vaults": {},
-            "dashboard_msg_id": None,
-            "stats": {"vaults_created": 0, "messages_vaulted": 0, "waits_avoided": 0}
-        }
-    with open(DB_FILE, "r") as f:
-        db_data = json.load(f)
-        # Handle migration if coming from old list-based monitored_groups
-        if isinstance(db_data.get("monitored_groups"), list):
-            db_data["monitored_groups"] = {str(k): "Unknown Group" for k in db_data["monitored_groups"]}
-        if "stats" not in db_data:
-            db_data["stats"] = {"vaults_created": 0, "messages_vaulted": 0, "waits_avoided": 0}
-        return db_data
-
-def save_db(db_data):
-    with open(DB_FILE, "w") as f:
-        json.dump(db_data, f, indent=4)
-
-db = load_db()
-
-# --- INITIALIZE CLIENTS ---
-user = Client("my_userbot", api_id=config.API_ID, api_hash=config.API_HASH, sleep_threshold=60)
-bot = Client("my_control_bot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.SORT_TOKEN)
-
-user_states = {}
-sys_status = {"status_icon": "🟢", "status_text": "Optimal", "current_action": "💤 Idle"}
-
-# --- DASHBOARD & UI FUNCTIONS ---
-async def update_dashboard():
-    """Generates and updates the pinned Job Card in the bot chat."""
-    groups_list = ""
-    if not db["monitored_groups"]:
-        groups_list = "None"
-    else:
-        for idx, (cid, title) in enumerate(db["monitored_groups"].items(), 1):
-            groups_list += f"{idx}. {title} (`{cid}`)\n"
-
-    stats = db["stats"]
-    now = datetime.now().strftime("%H:%M:%S")
-
-    dashboard_text = (
-        "🛠 **AUTOSCAN JOB CARD** 🛠\n\n"
-        f"📡 **System Status:** {sys_status['status_icon']} {sys_status['status_text']}\n"
-        f"🔄 **Current Action:** {sys_status['current_action']}\n\n"
-        f"📂 **Active Monitored Groups:**\n{groups_list}\n"
-        f"📊 **Session Stats:**\n"
-        f"🔹 Vaults Created: `{stats['vaults_created']}`\n"
-        f"🔹 Messages Vaulted: `{stats['messages_vaulted']}`\n"
-        f"🔹 FloodWaits Handled: `{stats['waits_avoided']}`\n\n"
-        f"*(Last Updated: {now})*"
-    )
-
-    try:
-        if db["dashboard_msg_id"]:
-            await bot.edit_message_text(config.OWNER_ID, db["dashboard_msg_id"], dashboard_text)
-        else:
-            msg = await bot.send_message(config.OWNER_ID, dashboard_text)
-            db["dashboard_msg_id"] = msg.id
-            save_db(db)
-            await bot.pin_chat_message(config.OWNER_ID, msg.id)
-    except Exception as e:
-        # If message was deleted manually, resend it
-        if "MESSAGE_ID_INVALID" in str(e) or "MESSAGE_NOT_MODIFIED" not in str(e):
-            msg = await bot.send_message(config.OWNER_ID, dashboard_text)
-            db["dashboard_msg_id"] = msg.id
-            save_db(db)
-            try:
-                await bot.pin_chat_message(config.OWNER_ID, msg.id)
-            except: pass
-
-async def flash_message(text: str, delay: int = 10):
-    """Sends a message and deletes it after X seconds to keep the chat clean."""
-    try:
-        msg = await bot.send_message(config.OWNER_ID, text)
-        await asyncio.sleep(delay)
-        await msg.delete()
-    except Exception:
-        pass
-
-async def set_system_state(icon, text, action=None):
-    """Helper to update state and trigger dashboard refresh."""
-    sys_status["status_icon"] = icon
-    sys_status["status_text"] = text
-    if action:
-        sys_status["current_action"] = action
-    await update_dashboard()
-
-# --- CORE LOGIC WITH SAFETY PAUSES ---
-async def get_or_create_vault(tag: str, original_chat_title: str):
-    if tag in db["vaults"]:
-        return db["vaults"][tag]
+@app.on_message(filters.command("wipe", prefixes=["/", "."]) & filters.me)
+async def wipe_messages_advanced(client: Client, message):
+    """Searches for a caption/word and deletes all matching messages with live feedback."""
+    command_parts = message.text.split(" ", 1)
+    if len(command_parts) < 2:
+        await message.reply_text("⚠️ Usage: `/wipe #caption`")
+        return
     
-    vault_title = f"{original_chat_title[:30]} Vault - {tag}"
-    max_retries = 3
-    
-    for attempt in range(max_retries):
-        try:
-            await set_system_state("⏳", "Creating Group...", f"Vault for {tag}")
-            new_group = await user.create_supergroup(vault_title, f"Auto-archived messages for {tag}")
-            
-            db["vaults"][tag] = new_group.id
-            db["stats"]["vaults_created"] += 1
-            save_db(db)
-            
-            asyncio.create_task(flash_message(f"🆕 **Vault Created:** {tag}"))
-            
-            # Anti-spam cooldown
-            await set_system_state("🟡", "Anti-Spam Cooldown", f"Resting for 15s after creating {tag}")
-            await asyncio.sleep(15)
-            await set_system_state("🟢", "Optimal")
-            return new_group.id
-            
-        except FloodWait as e:
-            db["stats"]["waits_avoided"] += 1
-            save_db(db)
-            wait_time = e.value + 5
-            await set_system_state("🔴", f"Rate Limited", f"Waiting {wait_time}s before retrying {tag}")
-            await asyncio.sleep(wait_time)
-            await set_system_state("🟢", "Optimal")
-            
-        except UserRestricted:
-            await set_system_state("🚫", "Account Restricted", "Telegram temporarily blocked group creation.")
-            asyncio.create_task(flash_message("🚨 **ALERT:** Telegram restricted your account from creating new groups for now.", 30))
-            return None
-            
-        except Exception as e:
-            print(f"❌ Failed to create vault for {tag}: {e}")
-            return None
-            
-    asyncio.create_task(flash_message(f"⚠️ Skipped creating vault for {tag} after 3 failed attempts.", 15))
-    return None
+    query = command_parts[1]
+    chat_id = message.chat.id
+    status = await message.reply_text(f"🔍 Checking Telegram servers for '{query}'...")
 
-async def safe_copy(vault_id: int, chat_id: int, msg_id: int):
-    for attempt in range(3):
-        try:
-            await user.copy_message(chat_id=vault_id, from_chat_id=chat_id, message_id=msg_id)
-            db["stats"]["messages_vaulted"] += 1
-            save_db(db)
-            await asyncio.sleep(0.5) 
-            return True
-        except FloodWait as e:
-            db["stats"]["waits_avoided"] += 1
-            save_db(db)
-            await set_system_state("🔴", f"Rate Limited", f"Waiting {e.value}s to copy message")
-            await asyncio.sleep(e.value + 2)
-            await set_system_state("🟢", "Optimal")
-        except Exception:
-            return False
-    return False
-
-async def process_history_sweep(chat_id: int, chat_title: str, target_tag: str = None, wipe_only: bool = False):
-    await set_system_state("🟢", "Optimal", f"Gathering history from {chat_title}")
-    messages_to_process = []
+    # 1. INSTANT FEEDBACK: Ask Telegram for the exact count first
+    total_count = await client.search_messages_count(chat_id, query=query)
     
-    try:
-        if target_tag:
-            total_count = await user.search_messages_count(chat_id, query=target_tag)
-            if total_count == 0:
-                asyncio.create_task(flash_message(f"✅ No messages found for '{target_tag}' in {chat_title}."))
-                await set_system_state("🟢", "Optimal", "💤 Idle")
-                return
-                
-            async for msg in user.search_messages(chat_id, query=target_tag):
-                messages_to_process.append(msg)
-        else:
-            async for msg in user.get_chat_history(chat_id):
-                text = msg.text or msg.caption or ""
-                if "#" in text:
-                    messages_to_process.append(msg)
-                    
-            total_count = len(messages_to_process)
-            if total_count == 0:
-                asyncio.create_task(flash_message(f"✅ No hashtagged messages found in {chat_title}."))
-                await set_system_state("🟢", "Optimal", "💤 Idle")
-                return
-            
-    except Exception as e:
-        asyncio.create_task(flash_message(f"❌ Error gathering messages: {e}"))
-        await set_system_state("🟢", "Optimal", "💤 Idle")
+    if total_count == 0:
+        await status.edit_text(f"❌ No messages found containing '{query}'.")
         return
 
-    processed_count = 0
+    await status.edit_text(f"📊 **Found {total_count} messages.**\n⚙️ Gathering message data...")
+
+    # 2. GATHER DATA & USEFUL INFO
+    message_ids = []
+    oldest_date = None
+    newest_date = None
+
+    # Fetch the actual messages
+    async for msg in client.search_messages(chat_id, query=query):
+        message_ids.append(msg.id)
+        
+        # Track the time range of the messages
+        if msg.date:
+            if not newest_date:
+                newest_date = msg.date # First message is the newest
+            oldest_date = msg.date     # Last message in the loop is the oldest
+
+    # 3. LIVE PROGRESS DELETION
+    # Pyrogram can delete chunks of 100 messages at a time
+    chunk_size = 100
     deleted_count = 0
-    messages_to_process.reverse() 
 
-    for msg in messages_to_process:
-        text = msg.text or msg.caption or ""
-        tags = list(set(re.findall(r'(#\w+)', text.lower())))
+    for i in range(0, len(message_ids), chunk_size):
+        chunk = message_ids[i:i + chunk_size]
+        await client.delete_messages(chat_id, chunk)
+        deleted_count += len(chunk)
         
-        if target_tag:
-            if target_tag.lower() not in tags: continue
-            tags = [target_tag.lower()]
-            
-        if not tags: continue
-            
-        success = False
-        if wipe_only:
-            success = True
-        else:
-            for tag in tags:
-                vault_id = await get_or_create_vault(tag, chat_title)
-                if vault_id:
-                    success = await safe_copy(vault_id, chat_id, msg.id)
+        # Update the status message every chunk
+        await status.edit_text(f"🗑️ **Deleting...** {deleted_count} / {total_count} messages processed.")
+        await asyncio.sleep(1) # Prevent rate limits on status updates
 
-        if success:
-            try:
-                await user.delete_messages(chat_id, msg.id)
-                deleted_count += 1
-            except: pass
-
-        processed_count += 1
-        
-        # Update dashboard every 5 messages to show progress
-        if processed_count % 5 == 0:
-            await set_system_state("🟢", "Optimal", f"Sweeping {chat_title} ({processed_count}/{total_count})")
-
-    mode = "wiped" if wipe_only else "vaulted and wiped"
-    asyncio.create_task(flash_message(f"✅ **Sweep Complete!**\n{chat_title}: {deleted_count} messages {mode}.", 20))
-    await set_system_state("🟢", "Optimal", "💤 Idle")
-
-
-# --- BOT COMMAND INTERFACE ---
-@bot.on_message(filters.command("start") & filters.user(config.OWNER_ID))
-async def bot_start(client, message):
-    text = (
-        "🤖 **AutoScan Control Panel**\n"
-        "🔹 `/dashboard` - Refresh/Pin the Job Card\n"
-        "🔹 `/autoscan` - Scan history & active live monitor\n"
-        "🔹 `/stopscan` - Stop monitoring a group\n"
-        "🔹 `/vault` - Move a specific #tag (History)\n"
-        "🔹 `/wipe` - Delete a specific #tag (History)\n"
-        "🔹 `/stopbot` - Shut down"
+    # 4. FINAL REPORT WITH USEFUL INFO
+    report = (
+        f"✅ **Cleanup Complete!**\n\n"
+        f"**Search Query:** `{query}`\n"
+        f"**Total Wiped:** {deleted_count} messages\n"
     )
-    await message.reply_text(text)
-
-@bot.on_message(filters.command("dashboard") & filters.user(config.OWNER_ID))
-async def cmd_dashboard(client, message):
-    # Force resend of dashboard
-    db["dashboard_msg_id"] = None 
-    await update_dashboard()
-    await message.delete() # keep chat clean
-
-@bot.on_message(filters.command(["autoscan", "stopscan", "vault", "wipe"]) & filters.user(config.OWNER_ID))
-async def initiate_command(client, message):
-    cmd = message.command[0].lower()
-    user_states[config.OWNER_ID] = {"action": cmd, "step": "need_group"}
-    prompt = await message.reply_text(f"🛠️ **Command:** `/{cmd}`\nSend the **Group ID** or **Username**.")
-    user_states[config.OWNER_ID]["prompt_msg"] = prompt.id
-    await message.delete()
-
-@bot.on_message(filters.command("stopbot") & filters.user(config.OWNER_ID))
-async def bot_stopbot(client, message):
-    await message.reply_text("🛑 **System Offline.**")
-    os._exit(0)
-
-@bot.on_message(filters.text & filters.user(config.OWNER_ID) & ~filters.command(["start", "dashboard", "autoscan", "stopscan", "vault", "wipe", "stopbot"]))
-async def process_wizard_inputs(client, message):
-    state = user_states.get(config.OWNER_ID)
-    if not state: return 
-        
-    action = state["action"]
-    step = state["step"]
     
-    if step == "need_group":
-        raw_id = message.text.strip()
-        try:
-            chat_id = int(raw_id) if raw_id.replace("-", "").isdigit() else raw_id
-            chat = await user.get_chat(chat_id)
-            state["chat_id"] = chat.id
-            state["chat_title"] = chat.title
-            
-            # Delete user input and prompt for cleanliness
-            await message.delete()
-            try: await bot.delete_messages(config.OWNER_ID, state["prompt_msg"])
-            except: pass
-            
-            if action in ["vault", "wipe"]:
-                state["step"] = "need_tag"
-                prompt = await message.reply_text(f"🎯 Target: **{chat.title}**\nSend the exact **#hashtag**.")
-                state["prompt_msg"] = prompt.id
-            elif action == "autoscan":
-                db["monitored_groups"][str(chat.id)] = chat.title
-                save_db(db)
-                asyncio.create_task(flash_message(f"🔄 **AutoScan Activated:** {chat.title}"))
-                user_states.pop(config.OWNER_ID, None) 
-                asyncio.create_task(process_history_sweep(chat.id, chat.title))
-            elif action == "stopscan":
-                if str(chat.id) in db["monitored_groups"]:
-                    del db["monitored_groups"][str(chat.id)]
-                    save_db(db)
-                    asyncio.create_task(flash_message(f"🛑 **Stopped monitoring:** {chat.title}"))
-                    await update_dashboard()
-                else:
-                    asyncio.create_task(flash_message("⚠️ Group not in active list."))
-                user_states.pop(config.OWNER_ID, None)
-                
-        except Exception as e:
-            asyncio.create_task(flash_message(f"❌ Error: {e}\nAre you a member? Try again."))
-            await message.delete()
+    if oldest_date and newest_date:
+        oldest_str = oldest_date.strftime("%b %d, %Y")
+        newest_str = newest_date.strftime("%b %d, %Y")
+        report += f"**Time Range:** {oldest_str} ➡️ {newest_str}\n"
 
-    elif step == "need_tag":
-        tag = message.text.strip().lower()
-        await message.delete()
-        try: await bot.delete_messages(config.OWNER_ID, state["prompt_msg"])
-        except: pass
+    await status.edit_text(report)
 
-        if not tag.startswith("#"):
-            prompt = await message.reply_text("⚠️ Must start with '#'. Try again.")
-            state["prompt_msg"] = prompt.id
-            return
-            
-        chat_id = state["chat_id"]
-        chat_title = state["chat_title"]
-        user_states.pop(config.OWNER_ID, None)
-        
-        asyncio.create_task(flash_message(f"🚀 Initializing {action} for {tag} in {chat_title}..."))
-        if action == "vault":
-            asyncio.create_task(process_history_sweep(chat_id, chat_title, target_tag=tag, wipe_only=False))
-        elif action == "wipe":
-            asyncio.create_task(process_history_sweep(chat_id, chat_title, target_tag=tag, wipe_only=True))
 
-# --- LIVE LISTENER ---
-@user.on_message(filters.group & ~filters.me, group=1)
-async def live_hashtag_listener(client, message):
-    chat_id = str(message.chat.id)
-    if chat_id not in db["monitored_groups"]:
+@app.on_message(filters.command("vault", prefixes=["/", "."]) & filters.me)
+async def vault_messages_advanced(client: Client, message):
+    """Creates a private group, transfers matching messages, then deletes them with live feedback."""
+    command_parts = message.text.split(" ", 1)
+    if len(command_parts) < 2:
+        await message.reply_text("⚠️ Usage: `/vault #caption`")
         return
-        
-    text = message.text or message.caption or ""
-    tags = list(set(re.findall(r'(#\w+)', text.lower())))
-    if not tags: return
-
-    chat_title = message.chat.title or "Archive"
-    success = False
     
-    # Temporarily update dashboard for live action
-    await set_system_state("⚡", "Live Event", f"Routing new msg in {chat_title}")
-    
-    for tag in tags:
-        vault_id = await get_or_create_vault(tag, chat_title)
-        if vault_id:
-            if await safe_copy(vault_id, message.chat.id, message.id):
-                success = True
+    query = command_parts[1]
+    original_chat = message.chat
+    status = await message.reply_text(f"🔍 Checking Telegram servers for '{query}'...")
 
-    if success:
+    total_count = await client.search_messages_count(original_chat.id, query=query)
+    
+    if total_count == 0:
+        await status.edit_text(f"❌ No messages found containing '{query}'.")
+        return
+
+    await status.edit_text(f"📊 **Found {total_count} messages.**\n⚙️ Gathering message data...")
+
+    message_ids = []
+    oldest_date = None
+    newest_date = None
+
+    async for msg in client.search_messages(original_chat.id, query=query):
+        # Exclude the command message itself so we don't vault the command
+        if msg.id != message.id: 
+            message_ids.append(msg.id)
+            
+            if msg.date:
+                if not newest_date:
+                    newest_date = msg.date
+                oldest_date = msg.date
+
+    if not message_ids:
+        await status.edit_text(f"❌ No transferrable messages found containing '{query}'.")
+        return
+
+    # Reverse the list so we transfer them to the vault in chronological order
+    message_ids.reverse()
+
+    # Create the new Private Supergroup
+    vault_title = f"{original_chat.title or 'Archive'} - {query}"
+    await status.edit_text(f"🏗️ Creating new private group: '{vault_title}'...")
+    
+    try:
+        new_group = await client.create_supergroup(vault_title, f"Archived messages containing: {query}")
+        vault_id = new_group.id
+    except Exception as e:
+        await status.edit_text(f"❌ Failed to create group: {e}")
+        return
+
+    await status.edit_text(f"✅ Vault created!\n📤 Transferring {len(message_ids)} messages...")
+
+    # Copy messages one by one to avoid FloodWait limits on large transfers
+    successful_copies = 0
+    for i, msg_id in enumerate(message_ids, 1):
         try:
-            await user.delete_messages(message.chat.id, message.id)
-            asyncio.create_task(flash_message(f"⚡ Live msg vaulted: {', '.join(tags)}", 5))
-        except: pass
-        
-    await set_system_state("🟢", "Optimal", "💤 Idle")
+            await client.copy_message(chat_id=vault_id, from_chat_id=original_chat.id, message_id=msg_id)
+            successful_copies += 1
+            await asyncio.sleep(0.5) # Respect Telegram's rate limits
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+            await client.copy_message(chat_id=vault_id, from_chat_id=original_chat.id, message_id=msg_id)
+            successful_copies += 1
+        except Exception as e:
+            print(f"Skipped message {msg_id}: {e}")
 
-# --- STARTUP ---
-async def main_startup():
-    print("Starting Userbot and Control Bot safely...")
-    await compose([user, bot])
+        # Update status every 10 messages so we don't flood the API with edits
+        if successful_copies % 10 == 0:
+            await status.edit_text(f"📤 **Transferring...** {successful_copies} / {len(message_ids)} copied to vault.")
+
+    await status.edit_text(f"🗑️ Transfer complete. Deleting original messages...")
+    
+    # Delete the original messages from the source group in chunks
+    chunk_size = 100
+    deleted_count = 0
+    for i in range(0, len(message_ids), chunk_size):
+        chunk = message_ids[i:i + chunk_size]
+        await client.delete_messages(original_chat.id, chunk)
+        deleted_count += len(chunk)
+
+    # Final Report
+    report = (
+        f"✅ **Vault & Cleanup Complete!**\n\n"
+        f"**Search Query:** `{query}`\n"
+        f"**Vault Created:** `{vault_title}`\n"
+        f"**Successfully Transferred & Wiped:** {successful_copies} messages\n"
+    )
+    
+    if oldest_date and newest_date:
+        oldest_str = oldest_date.strftime("%b %d, %Y")
+        newest_str = newest_date.strftime("%b %d, %Y")
+        report += f"**Time Range:** {oldest_str} ➡️ {newest_str}\n"
+
+    await status.edit_text(report)
 
 if __name__ == '__main__':
-    # Initialize dashboard on boot
-    asyncio.run(main_startup())
+    print("Userbot is running...")
+    app.run()
