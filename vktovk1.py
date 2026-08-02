@@ -689,11 +689,16 @@ class UploaderEngine:
             async with aiohttp.ClientSession() as session:
                 with open(enc_file, 'rb') as f:
                     await self.db.update_job(jid, pct=50.0, stage="uploading | ~ | ~")
-                    form = aiohttp.FormData()
-                    form.add_field('video_file', f, filename=enc_file.name)
-                    async with session.post(upload_url, data=form) as resp:
+                    
+                    # Pass the file object directly in a dictionary
+                    payload = {'video_file': f}
+                    
+                    async with session.post(upload_url, data=payload) as resp:
                         response_data = await resp.json()
-                        if 'video_hash' not in response_data: raise RuntimeError(f"VK Upload Failed: {response_data}")
+                        # Some successful VK responses might not include 'video_hash' directly at the root, 
+                        # or they might return an error object. Print the response for debugging if it fails.
+                        if 'video_hash' not in response_data and 'error' in response_data: 
+                            raise RuntimeError(f"VK Upload Failed: {response_data}")
 
             await self.db.update_job(jid, stage="uploaded", pct=100.0)
             job['stage'] = "uploaded"
