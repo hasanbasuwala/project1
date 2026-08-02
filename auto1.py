@@ -97,19 +97,23 @@ async def update_dashboard():
             msg = await bot.send_message(config.OWNER_ID, dashboard_text)
             db["dashboard_msg_id"] = msg.id
             save_db()
+            
+            # The Fix: Added both_sides=True
             try:
-                await bot.pin_chat_message(config.OWNER_ID, msg.id, disable_notification=True)
-            except Exception:
-                pass
+                await bot.pin_chat_message(config.OWNER_ID, msg.id, disable_notification=True, both_sides=True)
+            except Exception as pin_err:
+                print(f"[Termux Logger] Note: Could not pin dashboard ({pin_err})")
+                
     except Exception:
         # If message was deleted manually by you, send a fresh one
         msg = await bot.send_message(config.OWNER_ID, dashboard_text)
         db["dashboard_msg_id"] = msg.id
         save_db()
         try:
-            await bot.pin_chat_message(config.OWNER_ID, msg.id, disable_notification=True)
+            await bot.pin_chat_message(config.OWNER_ID, msg.id, disable_notification=True, both_sides=True)
         except Exception:
             pass
+
 
 async def get_or_create_vault(original_tag: str) -> int:
     norm_tag = normalize_tag(original_tag)
