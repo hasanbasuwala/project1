@@ -72,7 +72,7 @@ db = load_db()
 # `app` = your account (session persists, drives direct in-group commands + live listener)
 # `bot` = the control bot (DM wizard, dashboard, status pings) — needs config.SORT_TOKEN
 #         to be your NEW bot's token, and config.OWNER_ID to be your user id.
-app = Client("my_userbot", api_id=config.API_ID, api_hash=config.API_HASH, sleep_threshold=60)
+app = Client("d_session", api_id=config.API_ID, api_hash=config.API_HASH, sleep_threshold=60)
 bot = Client("my_control_bot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.SORT_TOKEN)
 
 user_states = {}
