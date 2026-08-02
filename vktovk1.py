@@ -686,19 +686,33 @@ class UploaderEngine:
             upload_data = await asyncio.to_thread(get_upload_server)
             upload_url = upload_data['upload_url']
             
-            async with aiohttp.ClientSession() as session:
+                 # 1. Disable total timeout for large files, but keep socket limits to detect network drops
+            custom_timeout = aiohttp.ClientTimeout(total=None, sock_read=300, sock_connect=60)
+            
+            # 2. Mask the bot as a standard browser to bypass VK CDN firewalls
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+
+            async with aiohttp.ClientSession(timeout=custom_timeout, headers=headers) as session:
                 with open(enc_file, 'rb') as f:
                     await self.db.update_job(jid, pct=50.0, stage="uploading | ~ | ~")
                     
-                    # Pass the file object directly in a dictionary
-                    payload = {'video_file': f}
+                    form = aiohttp.FormData()
+                    # 3. Explicitly declare the content_type so VK knows how to process the stream
+                    form.add_field('video_file', 
+                                   f, 
+                                   filename=enc_file.name,
+                                   content_type='video/mp4') 
                     
-                    async with session.post(upload_url, data=payload) as resp:
-                        response_data = await resp.json()
-                        # Some successful VK responses might not include 'video_hash' directly at the root, 
-                        # or they might return an error object. Print the response for debugging if it fails.
-                        if 'video_hash' not in response_data and 'error' in response_data: 
-                            raise RuntimeError(f"VK Upload Failed: {response_data}")
+                    try:
+                        async with session.post(upload_url, data=form) as resp:
+                            response_data = await resp.json()
+                            if 'video_hash' not in response_data: 
+                                raise RuntimeError(f"VK API Rejected Upload: {response_data}")
+                    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                        # This ensures the worker correctly logs a network drop instead of silently hanging
+                        raise RuntimeError(f"Network/Timeout error during upload: {e}")
 
             await self.db.update_job(jid, stage="uploaded", pct=100.0)
             job['stage'] = "uploaded"
