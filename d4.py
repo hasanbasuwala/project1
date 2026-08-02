@@ -432,11 +432,13 @@ async def process_history_sweep(chat_id: int, chat_title: str, target_tag: str =
 # ============================================================
 # CONTROL BOT DM WIZARD — private chat with the bot, no in-group typing
 # ============================================================
-# Scoped strictly to filters.private so this can never double-fire
-# alongside the direct in-group commands below on the same message,
-# even if the bot happens to also be a member of that group.
 
-@bot.on_message(filters.command("start") & filters.user(config.OWNER_ID))
+# 🛠️ CUSTOM FILTER: Bypasses Pyrogram's native user filter to guarantee 64-bit ID matching
+def check_owner(_, __, message):
+    return bool(message.from_user and message.from_user.id == config.OWNER_ID)
+is_owner = filters.create(check_owner)
+
+@bot.on_message(filters.command("start") & is_owner)
 async def bot_start(client, message):
     text = (
         "🤖 **AutoScan Control Panel**\n"
@@ -453,13 +455,13 @@ async def bot_start(client, message):
     )
     await message.reply_text(text)
 
-@bot.on_message(filters.command("dashboard") & filters.user(config.OWNER_ID))
+@bot.on_message(filters.command("dashboard") & is_owner)
 async def cmd_dashboard(client, message):
     db["dashboard_msg_id"] = None
     await update_dashboard()
     await message.delete()
 
-@bot.on_message(filters.command(["autoscan", "stopscan", "vault", "wipe", "copyonly"]) & filters.user(config.OWNER_ID) & filters.private)
+@bot.on_message(filters.command(["autoscan", "stopscan", "vault", "wipe", "copyonly"]) & is_owner & filters.private)
 async def initiate_command(client, message):
     cmd = message.command[0].lower()
     user_states[config.OWNER_ID] = {"action": cmd, "step": "need_group"}
@@ -467,12 +469,12 @@ async def initiate_command(client, message):
     user_states[config.OWNER_ID]["prompt_msg"] = prompt.id
     await message.delete()
 
-@bot.on_message(filters.command("stopbot") & filters.user(config.OWNER_ID))
+@bot.on_message(filters.command("stopbot") & is_owner)
 async def bot_stopbot(client, message):
     await message.reply_text("🛑 **System Offline.**")
     os._exit(0)
 
-@bot.on_message(filters.text & filters.user(config.OWNER_ID) & ~filters.command(["start", "dashboard", "autoscan", "stopscan", "vault", "wipe", "copyonly", "stopbot"]))
+@bot.on_message(filters.text & is_owner & ~filters.command(["start", "dashboard", "autoscan", "stopscan", "vault", "wipe", "copyonly", "stopbot"]))
 async def process_wizard_inputs(client, message):
     state = user_states.get(config.OWNER_ID)
     if not state: return
