@@ -64,8 +64,8 @@ def save_db():
 # ==========================================
 # 2. CLIENT INITIALIZATION
 # ==========================================
-user = Client("userbot_session", api_id=config.API_ID, api_hash=config.API_HASH)
-bot = Client("bot_session", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN)
+user = Client("userbott_session", api_id=config.API_ID, api_hash=config.API_HASH)
+bot = Client("bott_session", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.SORT_TOKEN)
 
 # ==========================================
 # 3. HELPER FUNCTIONS & DASHBOARD
