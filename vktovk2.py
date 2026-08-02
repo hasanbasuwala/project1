@@ -657,6 +657,38 @@ class EncoderEngine:
                 except Exception: pass
 
 
+import aiohttp.payload
+
+
+class _ProgressFilePayload(aiohttp.payload.IOBasePayload):
+    """
+    Identical to aiohttp's built-in IOBasePayload, except it reports
+    bytes-written progress via an async callback as it streams the file.
+    Because isinstance(value, Payload) is True, aiohttp's FormData/get_payload
+    will use this object as-is instead of re-wrapping it — so Content-Length
+    detection (the thing that keeps VK from 406'ing on chunked encoding)
+    still works exactly like the stock IOBasePayload.
+    """
+
+    def __init__(self, value, progress_cb=None, *args, **kwargs):
+        super().__init__(value, *args, **kwargs)
+        self._progress_cb = progress_cb
+
+    async def write(self, writer):
+        loop = asyncio.get_event_loop()
+        sent = 0
+        try:
+            chunk = await loop.run_in_executor(None, self._value.read, 1024 * 1024)
+            while chunk:
+                await writer.write(chunk)
+                sent += len(chunk)
+                if self._progress_cb:
+                    await self._progress_cb(sent)
+                chunk = await loop.run_in_executor(None, self._value.read, 1024 * 1024)
+        finally:
+            await loop.run_in_executor(None, self._value.close)
+
+
 class UploaderEngine:
     def __init__(self, db: JobScheduler, app: Client):
         self.db = db; self.app = app
@@ -669,10 +701,12 @@ class UploaderEngine:
             files = [f for f in enc_dir.rglob("*") if f.is_file()]
             if not files: raise RuntimeError("Payload missing from upload queue.")
             enc_file = files[0]
+            file_size = enc_file.stat().st_size
+            if file_size <= 0: raise RuntimeError("Encoded file is empty (0 bytes) — refusing to upload.")
 
             pl = await self.db.get_playlist(job['playlist_id'])
             target_album_id = int(pl['caption']) if pl and pl.get('caption') and pl['caption'].lstrip('-').isdigit() else None
-            
+
             raw_title = job['title']
             clean_title_str, unique_id = raw_title.split("|||", 1) if "|||" in raw_title else (raw_title, "UNKNOWN")
             db_signature = f"\n\n[VK_DB_ID: {unique_id}]"
@@ -685,34 +719,48 @@ class UploaderEngine:
 
             upload_data = await asyncio.to_thread(get_upload_server)
             upload_url = upload_data['upload_url']
-            
-                 # 1. Disable total timeout for large files, but keep socket limits to detect network drops
-            custom_timeout = aiohttp.ClientTimeout(total=None, sock_read=300, sock_connect=60)
-            
-            # 2. Mask the bot as a standard browser to bypass VK CDN firewalls
+
+            # total=3600 is the fix: previously total=None meant a dead/stalled
+            # write could hang forever with no exception, no retry, no signal.
+            custom_timeout = aiohttp.ClientTimeout(total=3600, sock_connect=60, sock_read=300)
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             }
 
-            async with aiohttp.ClientSession(timeout=custom_timeout, headers=headers) as session:
-                with open(enc_file, 'rb') as f:
-                    await self.db.update_job(jid, pct=50.0, stage="uploading | ~ | ~")
-                    
-                    form = aiohttp.FormData()
-                    # 3. Explicitly declare the content_type so VK knows how to process the stream
-                    form.add_field('video_file', 
-                                   f, 
-                                   filename=enc_file.name,
-                                   content_type='video/mp4') 
-                    
-                    try:
+            last_update = {"t": 0.0, "bytes": 0}
+
+            async def progress_cb(sent: int):
+                now = time.time()
+                # throttle DB writes to ~1/sec, but always let the final 100% through
+                if now - last_update["t"] < 1.0 and sent < file_size:
+                    return
+                elapsed = now - last_update["t"] or 1.0
+                speed_bps = (sent - last_update["bytes"]) / elapsed
+                speed_str = f"{speed_bps / (1024*1024):.2f}MiB/s" if speed_bps > 0 else "~"
+                pct = 50.0 + min(sent / file_size, 1.0) * 49.0
+                last_update["t"], last_update["bytes"] = now, sent
+                await self.db.update_job(jid, pct=pct, stage=f"uploading | {speed_str} | {sent}/{file_size}B")
+
+            await self.db.update_job(jid, pct=50.0, stage="uploading | ~ | ~")
+
+            try:
+                async with aiohttp.ClientSession(timeout=custom_timeout, headers=headers) as session:
+                    with open(enc_file, 'rb') as f:
+                        payload = _ProgressFilePayload(
+                            f, progress_cb=progress_cb,
+                            filename=enc_file.name, content_type='video/mp4'
+                        )
+                        form = aiohttp.FormData()
+                        form.add_field('video_file', payload, filename=enc_file.name, content_type='video/mp4')
+
                         async with session.post(upload_url, data=form) as resp:
-                            response_data = await resp.json()
-                            if 'video_hash' not in response_data: 
+                            response_data = await resp.json(content_type=None)
+                            if 'video_hash' not in response_data:
                                 raise RuntimeError(f"VK API Rejected Upload: {response_data}")
-                    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-                        # This ensures the worker correctly logs a network drop instead of silently hanging
-                        raise RuntimeError(f"Network/Timeout error during upload: {e}")
+            except asyncio.TimeoutError:
+                raise RuntimeError("Upload hit the 3600s hard timeout — connection was stalled/dead.")
+            except (aiohttp.ClientError, OSError) as e:
+                raise RuntimeError(f"Network/Timeout error during upload: {e}")
 
             await self.db.update_job(jid, stage="uploaded", pct=100.0)
             job['stage'] = "uploaded"
@@ -733,6 +781,7 @@ class UploaderEngine:
             await self.db.update_item_status(item_id, "done")
         await self.db.delete_job(jid)
         shutil.rmtree(JOBS_DIR / f"JOB_{jid}", ignore_errors=True)
+
 
 
 # ──────────────────────────── DASHBOARD & ROUTER ───────────────────────
