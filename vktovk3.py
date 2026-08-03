@@ -211,16 +211,18 @@ def get_existing_vk_db_ids(vk, album_id: int) -> set:
 
 
 def parse_caption(caption: str):
-    """Parses a VK caption for: [Production] Name x Name - description"""
+    """Parses a VK caption for: [Production] Name x Name (Description optional)"""
     if not caption: return None
-    pattern = r'\[\s*(.*?)\s*\]\s*(.*?)\s*-\s*(.*)'
+    
+    # More forgiving Regex: Matches [Prod] Names (and optionally - Description)
+    pattern = r'\[([^\]]+)\]\s*([^-]+)(?:-\s*(.*))?'
     match = re.search(pattern, caption, flags=re.DOTALL)
     
     if not match: return None 
     
     production = match.group(1).strip()
     names_raw = match.group(2).strip()
-    description = match.group(3).strip()
+    description = match.group(3).strip() if match.group(3) else ""
     
     names_list = [
         name.strip() for name in 
