@@ -1028,14 +1028,13 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
             return await msg.reply("❌ Usage: `/transfer https://vk.com/community_link`")
         
         url = args[1].strip()
-        m = await msg.reply(f"⏳ `Resolving target community and initializing transfer engine...`")
+        m = await msg.reply(f"⏳ `Resolving target community and initializing Bookmark engine...`")
         
-        # Async worker function to keep Pyrogram responsive
         async def run_transfer_job(chat_id, msg_id, link, db_instance):
             try:
                 vk = await asyncio.to_thread(get_vk_api)
                 comm_id = await asyncio.to_thread(resolve_vk_community_id, vk, link)
-                album_manager = await asyncio.to_thread(FuzzyAlbumManager, vk)
+                tag_manager = await asyncio.to_thread(FuzzyTagManager, vk)
                 
                 offset = 0
                 processed = 0
@@ -1043,7 +1042,6 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                 skipped = 0
                 
                 while True:
-                    # Fetch 100 posts at a time from VK
                     res = await asyncio.to_thread(vk.wall.get, owner_id=comm_id, count=100, offset=offset)
                     posts = res.get('items', [])
                     if not posts: break
@@ -1051,15 +1049,12 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                     for post in posts:
                         processed += 1
                         caption = post.get('text', '')
-                        
-                        # Find all video attachments on this post
                         video_atts = [att['video'] for att in post.get('attachments', []) if att.get('type') == 'video']
                         
                         if not video_atts:
                             skipped += 1
                             continue
                             
-                        # Try to parse the caption with Regex
                         parsed_data = parse_caption(caption)
                         if not parsed_data:
                             skipped += 1
@@ -1068,7 +1063,6 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                         production, names_list, _ = parsed_data
                         target_names = [production] + names_list
                         
-                        # Link each video attachment in the post
                         for v in video_atts:
                             uid = f"{v['owner_id']}_{v['id']}"
                             
@@ -1076,51 +1070,61 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                                 skipped += 1
                                 continue
                                 
-                            def do_link():
-                                # 1. Find or create the albums
-                                resolved_album_ids = [album_manager.get_or_create(n) for n in target_names if n]
-                                # 2. Filter out failures and convert to string for the API
-                                valid_ids = [str(a_id) for a_id in resolved_album_ids if a_id]
+                            def do_bookmark():
+                                # 1. Add video to VK Bookmarks
+                                vk.fave.addVideo(owner_id=v['owner_id'], id=v['id'])
                                 
+                                # 2. Resolve fuzzy tags
+                                resolved_tag_ids = [tag_manager.get_or_create_tag_id(n) for n in target_names if n]
+                                valid_ids = [str(t_id) for t_id in resolved_tag_ids if t_id]
+                                
+                                # 3. Apply the tags to the bookmarked video
                                 if valid_ids:
-                                    # 3. Use VK's Native Linker (No downloading required)
-                                    vk.video.addToAlbum(
-                                        owner_id=v['owner_id'],
-                                        video_id=v['id'],
-                                        album_ids=",".join(valid_ids)
+                                    vk.fave.setTags(
+                                        item_type="video",
+                                        item_owner_id=v['owner_id'],
+                                        item_id=v['id'],
+                                        tag_ids=",".join(valid_ids)
                                     )
                                     
                             try:
-                                await asyncio.to_thread(do_link)
+                                await asyncio.to_thread(do_bookmark)
                                 await db_instance.mark_transferred(uid)
                                 added += 1
                             except Exception as e:
-                                log.error(f"Failed to link {uid}: {e}")
+                                error_msg = str(e).lower()
+                                # PHYSICAL DOWNLOAD FALLBACK (If Bookmarking is blocked by privacy)
+                                if "access denied" in error_msg or "code 15" in error_msg or "code 204" in error_msg:
+                                    pl_id = f"trans_{uid[:8]}" 
+                                    await db_instance.create_playlist(pl_id, f"https://vk.com/video{uid}", "Bookmarks", 1, chat_id)
+                                    item_id = str(uuid.uuid4())[:8]
+                                    db_item = [(item_id, pl_id, f"https://vk.com/video{uid}", f"{v.get('title', 'Private Video')}|||{uid}")]
+                                    await db_instance.add_playlist_items(db_item)
+                                    log.warning(f"Video {uid} bookmark denied. Queued for physical download.")
+                                else:
+                                    log.error(f"Failed to bookmark {uid}: {e}")
                                 skipped += 1
 
-                        # Safe UI updates to avoid FloodWaits
                         if processed % 50 == 0:
                             report = (f"🔄 **SCANNING WALL**\n`━━━━━━━━━━━━━━━━━`\n"
                                       f"🔍 **Scanned:** `{processed}` posts\n"
-                                      f"🔗 **Linked & Added:** `{added}` videos\n"
-                                      f"⏭ **Skipped (No Match/Dupes):** `{skipped}`")
+                                      f"🔖 **Bookmarked & Tagged:** `{added}` videos\n"
+                                      f"⏭ **Skipped (No Match/Dupes/Queued):** `{skipped}`")
                             await safe_edit(app, chat_id, msg_id, report)
 
                     offset += 100
-                    await asyncio.sleep(0.5) # Rate limit protection
+                    await asyncio.sleep(0.5) 
                 
-                # Final Success Report
                 final_report = (f"✅ **TRANSFER COMPLETE**\n`━━━━━━━━━━━━━━━━━`\n"
                                 f"🎯 **Target:** `{link}`\n"
                                 f"🔍 **Total Posts Checked:** `{processed}`\n"
-                                f"🔗 **Successfully Linked:** `{added}`\n"
-                                f"⏭ **Skipped:** `{skipped}`")
+                                f"🔖 **Successfully Bookmarked:** `{added}`\n"
+                                f"⏭ **Skipped/Sent to Downloader:** `{skipped}`")
                 await safe_edit(app, chat_id, msg_id, final_report)
                 
             except Exception as e:
                 await safe_edit(app, chat_id, msg_id, f"❌ Transfer Critical Error: `{e}`")
 
-        # Hand it off to the background
         asyncio.create_task(run_transfer_job(msg.chat.id, m.id, url, db))
 
 
