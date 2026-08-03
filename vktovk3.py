@@ -1055,12 +1055,19 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                         caption = post.get('text', '')
                         video_atts = [att['video'] for att in post.get('attachments', []) if att.get('type') == 'video']
                         
+                        # DIAGNOSTIC LOG 1
                         if not video_atts:
+                            log.info(f"⏭ SKIPPED Post {post.get('id')}: No native video attachments found.")
                             skipped += 1
                             continue
                             
                         parsed_data = parse_caption(caption)
+                        
+                        # DIAGNOSTIC LOG 2
                         if not parsed_data:
+                            # Print the first 50 chars of the caption so you can see why it failed
+                            clean_cap = caption.replace('\n', ' ')[:50]
+                            log.info(f"⏭ SKIPPED Post {post.get('id')}: Caption didn't match format. Capt: '{clean_cap}...'")
                             skipped += 1
                             continue
                             
@@ -1070,7 +1077,9 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                         for v in video_atts:
                             uid = f"{v['owner_id']}_{v['id']}"
                             
+                            # DIAGNOSTIC LOG 3
                             if await db_instance.is_transferred(uid):
+                                log.info(f"⏭ SKIPPED Video {uid}: Already marked as transferred in database.")
                                 skipped += 1
                                 continue
                                 
