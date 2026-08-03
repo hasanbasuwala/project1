@@ -92,19 +92,25 @@ def parse_caption(caption: str):
     if not caption:
         return None, []
         
-    pattern = r'\[([^\]]+)\]\s*([^-]+)(?:-\s*(.*))?'
-    match = re.search(pattern, caption, flags=re.DOTALL)
+    # 1. Ignore everything after the first '-'
+    clean_text = caption.split('-')[0].strip()
+    
+    # 2. Extract [Production] and the remaining names
+    pattern = r'\[([^\]]+)\]\s*(.*)'
+    match = re.search(pattern, clean_text, flags=re.DOTALL)
     if not match:
         return None, []
     
     production = match.group(1).strip()
     names_raw = match.group(2).strip()
     
+    # 3. Split names by separators: 'x', '&', ',', 'and'
     names_list = [
         name.strip() for name in 
         re.split(r'\s*(?:x|&|,|\band\b)\s*', names_raw, flags=re.IGNORECASE) 
         if name.strip()
     ]
+    
     return production, names_list
 
 
