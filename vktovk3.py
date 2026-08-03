@@ -230,42 +230,42 @@ def parse_caption(caption: str):
     return production, names_list, description
 
 
-class FuzzyAlbumManager:
-    """Loads all existing albums and fuzzy matches targets to avoid duplicates."""
+class FuzzyTagManager:
+    """Manages VK Fave Tags with fuzzy matching to avoid duplicate tag creation."""
     def __init__(self, vk):
         self.vk = vk
-        self.albums = {} # 'Exact Title': ID
-        self._load_albums()
+        self.tags = {}  # "Tag Name": tag_id
+        self._load_tags()
 
-    def _load_albums(self):
-        offset = 0
-        while True:
-            res = self.vk.video.getAlbums(count=100, offset=offset)
-            items = res.get('items', [])
-            if not items: break
-            for a in items:
-                self.albums[a['title'].strip()] = a['id']
-            offset += 100
-            if offset >= res.get('count', 0): break
-
-    def get_or_create(self, target_name: str) -> int:
-        target_name = target_name.strip()
-        if not target_name: return None
-
-        existing_names = list(self.albums.keys())
-        if existing_names:
-            match = process.extractOne(target_name, existing_names, scorer=fuzz.WRatio)
-            if match and match[1] > 85: 
-                return self.albums[match[0]] # Return ID of closest match
-
-        # Needs a new album created on VK
+    def _load_tags(self):
+        """Fetch all existing bookmark tags."""
         try:
-            new_album = self.vk.video.addAlbum(title=target_name)
-            new_id = new_album['album_id']
-            self.albums[target_name] = new_id
-            return new_id
+            res = self.vk.fave.getTags()
+            for t in res.get('items', []):
+                self.tags[t['name'].strip()] = t['id']
         except Exception as e:
-            print(f"Error creating album '{target_name}': {e}")
+            log.error(f"Error loading fave tags: {e}")
+
+    def get_or_create_tag_id(self, tag_name: str) -> int:
+        tag_name = tag_name.strip()
+        if not tag_name:
+            return None
+
+        # Check existing tags using Fuzzy Match
+        existing_names = list(self.tags.keys())
+        if existing_names:
+            match = process.extractOne(tag_name, existing_names, scorer=fuzz.WRatio)
+            if match and match[1] > 85:
+                return self.tags[match[0]]
+
+        # Create new tag if no close match found
+        try:
+            new_tag = self.vk.fave.addTag(name=tag_name)
+            tag_id = new_tag['id']
+            self.tags[tag_name] = tag_id
+            return tag_id
+        except Exception as e:
+            log.error(f"Failed to create tag '{tag_name}': {e}")
             return None
 
 
