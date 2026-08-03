@@ -1019,7 +1019,7 @@ def render_scan_ui(chat_id: int):
 def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.Queue, up_q: asyncio.Queue, dl_pool: "WorkerPool", enc_pool: "WorkerPool", up_pool: "WorkerPool"):
 
     # ==========================================
-    # NEW FEATURE: /transfer
+    # NEW FEATURE: /transfer (BOOKMARKS & TAGS)
     # ==========================================
     @app.on_message(filters.command(["transfer"]) & filters.user(OWNER_ID))
     async def cmd_transfer(_, msg: Message):
@@ -1034,6 +1034,8 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
             try:
                 vk = await asyncio.to_thread(get_vk_api)
                 comm_id = await asyncio.to_thread(resolve_vk_community_id, vk, link)
+                
+                # FIX: We now use FuzzyTagManager instead of FuzzyAlbumManager!
                 tag_manager = await asyncio.to_thread(FuzzyTagManager, vk)
                 
                 offset = 0
@@ -1093,7 +1095,7 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                                 added += 1
                             except Exception as e:
                                 error_msg = str(e).lower()
-                                # PHYSICAL DOWNLOAD FALLBACK (If Bookmarking is blocked by privacy)
+                                # PHYSICAL DOWNLOAD FALLBACK
                                 if "access denied" in error_msg or "code 15" in error_msg or "code 204" in error_msg:
                                     pl_id = f"trans_{uid[:8]}" 
                                     await db_instance.create_playlist(pl_id, f"https://vk.com/video{uid}", "Bookmarks", 1, chat_id)
