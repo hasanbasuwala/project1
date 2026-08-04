@@ -1,12 +1,18 @@
 """
-launcher_bot.py — Telegram UI for picking which Stealth Mainframe version runs.
+launcher_bot.py — Telegram UI for running Stealth Mainframe scripts.
 
 Stays running 24/7 (separate bot token from the worker scripts). Sends an
-inline keyboard listing every script in this folder; tapping one stops
-whatever's running and opens the new one inside a tmux session named
-"stealth_run" — so it gets the actual Termux terminal UI (terminal_loop,
-live logs, dashboard prints) instead of a silent background process.
-Picking a different script kills that tmux session and opens a fresh one.
+inline keyboard listing every script in this folder. Tapping a STOPPED
+script starts it in its OWN tmux session — it does not touch anything
+else that's already running. Tapping a RUNNING script opens a per-script
+menu (view log / restart / stop). A "🎛 Dashboard" view lists everything
+currently running at once with quick log/stop buttons, and "🛑 Stop All"
+kills everything in one tap.
+
+Each script gets a dedicated tmux session named `stealth_<script_stem>`,
+so it gets the actual Termux terminal UI (terminal_loop, live logs,
+dashboard prints) instead of a silent background process, and you can
+run as many of them side by side as you want.
 
 REQUIRES: tmux installed in Termux (`pkg install tmux`).
 
@@ -17,8 +23,9 @@ SETUP (config.py additions):
 RUN (keep it alive persistently, e.g. inside its own tmux/systemd unit):
     python3.13 launcher_bot.py
 
-To watch a running script's live terminal:
-    tmux attach -t stealth_run
+Termux-side visibility (also shown in the bot's /help and dashboard footer):
+    tmux ls                          # list every running session
+    tmux attach -t stealth_vk_bot    # watch one live
     (detach without killing it: Ctrl-b then d)
 """
 import ast
@@ -41,7 +48,7 @@ STATE_FILE = SCRIPT_DIR / ".launcher_state.json"
 LOG_DIR = SCRIPT_DIR / "SysCache" / "launcher_logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-TMUX_SESSION = "stealth_run"
+SESSION_PREFIX = "stealth_"
 
 OWNER_ID = int(config.OWNER_ID)
 
@@ -76,9 +83,16 @@ def discover():
     return scripts
 
 
-# ─────────────────────────── process state ───────────────────────────
+def session_name(script_name: str) -> str:
+    """Deterministic tmux session name for a given script filename."""
+    stem = Path(script_name).stem
+    safe = re.sub(r"[^a-zA-Z0-9_]", "_", stem)
+    return f"{SESSION_PREFIX}{safe}"
 
-def _load_state():
+
+# ─────────────────────────── process / tmux state ───────────────────────────
+
+def _load_state() -> dict:
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text())
@@ -87,56 +101,105 @@ def _load_state():
     return {}
 
 
-def _save_state(state):
+def _save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state))
 
 
-def _tmux_alive() -> bool:
+def _tmux_alive(session: str) -> bool:
     return subprocess.run(
-        ["tmux", "has-session", "-t", TMUX_SESSION],
+        ["tmux", "has-session", "-t", session],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     ).returncode == 0
 
 
-def running_script():
-    """Returns {'script': name, 'started': ts} if the tmux session is alive, else None."""
-    if not _tmux_alive():
-        if STATE_FILE.exists():
-            _save_state({})
-        return None
+def _list_tmux_sessions() -> set:
+    r = subprocess.run(
+        ["tmux", "ls", "-F", "#{session_name}"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return set()
+    return {line.strip() for line in r.stdout.splitlines() if line.strip()}
+
+
+def reconcile_state() -> dict:
+    """Drop any script whose tmux session has died, keep the rest. Called
+    before every menu render so the UI never lies about what's running.
+    Also runs on launcher startup, so scripts survive a launcher restart."""
+    scripts = {p.name for p, _ in discover()}
+    alive_sessions = _list_tmux_sessions()
     state = _load_state()
-    if not state.get("script"):
-        return None
+    changed = False
+
+    for name in list(state.keys()):
+        if name not in scripts or session_name(name) not in alive_sessions:
+            del state[name]
+            changed = True
+
+    # Pick up sessions that are alive but weren't tracked (e.g. launcher
+    # was restarted while a script kept running).
+    for p, _ in discover():
+        sess = session_name(p.name)
+        if sess in alive_sessions and p.name not in state:
+            state[p.name] = {"started": time.time(), "recovered": True}
+            changed = True
+
+    if changed:
+        _save_state(state)
     return state
 
 
-def stop_current(timeout: float = 8.0) -> bool:
-    """Ctrl-C into the pane (graceful, same as pressing it yourself), then kill-session if it won't die."""
-    if not _tmux_alive():
-        _save_state({})
+def is_running(script_name: str) -> bool:
+    return script_name in reconcile_state()
+
+
+def stop_script(script_name: str, timeout: float = 8.0) -> bool:
+    """Ctrl-C into the pane (graceful, same as pressing it yourself), then
+    kill-session if it won't die. Only touches this one script's session."""
+    sess = session_name(script_name)
+    if not _tmux_alive(sess):
+        state = _load_state()
+        if script_name in state:
+            del state[script_name]
+            _save_state(state)
         return False
 
     subprocess.run(
-        ["tmux", "send-keys", "-t", TMUX_SESSION, "C-c"],
+        ["tmux", "send-keys", "-t", sess, "C-c"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if not _tmux_alive():
-            _save_state({})
-            return True
+        if not _tmux_alive(sess):
+            break
         time.sleep(0.3)
+    else:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", sess],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
 
-    subprocess.run(
-        ["tmux", "kill-session", "-t", TMUX_SESSION],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    _save_state({})
+    state = _load_state()
+    state.pop(script_name, None)
+    _save_state(state)
     return True
 
 
-def launch(script_path: Path):
-    stop_current()
+def stop_all() -> list:
+    stopped = []
+    for name in list(reconcile_state().keys()):
+        if stop_script(name):
+            stopped.append(name)
+    return stopped
+
+
+def launch(script_path: Path, restart: bool = False):
+    sess = session_name(script_path.name)
+    if _tmux_alive(sess):
+        if not restart:
+            return  # already running, leave it alone
+        stop_script(script_path.name)
+
     log_path = LOG_DIR / f"{script_path.stem}.log"
     # tee mirrors output to a log file too, in case you want to check it
     # after the tmux session has already closed.
@@ -145,24 +208,39 @@ def launch(script_path: Path):
         f"{shlex.quote(sys.executable)} {shlex.quote(str(script_path))} "
         f"2>&1 | tee -a {shlex.quote(str(log_path))}"
     )
-    result = subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION, cmd])
+    result = subprocess.run(["tmux", "new-session", "-d", "-s", sess, cmd])
     if result.returncode != 0:
         raise RuntimeError("Failed to start tmux session — is tmux installed? (`pkg install tmux`)")
-    _save_state({"script": script_path.name, "started": time.time()})
+
+    state = _load_state()
+    state[script_path.name] = {"started": time.time()}
+    _save_state(state)
 
 
-def capture_pane(lines: int = 40):
-    """Grab the last N lines of the tmux pane, so we can show the actual
-    Termux logger output inside Telegram instead of making you go attach."""
-    if not _tmux_alive():
+def capture_pane(script_name: str, lines: int = 40):
+    """Grab the last N lines of a script's tmux pane, so we can show the
+    actual Termux logger output inside Telegram instead of making you go attach."""
+    sess = session_name(script_name)
+    if not _tmux_alive(sess):
         return None
     r = subprocess.run(
-        ["tmux", "capture-pane", "-t", TMUX_SESSION, "-p", "-S", f"-{lines}"],
+        ["tmux", "capture-pane", "-t", sess, "-p", "-S", f"-{lines}"],
         capture_output=True, text=True,
     )
     if r.returncode != 0:
         return None
     return r.stdout.strip()
+
+
+def fmt_uptime(started: float) -> str:
+    secs = int(time.time() - started)
+    if secs < 60:
+        return f"{secs}s"
+    mins, secs = divmod(secs, 60)
+    if mins < 60:
+        return f"{mins}m{secs:02d}s"
+    hrs, mins = divmod(mins, 60)
+    return f"{hrs}h{mins:02d}m"
 
 
 # ─────────────────────────── bot ───────────────────────────
@@ -176,35 +254,83 @@ app = Client(
 
 owner_only = filters.user(OWNER_ID)
 
+TMUX_HINT = (
+    "`tmux ls` to list sessions · `tmux attach -t <session>` to watch one live "
+    "(detach with `Ctrl-b` then `d`)"
+)
+
 
 def build_menu() -> InlineKeyboardMarkup:
     scripts = discover()
-    state = running_script()
-    active = state["script"] if state else None
+    state = reconcile_state()
 
     rows = []
-    for p, desc in scripts:
-        mark = "🟢 " if p.name == active else "▫️ "
-        rows.append([InlineKeyboardButton(f"{mark}{p.name}", callback_data=f"run:{p.name}")])
+    for p, _ in scripts:
+        running = p.name in state
+        mark = "🟢 " if running else "▫️ "
+        cb = f"manage:{p.name}" if running else f"run:{p.name}"
+        rows.append([InlineKeyboardButton(f"{mark}{p.name}", callback_data=cb)])
 
-    if active:
-        rows.append([InlineKeyboardButton("📟 View live log", callback_data="viewlog")])
-        rows.append([InlineKeyboardButton("🛑 Stop running script", callback_data="stop")])
+    if state:
+        rows.append([InlineKeyboardButton(f"🎛 Dashboard ({len(state)} running)", callback_data="dashboard")])
+        rows.append([InlineKeyboardButton("🛑 Stop All", callback_data="stopall")])
     rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh")])
     return InlineKeyboardMarkup(rows)
 
 
 def status_text() -> str:
-    state = running_script()
+    state = reconcile_state()
     if not state:
-        return "**Stealth Mainframe Launcher**\n\nNothing running. Pick a version:"
-    uptime = int(time.time() - state["started"])
+        return "**Stealth Mainframe Launcher**\n\nNothing running. Pick a script to start it:"
+    lines = [f"🟢 `{name}` — up {fmt_uptime(info['started'])}" for name, info in sorted(state.items())]
     return (
         "**Stealth Mainframe Launcher**\n\n"
-        f"🟢 Running: `{state['script']}` (up {uptime}s)\n"
-        f"Watch it live: `tmux attach -t {TMUX_SESSION}` (detach with Ctrl-b then d)\n\n"
-        "Pick a version to switch, or stop it:"
+        f"{len(state)} script(s) running:\n" + "\n".join(lines) +
+        f"\n\n{TMUX_HINT}\n\nTap ▫️ to start something new, or 🟢 to manage a running one:"
     )
+
+
+def build_manage_menu(script_name: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("📟 View live log", callback_data=f"viewlog:{script_name}")],
+        [InlineKeyboardButton("🔁 Restart", callback_data=f"restart:{script_name}")],
+        [InlineKeyboardButton("🛑 Stop", callback_data=f"stop:{script_name}")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="refresh")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def manage_text(script_name: str) -> str:
+    state = reconcile_state()
+    info = state.get(script_name)
+    if not info:
+        return f"`{script_name}` is not running."
+    sess = session_name(script_name)
+    return (
+        f"🟢 `{script_name}`\n"
+        f"Session: `{sess}` · up {fmt_uptime(info['started'])}\n\n"
+        f"`tmux attach -t {sess}`"
+    )
+
+
+def build_dashboard_menu(state: dict) -> InlineKeyboardMarkup:
+    rows = []
+    for name in sorted(state):
+        info = state[name]
+        rows.append([
+            InlineKeyboardButton(f"{name} · {fmt_uptime(info['started'])}", callback_data=f"viewlog:{name}"),
+            InlineKeyboardButton("🛑", callback_data=f"stop:{name}"),
+        ])
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="dashboard")])
+    rows.append([InlineKeyboardButton("🛑 Stop All", callback_data="stopall")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="refresh")])
+    return InlineKeyboardMarkup(rows)
+
+
+def dashboard_text(state: dict) -> str:
+    if not state:
+        return "**🎛 Dashboard**\n\nNothing running."
+    return f"**🎛 Dashboard** — {len(state)} running\n\n{TMUX_HINT}\n\nTap a script for its log, or 🛑 to stop it:"
 
 
 @app.on_message(filters.command(["start", "launch"]) & owner_only)
@@ -217,15 +343,31 @@ async def cmd_status(client, message):
     await message.reply(status_text(), reply_markup=build_menu())
 
 
+@app.on_message(filters.command("dashboard") & owner_only)
+async def cmd_dashboard(client, message):
+    state = reconcile_state()
+    await message.reply(dashboard_text(state), reply_markup=build_dashboard_menu(state))
+
+
+@app.on_message(filters.command("help") & owner_only)
+async def cmd_help(client, message):
+    await message.reply(
+        "**Commands**\n"
+        "/launch or /status — main menu, tap a script to start/manage it\n"
+        "/dashboard — everything currently running, quick log/stop buttons\n"
+        "/delete — remove script files (running ones are protected)\n\n"
+        f"**In Termux**\n{TMUX_HINT}"
+    )
+
+
 def build_delete_menu(selected: set) -> InlineKeyboardMarkup:
     scripts = discover()
-    state = running_script()
-    active = state["script"] if state else None
+    state = reconcile_state()
 
     rows = []
-    for p, desc in scripts:
-        if p.name == active:
-            continue  # can't delete the one that's running
+    for p, _ in scripts:
+        if p.name in state:
+            continue  # can't delete something that's running
         mark = "✅ " if p.name in selected else "⬜ "
         rows.append([InlineKeyboardButton(f"{mark}{p.name}", callback_data=f"deltoggle:{p.name}")])
 
@@ -241,11 +383,10 @@ def build_delete_menu(selected: set) -> InlineKeyboardMarkup:
 @app.on_message(filters.command("delete") & owner_only)
 async def cmd_delete(client, message):
     scripts = [p for p, _ in discover()]
-    state = running_script()
-    active = state["script"] if state else None
-    deletable = [p for p in scripts if p.name != active]
+    state = reconcile_state()
+    deletable = [p for p in scripts if p.name not in state]
     if not deletable:
-        await message.reply("Nothing to delete." + (f" (`{active}` is running — stop it first if you want to remove it.)" if active else ""))
+        await message.reply("Nothing to delete — every script is currently running. Stop one first.")
         return
     sent = await message.reply(
         "Tap to select scripts, then tap Delete selected:",
@@ -284,11 +425,20 @@ async def _handle_callback(cq: CallbackQuery, data: str):
         await _safe_edit(cq.message, status_text(), build_menu())
         return
 
-    if data == "stop":
-        await cq.answer("Stopping…")
-        ok = stop_current()
+    if data == "dashboard":
+        state = reconcile_state()
+        await cq.answer("Refreshed")
+        await _safe_edit(cq.message, dashboard_text(state), build_dashboard_menu(state))
+        return
+
+    if data == "stopall":
+        await cq.answer("Stopping everything…")
+        stopped = stop_all()
         await _safe_edit(cq.message, status_text(), build_menu())
-        await cq.message.reply("🛑 Stopped." if ok else "Nothing was running.")
+        if stopped:
+            await cq.message.reply("🛑 Stopped: " + ", ".join(f"`{n}`" for n in stopped))
+        else:
+            await cq.message.reply("Nothing was running.")
         return
 
     if data.startswith("run:"):
@@ -297,6 +447,9 @@ async def _handle_callback(cq: CallbackQuery, data: str):
         if not target.exists():
             await cq.answer("Script not found (was it moved?)", show_alert=True)
             return
+        if is_running(name):
+            await cq.answer("Already running.", show_alert=True)
+            return
         await cq.answer(f"Launching {name}…")
         launch(target)
         await _safe_edit(cq.message, status_text(), build_menu())
@@ -304,22 +457,55 @@ async def _handle_callback(cq: CallbackQuery, data: str):
         # give it a moment to print its startup banner, then show the actual
         # terminal output right here instead of making you go attach tmux
         await asyncio.sleep(2)
-        log = capture_pane()
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh log", callback_data="viewlog")]])
-        text = f"📟 Live log — `{name}`:\n```\n{(log or '(no output yet)')[-3500:]}\n```"
+        log = capture_pane(name)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh log", callback_data=f"viewlog:{name}")]])
+        text = f"📟 Live log — `{name}` (`{session_name(name)}`):\n```\n{(log or '(no output yet)')[-3500:]}\n```"
         await cq.message.reply(text, reply_markup=kb)
         return
 
-    if data == "viewlog":
-        state = running_script()
-        if not state:
-            await cq.answer("Nothing running.", show_alert=True)
+    if data.startswith("manage:"):
+        name = data.split("manage:", 1)[1]
+        if not is_running(name):
+            await cq.answer("Not running anymore.", show_alert=True)
+            await _safe_edit(cq.message, status_text(), build_menu())
+            return
+        await cq.answer()
+        await _safe_edit(cq.message, manage_text(name), build_manage_menu(name))
+        return
+
+    if data.startswith("restart:"):
+        name = data.split("restart:", 1)[1]
+        target = SCRIPT_DIR / name
+        if not target.exists():
+            await cq.answer("Script not found (was it moved?)", show_alert=True)
+            return
+        await cq.answer(f"Restarting {name}…")
+        launch(target, restart=True)
+        await asyncio.sleep(2)
+        await _safe_edit(cq.message, manage_text(name), build_manage_menu(name))
+        return
+
+    if data.startswith("viewlog:"):
+        name = data.split("viewlog:", 1)[1]
+        if not is_running(name):
+            await cq.answer("Not running anymore.", show_alert=True)
             return
         await cq.answer("Refreshed")
-        log = capture_pane()
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh log", callback_data="viewlog")]])
-        text = f"📟 Live log — `{state['script']}`:\n```\n{(log or '(no output yet)')[-3500:]}\n```"
+        log = capture_pane(name)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Refresh log", callback_data=f"viewlog:{name}")],
+            [InlineKeyboardButton("⬅️ Back", callback_data=f"manage:{name}")],
+        ])
+        text = f"📟 Live log — `{name}` (`{session_name(name)}`):\n```\n{(log or '(no output yet)')[-3500:]}\n```"
         await _safe_edit(cq.message, text, kb)
+        return
+
+    if data.startswith("stop:"):
+        name = data.split("stop:", 1)[1]
+        await cq.answer("Stopping…")
+        ok = stop_script(name)
+        await _safe_edit(cq.message, status_text(), build_menu())
+        await cq.message.reply(f"🛑 Stopped `{name}`." if ok else f"`{name}` wasn't running.")
         return
 
     if data == "delcancel":
@@ -331,8 +517,7 @@ async def _handle_callback(cq: CallbackQuery, data: str):
     if data.startswith("deltoggle:"):
         name = data.split("deltoggle:", 1)[1]
         selected = DELETE_SELECTIONS.setdefault(cq.message.id, set())
-        state = running_script()
-        if state and state["script"] == name:
+        if is_running(name):
             await cq.answer("That one's running — stop it first.", show_alert=True)
             return
         if not (SCRIPT_DIR / name).exists():
@@ -373,11 +558,10 @@ async def _handle_callback(cq: CallbackQuery, data: str):
         if not selected:
             await cq.answer("Nothing selected.", show_alert=True)
             return
-        state = running_script()
-        active = state["script"] if state else None
+        state = reconcile_state()
         deleted, skipped, failed = [], [], []
         for name in sorted(selected):
-            if name == active:
+            if name in state:
                 skipped.append(name)
                 continue
             target = SCRIPT_DIR / name
@@ -403,6 +587,7 @@ async def _handle_callback(cq: CallbackQuery, data: str):
 
 async def _startup():
     async with app:
+        reconcile_state()  # pick up sessions that survived a launcher restart
         print("🚀 Launcher Online!!")
         try:
             await app.send_message(
