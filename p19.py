@@ -825,6 +825,8 @@ async def tg_mark_message_copied(chat_id, msg_id, tag, dest_topic_id):
         (chat_id, msg_id, tag, dest_topic_id, time.time())
     )
 
+from pyrogram.raw.functions.channels import CreateForumTopic
+
 async def tg_create_destination_topic(tag):
     master_forum_id = await get_control("master_forum_id")
     if not master_forum_id:
@@ -832,8 +834,27 @@ async def tg_create_destination_topic(tag):
     
     title = tag.replace("#", "").strip() or "transfer"
     
-    topic = await tg_flood_safe(user_app.create_forum_topic, int(master_forum_id), title)
-    topic_id = topic.id
+    # Bypass missing Pyrogram helper by directly invoking Telegram's raw MTProto API
+    peer = await user_app.resolve_peer(int(master_forum_id))
+    raw_response = await tg_flood_safe(
+        user_app.invoke, 
+        CreateForumTopic(
+            channel=peer, 
+            title=title,
+            random_id=int(time.time() * 1000)
+        )
+    )
+    
+    # Parse the raw Telegram response to find the ID of the newly created topic message
+    topic_id = None
+    for update in getattr(raw_response, "updates", []):
+        if hasattr(update, "message") and hasattr(update.message, "id"):
+            topic_id = update.message.id
+            break
+            
+    if not topic_id:
+        raise Exception("Topic was created in MTProto, but ID could not be parsed.")
+
     await asyncio.sleep(TRANSFER_STAGGER_SECONDS)
 
     await tg_set_routing_config(tag, topic_id, title)
