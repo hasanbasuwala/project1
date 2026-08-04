@@ -2216,8 +2216,11 @@ async def monitor_selected_cmd(client, message):
 @bot_app.on_message(filters.command("setmasterforum"))
 async def set_master_forum_cmd(client, message):
     if message.chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP):
-        forum_id = message.chat.id
-        if not getattr(message.chat, "is_forum", False):
+        # Force fetch the full chat object to get the real-time is_forum status
+        full_chat = await client.get_chat(message.chat.id)
+        forum_id = full_chat.id
+        
+        if not getattr(full_chat, "is_forum", False):
             return await message.reply_text(
                 "⚠️ **Topics are not enabled here.**\n"
                 "Please go to Group Settings -> Enable 'Topics', then run this command again.",
