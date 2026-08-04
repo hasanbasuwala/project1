@@ -439,7 +439,8 @@ async def bot_start(client, message):
 async def cmd_status(client, message):
     db["dashboard_msg_id"] = None
     await update_dashboard()
-    await message.delete()
+    try: await message.delete()
+    except: pass
 
 @bot.on_message(filters.command(["addsource", "rmsource", "movetag", "purgetag", "copytag"]) & is_owner & filters.private)
 async def initiate_command(client, message):
@@ -447,7 +448,8 @@ async def initiate_command(client, message):
     user_states[config.OWNER_ID] = {"action": cmd, "step": "need_group"}
     prompt = await message.reply_text(f"🛠️ **Command:** `/{cmd}`\nSend the target **Group ID** or **Username**.")
     user_states[config.OWNER_ID]["prompt_msg"] = prompt.id
-    await message.delete()
+    try: await message.delete()
+    except: pass
 
 @bot.on_message(filters.command("shutdown") & is_owner)
 async def bot_shutdown(client, message):
@@ -470,7 +472,8 @@ async def process_wizard_inputs(client, message):
             state["chat_id"] = chat.id
             state["chat_title"] = chat.title
 
-            await message.delete()
+            try: await message.delete()
+            except: pass
             try: await bot.delete_messages(config.OWNER_ID, state["prompt_msg"])
             except: pass
 
@@ -496,11 +499,13 @@ async def process_wizard_inputs(client, message):
 
         except Exception as e:
             asyncio.create_task(flash_message(f"❌ Error: {e}\nAre you a member? Try again."))
-            await message.delete()
+            try: await message.delete()
+            except: pass
 
     elif step == "need_tag":
         raw_tag = message.text.strip()
-        await message.delete()
+        try: await message.delete()
+        except: pass
         try: await bot.delete_messages(config.OWNER_ID, state["prompt_msg"])
         except: pass
 
