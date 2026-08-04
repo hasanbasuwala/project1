@@ -12,9 +12,9 @@ import requests
 import vk_api
 from collections import deque
 from pyrogram import Client, filters
-from pyrogram.enums import ParseMode, ChatPrivileges
+from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, ChatPrivileges
 
 from rich.console import Console
 from rich.live import Live
