@@ -832,10 +832,22 @@ async def tg_create_destination_topic(tag):
     if not master_forum_id:
         raise Exception("Master Forum ID is not set. Send /setmasterforum <chat_id> to the bot first.")
     
+    # 1. Intelligently figure out if it's a number or a username
+    try:
+        chat_identifier = int(master_forum_id)
+    except ValueError:
+        chat_identifier = master_forum_id  # It is a string like '@Collection5253'
+    
     title = tag.replace("#", "").strip() or "transfer"
     
-    # Bypass missing Pyrogram helper by directly invoking Telegram's raw MTProto API
-    peer = await user_app.resolve_peer(int(master_forum_id))
+    # 2. Get the peer using whichever format is provided
+    peer = await user_app.resolve_peer(chat_identifier)
+    
+    # 3. Retrieve the absolute integer ID so the rest of the bot's math/routing doesn't break
+    real_chat = await user_app.get_chat(chat_identifier)
+    real_chat_id = real_chat.id
+
+    # 4. Invoke MTProto
     raw_response = await tg_flood_safe(
         user_app.invoke, 
         CreateForumTopic(
@@ -845,7 +857,6 @@ async def tg_create_destination_topic(tag):
         )
     )
     
-    # Parse the raw Telegram response to find the ID of the newly created topic message
     topic_id = None
     for update in getattr(raw_response, "updates", []):
         if hasattr(update, "message") and hasattr(update.message, "id"):
@@ -858,7 +869,9 @@ async def tg_create_destination_topic(tag):
     await asyncio.sleep(TRANSFER_STAGGER_SECONDS)
 
     await tg_set_routing_config(tag, topic_id, title)
-    return int(master_forum_id), topic_id, title
+    
+    # Return the resolved real_chat_id so other functions get the pure integer they expect
+    return real_chat_id, topic_id, title
 
 async def tg_resolve_destination_topic(tag):
     master_forum_id = await get_control("master_forum_id")
