@@ -2,19 +2,21 @@ import re
 import time
 import asyncio
 import aiosqlite
-from telethon import TelegramClient, events, errors, functions
+from telethon import TelegramClient, events, functions
 from telethon.tl.custom import Button
 
 # --- IMPORT CONFIGURATION ---
 from config import API_ID, API_HASH, DROPZONE_GROUP_ID, LIBRARY_GROUP_ID, STASH_CONFIG, STASH_BOT_TOKEN
 from stashapi.stashapp import StashInterface
 
-client = TelegramClient('telegram_stash_indexer_session', API_ID, API_HASH)
-stash = StashInterface(STASH_CONFIG)
+# --- INITIALIZE BOTH CLIENTS ---
+user_client = TelegramClient('user_stash_session', API_ID, API_HASH)
+bot_client = TelegramClient('bot_stash_session', API_ID, API_HASH)
 
+stash = StashInterface(STASH_CONFIG)
 PERFORMER_CACHE = {}
-START_TIME = time.time()
-BOT_STATE = "Initializing..."
+
+# ================= DATABASE & CACHE SETUP =================
 
 def load_stash_performers():
     """Fetches performers from Stash to build the matching cache."""
@@ -35,18 +37,16 @@ def load_stash_performers():
             for alias in aliases:
                 if alias:
                     PERFORMER_CACHE[alias.lower().strip()] = f"#{tag_name}"
-        return count
+        print(f"[STASH] Successfully cached {count} performers.")
     except Exception as e:
         print(f"[WARNING] Stash connection failed: {e}")
-        return 0
 
 async def init_db():
-    """Sets up SQLite database with new transfer logic and topic mapping."""
+    """Sets up SQLite database."""
     async with aiosqlite.connect('telegram_stash_videos.db') as db:
         await db.execute('''
             CREATE TABLE IF NOT EXISTS videos (
                 message_id INTEGER PRIMARY KEY,
-                link TEXT,
                 transferred INTEGER DEFAULT 0
             )
         ''')
@@ -63,12 +63,6 @@ async def init_db():
                 topic_id INTEGER
             )
         ''')
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value INTEGER
-            )
-        ''')
         await db.commit()
 
 def extract_actor_tags(text):
@@ -83,33 +77,35 @@ def extract_actor_tags(text):
         found_tags.add(tag)
     return list(found_tags)
 
-async def process_message(message, db):
-    """Indexes a Dropzone video into SQLite."""
-    if not message.video: return False
+# ================= THE WORKER (USER CLIENT) =================
 
-    caption = message.text or ""
-    filename = message.video.attributes[0].file_name if message.video.attributes else ""
+@user_client.on(events.NewMessage(chats=DROPZONE_GROUP_ID))
+async def raw_upload_listener(event):
+    """Listens for raw uploads, scans tags, and indexes them silently."""
+    if not event.message.video: 
+        return
+
+    caption = event.message.text or ""
+    filename = event.message.video.attributes[0].file_name if event.message.video.attributes else ""
     tags = extract_actor_tags(f"{caption} {filename}")
     
-    if not tags: return False
+    if not tags: 
+        return
 
-    chat_id_str = str(message.chat_id).replace('-100', '')
-    link = f"https://t.me/c/{chat_id_str}/{message.id}"
-
-    # Insert ignoring conflicts so we don't reset transferred status of existing indexed vids
-    await db.execute('INSERT OR IGNORE INTO videos (message_id, link, transferred) VALUES (?, ?, 0)', (message.id, link))
-    await db.execute('DELETE FROM tags WHERE message_id = ?', (message.id,))
-    for tag in tags:
-        await db.execute('INSERT INTO tags (message_id, tag) VALUES (?, ?)', (message.id, tag))
-    return True
-
-# ================= TELEGRAM DASHBOARD COMMANDS =================
-
-@client.on(events.NewMessage(chats=DROPZONE_GROUP_ID, pattern=r'^/dashboard'))
-async def dashboard_handler(event):
-    """Generates the interactive Triage Dashboard for pending transfers."""
     async with aiosqlite.connect('telegram_stash_videos.db') as db:
-        # Find all tags that have videos that are NOT yet transferred
+        await db.execute('INSERT OR IGNORE INTO videos (message_id, transferred) VALUES (?, 0)', (event.message.id,))
+        await db.execute('DELETE FROM tags WHERE message_id = ?', (event.message.id,))
+        for tag in tags:
+            await db.execute('INSERT INTO tags (message_id, tag) VALUES (?, ?)', (event.message.id, tag))
+        await db.commit()
+    print(f"[USER WORKER] Indexed video {event.message.id} with tags: {tags}")
+
+# ================= THE MANAGER (BOT CLIENT) =================
+
+@bot_client.on(events.NewMessage(chats=DROPZONE_GROUP_ID, pattern=r'^/dashboard'))
+async def dashboard_handler(event):
+    """Generates the interactive Triage Dashboard."""
+    async with aiosqlite.connect('telegram_stash_videos.db') as db:
         query = '''
             SELECT tags.tag, COUNT(videos.message_id) 
             FROM tags 
@@ -117,7 +113,7 @@ async def dashboard_handler(event):
             WHERE videos.transferred = 0 
             GROUP BY tags.tag 
             ORDER BY COUNT(videos.message_id) DESC
-            LIMIT 20
+            LIMIT 15
         '''
         cursor = await db.execute(query)
         rows = await cursor.fetchall()
@@ -128,7 +124,6 @@ async def dashboard_handler(event):
 
     buttons = []
     for tag, count in rows:
-        # Callback data contains the tag name
         buttons.append([Button.inline(f"{tag} ({count} pending)", data=f"review_{tag}")])
 
     await event.reply(
@@ -136,9 +131,9 @@ async def dashboard_handler(event):
         buttons=buttons
     )
 
-@client.on(events.CallbackQuery(pattern=b'^review_(.+)'))
+@bot_client.on(events.CallbackQuery(pattern=b'^review_(.+)'))
 async def review_callback(event):
-    """Handles clicking an actor on the dashboard."""
+    """Displays action menu for a specific actor."""
     tag = event.pattern_match.group(1).decode('utf-8')
     
     async with aiosqlite.connect('telegram_stash_videos.db') as db:
@@ -153,38 +148,34 @@ async def review_callback(event):
         await event.edit(f"✅ All videos for {tag} have already been transferred.")
         return
 
-    # Show the action menu for this specific tag
     buttons = [
         [Button.inline("🚀 Transfer to Library", data=f"transfer_{tag}")],
         [Button.inline("🔙 Back to Dashboard", data="back_dash")]
     ]
     await event.edit(f"🎬 **Actor:** {tag}\n📦 **Pending Videos:** {count}\n\nDo you want to move these to the organized Library group?", buttons=buttons)
 
-@client.on(events.CallbackQuery(pattern=b'^back_dash$'))
+@bot_client.on(events.CallbackQuery(pattern=b'^back_dash$'))
 async def back_dash_callback(event):
-    # Triggers the dashboard command again to refresh
     await dashboard_handler(event)
 
-@client.on(events.CallbackQuery(pattern=b'^transfer_(.+)'))
+@bot_client.on(events.CallbackQuery(pattern=b'^transfer_(.+)'))
 async def transfer_callback(event):
-    """Executes the physical copy process to the Library Group and auto-creates topics."""
+    """Handles Topic creation (via Bot) and File Transfer (via User)."""
     tag = event.pattern_match.group(1).decode('utf-8')
     await event.edit(f"⏳ **Starting transfer for {tag}...**\nPlease wait.")
     
     async with aiosqlite.connect('telegram_stash_videos.db') as db:
-        # 1. Check if Topic exists in DB
         cursor = await db.execute('SELECT topic_id FROM topics WHERE tag = ?', (tag,))
         row = await cursor.fetchone()
         topic_id = row[0] if row else None
 
-        # 2. If no Topic, create one in the Library Group
+        # 1. Create Topic via Bot Client
         if not topic_id:
             try:
-                result = await client(functions.channels.CreateForumTopicRequest(
+                result = await bot_client(functions.channels.CreateForumTopicRequest(
                     channel=LIBRARY_GROUP_ID,
-                    title=tag.replace('#', '') # Clean the hashtag for the folder name
+                    title=tag.replace('#', '')
                 ))
-                # Extract the newly created Topic ID
                 topic_id = result.updates[1].message.id 
                 await db.execute('INSERT INTO topics (tag, topic_id) VALUES (?, ?)', (tag, topic_id))
                 await db.commit()
@@ -192,7 +183,6 @@ async def transfer_callback(event):
                 await event.edit(f"❌ **Error creating topic for {tag}:** {e}")
                 return
 
-        # 3. Fetch all pending messages for this tag
         cursor = await db.execute('''
             SELECT videos.message_id 
             FROM videos 
@@ -201,47 +191,47 @@ async def transfer_callback(event):
         ''', (tag,))
         pending_messages = [row[0] for row in await cursor.fetchall()]
 
-        # 4. Transfer Loop
+        # 2. Transfer Media via User Client (Bypasses bot file size limits)
         success_count = 0
         for msg_id in pending_messages:
             try:
-                # Fetch original message
-                msg = await client.get_messages(DROPZONE_GROUP_ID, ids=msg_id)
+                msg = await user_client.get_messages(DROPZONE_GROUP_ID, ids=msg_id)
                 if msg and msg.media:
-                    # Send a clean copy to the specific Topic ID
-                    await client.send_message(
+                    await user_client.send_message(
                         LIBRARY_GROUP_ID, 
                         message=msg.text, 
                         file=msg.media, 
                         reply_to=topic_id
                     )
-                    # Mark as transferred globally to prevent duplicates for co-stars
                     await db.execute('UPDATE videos SET transferred = 1 WHERE message_id = ?', (msg_id,))
                     await db.commit()
                     success_count += 1
-                    await asyncio.sleep(1.5) # Anti-spam sleep
+                    await asyncio.sleep(1.5) # Crucial sleep to prevent FloodWait
             except Exception as e:
                 print(f"[ERROR] Failed to transfer msg {msg_id}: {e}")
 
-    # 5. Finish
     await event.edit(f"✅ **Transfer Complete!**\nSuccessfully copied {success_count} videos into the `{tag}` folder in your Library.")
 
-# ================= LIVE LISTENING =================
-
-@client.on(events.NewMessage(chats=DROPZONE_GROUP_ID))
-async def live_message_handler(event):
-    if event.message.video:
-        async with aiosqlite.connect('telegram_stash_videos.db') as db:
-            if await process_message(event.message, db):
-                await db.commit()
-
 # ================= MAIN EXECUTION =================
+
 async def main():
     await init_db()
     load_stash_performers()
-    await client.start()
-    print("[READY] Bot is listening. Type /dashboard in the Dropzone group.")
-    await client.run_until_disconnected()
+    
+    # Start both clients
+    await user_client.start()
+    print("[SYSTEM] User Client (Worker) started.")
+    
+    await bot_client.start(bot_token=STASH_BOT_TOKEN)
+    print("[SYSTEM] Bot Client (Manager) started.")
+    
+    print("[READY] Hybrid system online. Send raw files, then type /dashboard to manage.")
+    
+    # Run concurrently
+    await asyncio.gather(
+        user_client.run_until_disconnected(),
+        bot_client.run_until_disconnected()
+    )
 
 if __name__ == '__main__':
     asyncio.run(main())
