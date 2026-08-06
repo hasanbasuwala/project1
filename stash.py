@@ -197,6 +197,9 @@ async def query_graphql(url: str, query: str, variables: dict = None, api_key: s
         print(f"\n❌ [Network Error talking to StashDB]: {e}")
         raise StashDBError(f"Network Connection Failed")
 
+# ============================================================
+# STASH GRAPHQL HYBRID MATCHER (FULLY PATCHED)
+# ============================================================
 STASHDB_GRAPHQL_URL = "https://stashdb.org/graphql"
 STASHDB_API_KEY = getattr(config, "STASHDB_API_KEY", "")
 
@@ -209,43 +212,38 @@ async def find_performers_hybrid(client: Client, message):
     
     # 1. OSHASH Fingerprint Lookup (StashDB direct)
     if oshash:
-        # 🚨 FIX 1: Use the exact FingerprintQueryInput StashDB demands
-        gql_hash = """
-        query FindByHash($fingerprint: FingerprintQueryInput!) {
-          findSceneByFingerprint(fingerprint: $fingerprint) {
-            performers { performer { name } }
-          }
-        }
+        # 🚨 FIX 1: Use Python f-strings to inject the hash directly.
+        # This completely bypasses the GraphQL strict variable typing conflict!
+        gql_hash = f"""
+        query {{
+          findScenesBySceneFingerprints(fingerprints: [{{hash: "{oshash}", algorithm: OSHASH}}]) {{
+            performers {{ performer {{ name }} }}
+          }}
+        }}
         """
-        # Pass the exact object structure via the variable dictionary
-        variables = {
-            "fingerprint": {
-                "hash": oshash,
-                "algorithm": "OSHASH"
-            }
-        }
-        res = await query_graphql(STASHDB_GRAPHQL_URL, gql_hash, variables, STASHDB_API_KEY)
+        # No variables dictionary needed because we hardcoded it in the string above
+        res = await query_graphql(STASHDB_GRAPHQL_URL, gql_hash, {}, STASHDB_API_KEY)
         
-        # 🚨 FIX 2: Check for the correct dictionary key returned by the query!
-        if res and res.get("findSceneByFingerprint"):
-            scenes = res["findSceneByFingerprint"]
-            # findSceneByFingerprint returns an array of matching scenes
-            if scenes and isinstance(scenes, list) and scenes[0].get("performers"):
-                performers = [p["performer"]["name"] for p in scenes[0]["performers"]]
-                if performers: 
-                    return performers, oshash
+        # 🚨 FIX 2: Parse the 2D array (list of lists) returned by the new schema
+        if res and res.get("findScenesBySceneFingerprints"):
+            results = res["findScenesBySceneFingerprints"]
+            # We check if the outer list and inner list exist and contain data
+            if results and isinstance(results, list) and isinstance(results[0], list) and len(results[0]) > 0:
+                first_scene = results[0][0]
+                if first_scene.get("performers"):
+                    performers = [p["performer"]["name"] for p in first_scene["performers"]]
+                    if performers: 
+                        return performers, oshash
 
     # 2. Text Search Fallback (StashDB direct)
     file_name = message.video.file_name if message.video else (message.document.file_name if message.document else "")
     caption_text = message.caption or message.text or ""
-    # Try to extract a clean search term (first line of caption or filename without extension)
     search_term = os.path.splitext(file_name)[0] if file_name else caption_text.split('\n')[0]
 
     if search_term:
-        # 🚨 FIX 3: Changed 'title' to 'q' (StashDB's global text search field) to prevent a secondary 422 error
         gql_text = """
         query TextSearch($q: String!) {
-          queryScenes(input: {q: $q, page: 1, per_page: 1}) {
+          queryScenes(input: {title: $q, page: 1, per_page: 1}) {
             scenes {
               performers { performer { name } }
             }
