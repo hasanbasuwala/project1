@@ -3200,37 +3200,72 @@ async def handle_buttons(client, callback):
         await callback.message.delete()
         await render_dashboard()
         
+# State store for interactive stashroute command
+STASH_ROUTE_STATE = {}
+
 @bot_app.on_message(filters.command("stashroute"))
 async def stash_route_cmd(client, message):
-    if len(message.command) < 3:
-        return await message.reply_text(
-            "⚠️ **Usage:** `/stashroute <source_group_id> <target_master_forum_id>`\n"
-            "Example: `/stashroute -100123456789 -100987654321`"
-        )
+    # Reset state and ask for Source Group
+    user_id = message.from_user.id
+    STASH_ROUTE_STATE[user_id] = {"step": "WAITING_SRC"}
     
-    # Try parsing the IDs (handles both numeric IDs and @usernames for public groups)
-    try:
-        src_chat_id = int(message.command[1].strip())
-    except ValueError:
-        src_chat_id = message.command[1].strip()
-        
-    try:
-        master_forum_id = int(message.command[2].strip())
-    except ValueError:
-        master_forum_id = message.command[2].strip()
-
-    status_msg = await message.reply_text("🚀 Initializing Stash Router and loading database...")
-    
-    # Run the massive loop in the background so it doesn't block other bot commands
-    asyncio.create_task(
-        stash_router.run_stash_archive_routing(
-            user_app=user_app,  # Make sure this matches your variable name for the Pyrogram User Client
-            bot_app=bot_app,    # Make sure this matches your variable name for the Pyrogram Bot Client
-            src_chat_id=src_chat_id,
-            master_forum_id=master_forum_id,
-            status_msg=status_msg
-        )
+    await message.reply_text(
+        "⚡ **Stash Performer Router**\n\n"
+        "📌 **Step 1:** Send the **Source Group ID** or **@username** (e.g. `@Collection5253` or `-10012345678`):"
     )
+
+@bot_app.on_message(filters.text & ~filters.command(["cancel", "start"]))
+async def stash_route_interactive_handler(client, message):
+    user_id = message.from_user.id
+    if user_id not in STASH_ROUTE_STATE:
+        return  # Let other handlers in p22.py handle this message
+
+    state = STASH_ROUTE_STATE[user_id]
+
+    # STEP 1: Process Source Group
+    if state.get("step") == "WAITING_SRC":
+        chat_input = message.text.strip()
+        try:
+            # Resolves both @username and numeric IDs to Telegram chat object
+            chat = await user_app.get_chat(chat_input)
+            state["src_chat_id"] = chat.id
+            state["step"] = "WAITING_TARGET"
+            
+            await message.reply_text(
+                f"✅ **Source Group Set:** {chat.title} (`{chat.id}`)\n\n"
+                "📌 **Step 2:** Send the **Target Master Forum ID** or **@username** (e.g. `@Collection515253`):"
+            )
+        except Exception as e:
+            await message.reply_text(f"❌ Could not resolve group `{chat_input}`. Make sure your user account has joined it.\n\nError: `{e}`")
+
+    # STEP 2: Process Target Forum & Launch
+    elif state.get("step") == "WAITING_TARGET":
+        chat_input = message.text.strip()
+        try:
+            chat = await user_app.get_chat(chat_input)
+            src_chat_id = state["src_chat_id"]
+            master_forum_id = chat.id
+            
+            # Clear state
+            del STASH_ROUTE_STATE[user_id]
+
+            status_msg = await message.reply_text(
+                f"🚀 **Target Set:** {chat.title} (`{chat.id}`)\n\n"
+                "Initializing Stash Router and populating database queue..."
+            )
+
+            # Launch routing engine
+            asyncio.create_task(
+                stash_router.run_stash_archive_routing(
+                    user_app=user_app,
+                    bot_app=bot_app,
+                    src_chat_id=src_chat_id,
+                    master_forum_id=master_forum_id,
+                    status_msg=status_msg
+                )
+            )
+        except Exception as e:
+            await message.reply_text(f"❌ Could not resolve target forum `{chat_input}`.\n\nError: `{e}`")
 
 # ============================================================
 # STARTUP & REBOOT RECOVERY
