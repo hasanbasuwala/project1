@@ -159,30 +159,43 @@ async def calculate_tg_oshash(client: Client, message):
         return None
 
 # ============================================================
-# STASH GRAPHQL HYBRID MATCHER (WITH ERROR LOGGING)
+# STASH GRAPHQL HYBRID MATCHER (WITH ERROR ABORT)
 # ============================================================
+class StashDBError(Exception):
+    """Custom exception to halt processing if StashDB fails."""
+    pass
+
 async def query_graphql(url: str, query: str, variables: dict = None, api_key: str = ""):
     headers = {"Content-Type": "application/json"}
     if api_key: 
         headers["ApiKey"] = api_key
+        
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json={"query": query, "variables": variables or {}}, headers=headers, timeout=10) as resp:
+                
+                # Check for authentication or server errors BEFORE falling back
+                if resp.status != 200:
+                    text_response = await resp.text()
+                    print(f"\n❌ [StashDB API Error] HTTP {resp.status}: {text_response.strip()}")
+                    if resp.status == 401:
+                        print("👉 FIX: Your STASHDB_API_KEY in config.py is invalid or missing.")
+                    # 🚨 Raising this error stops the script from dumping to 'Unmatched' 🚨
+                    raise StashDBError(f"HTTP {resp.status} - API Request Failed")
+
                 data = await resp.json()
                 
-                # Expose API authentication or schema errors
-                if resp.status != 200:
-                    print(f"\n❌ [StashDB API Error] HTTP {resp.status}: {data}")
-                    return None
+                # Catch internal GraphQL schema errors
                 if "errors" in data:
                     err_msg = data['errors'][0].get('message', 'Unknown Error')
                     print(f"\n❌ [StashDB GraphQL Error]: {err_msg}")
-                    return None
+                    raise StashDBError(f"GraphQL Error: {err_msg}")
                     
                 return data.get("data")
-    except Exception as e:
+                
+    except aiohttp.ClientError as e:
         print(f"\n❌ [Network Error talking to StashDB]: {e}")
-        return None
+        raise StashDBError(f"Network Connection Failed")
 
 STASHDB_GRAPHQL_URL = "https://stashdb.org/graphql"
 STASHDB_API_KEY = getattr(config, "STASHDB_API_KEY", "")
