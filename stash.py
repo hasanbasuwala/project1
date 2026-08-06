@@ -200,7 +200,7 @@ async def query_graphql(url: str, query: str, variables: dict = None, api_key: s
 # ============================================================
 # STASH GRAPHQL HYBRID MATCHER (FULLY PATCHED)
 # ============================================================
-STASHDB_GRAPHQL_URL = "https://stashdb.org/graphql"
+STASHDB_GRAPHQL_URL = "https://theporndb.net/graphql"
 STASHDB_API_KEY = getattr(config, "STASHDB_API_KEY", "")
 
 async def find_performers_hybrid(client: Client, message):
