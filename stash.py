@@ -110,11 +110,11 @@ async def live_dashboard_updater(bot_app: Client, status_msg):
             await asyncio.sleep(5.0)
 
 # ============================================================
-# OSHASH STREAMING CALCULATOR 
+# OSHASH STREAMING CALCULATOR (FIXED BYTE-MATH)
 # ============================================================
 async def calculate_tg_oshash(client: Client, message):
     media = message.video or message.document
-    if not media or media.file_size < 131072:
+    if not media or getattr(media, "file_size", 0) < 131072:
         return None
 
     file_id = media.file_id
@@ -122,20 +122,31 @@ async def calculate_tg_oshash(client: Client, message):
     chunk_size = 65536 
 
     try:
+        # Get head (First 64KB)
         head_buffer = bytearray()
         async for chunk in client.stream_media(file_id, limit=1, offset=0):
             head_buffer.extend(chunk)
-            if len(head_buffer) >= chunk_size: break
+            if len(head_buffer) >= chunk_size: 
+                break
         head_bytes = bytes(head_buffer[:chunk_size])
 
-        tail_offset = max(0, (file_size // (1024 * 1024)) - 1)
+        # Get tail (Last 64KB)
+        # Pyrogram yields chunks of 1048576 bytes (1MB). 
+        # We fetch the last two chunks to guarantee we get the absolute end of the file.
+        last_chunk_idx = (file_size - 1) // 1048576
+        start_chunk_idx = max(0, last_chunk_idx - 1) 
+        
         tail_buffer = bytearray()
-        async for chunk in client.stream_media(file_id, limit=1, offset=tail_offset):
+        async for chunk in client.stream_media(file_id, limit=3, offset=start_chunk_idx):
             tail_buffer.extend(chunk)
 
-        if len(tail_buffer) < chunk_size: return None
+        if len(tail_buffer) < chunk_size: 
+            return None
+            
+        # Accurately slice the exact last 64KB of the true file end
         tail_bytes = bytes(tail_buffer[-chunk_size:])
 
+        # Calculate OSHASH
         hash_val = file_size
         for i in range(0, chunk_size, 8):
             head_val = struct.unpack('<Q', head_bytes[i:i+8])[0]
@@ -143,24 +154,35 @@ async def calculate_tg_oshash(client: Client, message):
             hash_val = (hash_val + head_val + tail_val) & 0xFFFFFFFFFFFFFFFF
 
         return f"{hash_val:016x}"
-    except Exception:
+    except Exception as e:
+        print(f"❌ [OSHASH Error]: {e}")
         return None
 
 # ============================================================
-# STASH GRAPHQL HYBRID MATCHER
+# STASH GRAPHQL HYBRID MATCHER (WITH ERROR LOGGING)
 # ============================================================
 async def query_graphql(url: str, query: str, variables: dict = None, api_key: str = ""):
     headers = {"Content-Type": "application/json"}
-    if api_key: headers["ApiKey"] = api_key
+    if api_key: 
+        headers["ApiKey"] = api_key
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json={"query": query, "variables": variables or {}}, headers=headers, timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("data")
-    except Exception:
-        pass
-    return None
+                data = await resp.json()
+                
+                # Expose API authentication or schema errors
+                if resp.status != 200:
+                    print(f"\n❌ [StashDB API Error] HTTP {resp.status}: {data}")
+                    return None
+                if "errors" in data:
+                    err_msg = data['errors'][0].get('message', 'Unknown Error')
+                    print(f"\n❌ [StashDB GraphQL Error]: {err_msg}")
+                    return None
+                    
+                return data.get("data")
+    except Exception as e:
+        print(f"\n❌ [Network Error talking to StashDB]: {e}")
+        return None
 
 STASHDB_GRAPHQL_URL = "https://stashdb.org/graphql"
 STASHDB_API_KEY = getattr(config, "STASHDB_API_KEY", "")
