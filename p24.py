@@ -2781,6 +2781,28 @@ async def handle_buttons(client, callback):
         return await callback.answer()
 
     elif data == "noop":
+    elif data == "stop_task":
+        stash_router.stop_routing_flag.set()
+        await callback.answer("🛑 Stopping routing loops...", show_alert=True)
+        await callback.message.edit_text("🛑 **Stop Signal Sent.**\nThe router will halt after the current video finishes.")
+        return
+
+    elif data.startswith("opt_"):
+        stash_router.stop_routing_flag.clear()
+        parts = data.split("_")
+        option = parts[1]
+        src_id = int(parts[2])
+        dest_id = int(parts[3])
+        
+        status_msg = await callback.message.edit_text("⏳ **Initializing Database Scan...**")
+        
+        if option == "a":
+            asyncio.create_task(stash_router.run_stash_archive_routing(user_app, bot_app, src_id, dest_id, status_msg))
+            await callback.answer("Starting StashDB Matcher")
+        elif option == "b":
+            asyncio.create_task(stash_router.run_hashtag_routing(user_app, bot_app, src_id, dest_id, status_msg))
+            await callback.answer("Starting Hashtag Router")
+        return
         return await callback.answer()
 
     elif data in ("direct_copy_forum", "direct_transfer_forum"):
