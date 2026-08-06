@@ -12,6 +12,7 @@ import requests
 import vk_api
 from collections import deque
 from pyrogram import Client, filters, enums
+import stash
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, ChatPrivileges
