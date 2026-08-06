@@ -209,18 +209,28 @@ async def find_performers_hybrid(client: Client, message):
     
     # 1. OSHASH Fingerprint Lookup (StashDB direct)
     if oshash:
+        # 🚨 FIX 1: Use the exact FingerprintQueryInput StashDB demands
         gql_hash = """
-        query FindByHash($hash: String!) {
-          findScenesBySceneFingerprints(fingerprints: [{hash: $hash, algorithm: OSHASH}]) {
+        query FindByHash($fingerprint: FingerprintQueryInput!) {
+          findSceneByFingerprint(fingerprint: $fingerprint) {
             performers { performer { name } }
           }
         }
         """
-        res = await query_graphql(STASHDB_GRAPHQL_URL, gql_hash, {"hash": oshash}, STASHDB_API_KEY)
+        # Pass the exact object structure via the variable dictionary
+        variables = {
+            "fingerprint": {
+                "hash": oshash,
+                "algorithm": "OSHASH"
+            }
+        }
+        res = await query_graphql(STASHDB_GRAPHQL_URL, gql_hash, variables, STASHDB_API_KEY)
         
-        if res and res.get("findScenesByFingerprints"):
-            scenes = res["findScenesByFingerprints"]
-            if scenes and scenes[0].get("performers"):
+        # 🚨 FIX 2: Check for the correct dictionary key returned by the query!
+        if res and res.get("findSceneByFingerprint"):
+            scenes = res["findSceneByFingerprint"]
+            # findSceneByFingerprint returns an array of matching scenes
+            if scenes and isinstance(scenes, list) and scenes[0].get("performers"):
                 performers = [p["performer"]["name"] for p in scenes[0]["performers"]]
                 if performers: 
                     return performers, oshash
@@ -232,9 +242,10 @@ async def find_performers_hybrid(client: Client, message):
     search_term = os.path.splitext(file_name)[0] if file_name else caption_text.split('\n')[0]
 
     if search_term:
+        # 🚨 FIX 3: Changed 'title' to 'q' (StashDB's global text search field) to prevent a secondary 422 error
         gql_text = """
         query TextSearch($q: String!) {
-          queryScenes(input: {title: $q, page: 1, per_page: 1}) {
+          queryScenes(input: {q: $q, page: 1, per_page: 1}) {
             scenes {
               performers { performer { name } }
             }
