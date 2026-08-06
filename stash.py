@@ -162,26 +162,60 @@ async def query_graphql(url: str, query: str, variables: dict = None, api_key: s
         pass
     return None
 
-async def find_performers_hybrid(client: Client, message):
-    oshash = await calculate_tg_oshash(client, message)
-    if oshash:
-        gql_hash = 'query FindByHash($oshash: String!) { findScenes(scene_filter: { oshash: { value: $oshash, modifier: EQUALS } }) { scenes { performers { name } } } }'
-        res = await query_graphql(STASH_GRAPHQL_URL, gql_hash, {"oshash": oshash}, STASH_API_KEY)
-        if res and res.get("findScenes", {}).get("scenes"):
-            performers = [p["name"] for p in res["findScenes"]["scenes"][0].get("performers", [])]
-            if performers: return performers, oshash
+STASHDB_GRAPHQL_URL = "https://stashdb.org/graphql"
+STASHDB_API_KEY = getattr(config, "STASHDB_API_KEY", "")
 
+async def find_performers_hybrid(client: Client, message):
+    """
+    1. Tries OSHASH matching via remote StashDB.org
+    2. Falls back to Title/Caption text matching via remote StashDB.org
+    """
+    oshash = await calculate_tg_oshash(client, message)
+    
+    # 1. OSHASH Fingerprint Lookup (StashDB direct)
+    if oshash:
+        gql_hash = """
+        query FindByHash($hash: String!) {
+          findScenesByFingerprints(fingerprints: [{hash: $hash, algorithm: OSHASH}]) {
+            performers { performer { name } }
+          }
+        }
+        """
+        res = await query_graphql(STASHDB_GRAPHQL_URL, gql_hash, {"hash": oshash}, STASHDB_API_KEY)
+        
+        if res and res.get("findScenesByFingerprints"):
+            scenes = res["findScenesByFingerprints"]
+            if scenes and scenes[0].get("performers"):
+                performers = [p["performer"]["name"] for p in scenes[0]["performers"]]
+                if performers: 
+                    return performers, oshash
+
+    # 2. Text Search Fallback (StashDB direct)
     file_name = message.video.file_name if message.video else (message.document.file_name if message.document else "")
     caption_text = message.caption or message.text or ""
+    # Try to extract a clean search term (first line of caption or filename without extension)
     search_term = os.path.splitext(file_name)[0] if file_name else caption_text.split('\n')[0]
 
     if search_term:
-        gql_text = 'query FindByText($q: String!) { findScenes(filter: { q: $q, per_page: 1 }) { scenes { performers { name } } } }'
-        res = await query_graphql(STASH_GRAPHQL_URL, gql_text, {"q": search_term}, STASH_API_KEY)
-        if res and res.get("findScenes", {}).get("scenes"):
-            performers = [p["name"] for p in res["findScenes"]["scenes"][0].get("performers", [])]
-            if performers: return performers, oshash
+        gql_text = """
+        query TextSearch($q: String!) {
+          queryScenes(input: {title: $q, page: 1, per_page: 1}) {
+            scenes {
+              performers { performer { name } }
+            }
+          }
+        }
+        """
+        res = await query_graphql(STASHDB_GRAPHQL_URL, gql_text, {"q": search_term}, STASHDB_API_KEY)
+        
+        if res and res.get("queryScenes", {}).get("scenes"):
+            scenes = res["queryScenes"]["scenes"]
+            if scenes and scenes[0].get("performers"):
+                performers = [p["performer"]["name"] for p in scenes[0]["performers"]]
+                if performers: 
+                    return performers, oshash
 
+    # 3. Default Fallback
     return ["Unmatched Stash Videos"], oshash
 
 # ============================================================
