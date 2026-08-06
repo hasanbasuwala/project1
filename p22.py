@@ -3199,6 +3199,38 @@ async def handle_buttons(client, callback):
         user_states.pop(chat_id, None)
         await callback.message.delete()
         await render_dashboard()
+        
+@bot_app.on_message(filters.command("stashroute"))
+async def stash_route_cmd(client, message):
+    if len(message.command) < 3:
+        return await message.reply_text(
+            "⚠️ **Usage:** `/stashroute <source_group_id> <target_master_forum_id>`\n"
+            "Example: `/stashroute -100123456789 -100987654321`"
+        )
+    
+    # Try parsing the IDs (handles both numeric IDs and @usernames for public groups)
+    try:
+        src_chat_id = int(message.command[1].strip())
+    except ValueError:
+        src_chat_id = message.command[1].strip()
+        
+    try:
+        master_forum_id = int(message.command[2].strip())
+    except ValueError:
+        master_forum_id = message.command[2].strip()
+
+    status_msg = await message.reply_text("🚀 Initializing Stash Router and loading database...")
+    
+    # Run the massive loop in the background so it doesn't block other bot commands
+    asyncio.create_task(
+        stash_router.run_stash_archive_routing(
+            user_app=user_app,  # Make sure this matches your variable name for the Pyrogram User Client
+            bot_app=bot_app,    # Make sure this matches your variable name for the Pyrogram Bot Client
+            src_chat_id=src_chat_id,
+            master_forum_id=master_forum_id,
+            status_msg=status_msg
+        )
+    )
 
 # ============================================================
 # STARTUP & REBOOT RECOVERY
