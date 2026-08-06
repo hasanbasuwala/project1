@@ -211,7 +211,7 @@ async def find_performers_hybrid(client: Client, message):
     if oshash:
         gql_hash = """
         query FindByHash($hash: String!) {
-          findScenesByFingerprints(fingerprints: [{hash: $hash, algorithm: OSHASH}]) {
+          findScenesBySceneFingerprints(fingerprints: [{hash: $hash, algorithm: OSHASH}]) {
             performers { performer { name } }
           }
         }
