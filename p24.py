@@ -2781,6 +2781,8 @@ async def handle_buttons(client, callback):
         return await callback.answer()
 
     elif data == "noop":
+        return await callback.answer()
+
     elif data == "stop_task":
         stash_router.stop_routing_flag.set()
         await callback.answer("🛑 Stopping routing loops...", show_alert=True)
@@ -2803,7 +2805,6 @@ async def handle_buttons(client, callback):
             asyncio.create_task(stash_router.run_hashtag_routing(user_app, bot_app, src_id, dest_id, status_msg))
             await callback.answer("Starting Hashtag Router")
         return
-        return await callback.answer()
 
     elif data in ("direct_copy_forum", "direct_transfer_forum"):
         state = user_states.get(chat_id)
