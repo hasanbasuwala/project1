@@ -347,8 +347,9 @@ async def run_stash_archive_routing(user_app: Client, bot_app: Client, src_chat_
             for perf_name in performers:
                 topic_id = await resolve_performer_topic(user_app, master_forum_id, perf_name)
                 
-                c.execute("SELECT 1 FROM master_ledger WHERE source_msg_id = ? AND destination_topic_id = ?", (msg_id, topic_id))
-                if c.fetchone():
+                # 🚨 FIX: Assign the result to a 'cursor' variable
+                cursor = c.execute("SELECT 1 FROM master_ledger WHERE source_msg_id = ? AND destination_topic_id = ?", (msg_id, topic_id))
+                if cursor.fetchone():
                     copied = True 
                     continue
 
@@ -436,8 +437,9 @@ async def run_hashtag_routing(user_app: Client, bot_app: Client, src_chat_id, ma
             for tag_name in tags_list:
                 topic_id = await resolve_performer_topic(user_app, master_forum_id, tag_name)
                 
-                c.execute("SELECT 1 FROM master_ledger WHERE source_msg_id = ? AND destination_topic_id = ?", (msg_id, topic_id))
-                if c.fetchone():
+                # 🚨 FIX: Assign the result to a 'cursor' variable
+                cursor = c.execute("SELECT 1 FROM master_ledger WHERE source_msg_id = ? AND destination_topic_id = ?", (msg_id, topic_id))
+                if cursor.fetchone():
                     copied = True
                     continue
 
