@@ -2345,19 +2345,35 @@ async def route_menu_command(client, message):
     try:
         parts = message.text.split()
         if len(parts) != 3:
-            await message.reply("⚠️ **Format:** `/route <source_chat_id> <destination_forum_id>`")
+            await message.reply("⚠️ **Format:** `/route <source> <destination>`\n_(You can use numeric IDs like -1001234 or @usernames)_")
             return
             
-        src_id = int(parts[1])
-        dest_id = int(parts[2])
+        status_msg = await message.reply("⏳ Resolving chats...")
         
+        # 1. Safely resolve the Source chat ID
+        src_input = parts[1]
+        if src_input.lstrip("-").isdigit():
+            src_id = int(src_input)
+        else:
+            chat = await user_app.get_chat(src_input)
+            src_id = chat.id
+            
+        # 2. Safely resolve the Destination chat ID
+        dest_input = parts[2]
+        if dest_input.lstrip("-").isdigit():
+            dest_id = int(dest_input)
+        else:
+            chat = await user_app.get_chat(dest_input)
+            dest_id = chat.id
+        
+        # Build the menu
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🅰️ StashDB Matcher (Fingerprints)", callback_data=f"opt_a_{src_id}_{dest_id}")],
             [InlineKeyboardButton("🅱️ Hashtag Router (Captions)", callback_data=f"opt_b_{src_id}_{dest_id}")],
             [InlineKeyboardButton("🛑 Stop Running Router", callback_data="stop_task")]
         ])
         
-        await message.reply(
+        await status_msg.edit_text(
             f"**Routing Setup Confirmed**\n"
             f"Source: `{src_id}`\n"
             f"Destination: `{dest_id}`\n\n"
@@ -2365,8 +2381,8 @@ async def route_menu_command(client, message):
             reply_markup=keyboard
         )
     except Exception as e:
-         await message.reply(f"Error: {e}")
-
+         # If the bot/user isn't in the channel or it's misspelled, it will tell you here
+         await message.reply(f"❌ **Error resolving chats:** {e}")
 @bot_app.on_message(filters.command("refresh"))
 async def refresh_cmd(client, message):
     global engine_state
