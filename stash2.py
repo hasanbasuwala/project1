@@ -243,9 +243,10 @@ async def find_performers_hybrid(client: Client, message):
     search_term = os.path.splitext(file_name)[0] if file_name else caption_text.split('\n')[0]
 
     if search_term:
+        # 🚨 FIX: Added sort and direction to the input parameters
         gql_text = """
         query TextSearch($q: String!) {
-          queryScenes(input: {title: $q, page: 1, per_page: 1}) {
+          queryScenes(input: {title: $q, page: 1, per_page: 1, sort: "date", direction: "desc"}) {
             scenes {
               performers { performer { name } }
             }
