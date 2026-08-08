@@ -10,6 +10,7 @@ import requests
 import concurrent.futures
 import vk_api
 from collections import deque
+from requests_toolbelt.multipart.encoder import MultipartEncoder
 from pyrogram import Client, filters, enums
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
@@ -980,13 +981,12 @@ async def add_monitored_target(target_raw):
     except Exception as e: return False, str(e)
 
 # ============================================================
-# ZERO-HOP IN-MEMORY STREAMING ENGINE (THREAD-SAFE FIXED)
+# ZERO-HOP IN-MEMORY STREAMING ENGINE (TOOLBELT ENCODING)
 # ============================================================
 class PyrogramStreamReader(io.RawIOBase):
     """
     A synchronous file-like bridge that pulls data from an async Pyrogram stream.
-    This provides a strict __len__ method so VK gets a proper Content-Length header,
-    avoiding the HTTP 500 chunked-encoding crash.
+    Used by requests_toolbelt.MultipartEncoder to generate a strict Content-Length.
     """
     def __init__(self, client, message, loop, progress_callback, job_id):
         self.client = client
@@ -997,9 +997,9 @@ class PyrogramStreamReader(io.RawIOBase):
         
         media = message.video or message.document
         self.total_size = media.file_size
+        self.len = self.total_size # Required by requests_toolbelt
         self.read_bytes = 0
         
-        # Explicitly wrap the Pyrogram stream in a native async generator
         self.async_gen = self._get_stream_generator()
         self.buffer = bytearray()
 
@@ -1020,7 +1020,6 @@ class PyrogramStreamReader(io.RawIOBase):
 
         while len(self.buffer) < size and (self.read_bytes + len(self.buffer)) < self.total_size:
             try:
-                # Call __anext__() safely on our native async generator wrapper
                 future = asyncio.run_coroutine_threadsafe(self.async_gen.__anext__(), self.loop)
                 chunk = future.result(timeout=60)
                 self.buffer.extend(chunk)
@@ -1044,13 +1043,23 @@ class PyrogramStreamReader(io.RawIOBase):
 
 
 async def stream_telegram_to_vk(client, message, upload_url, progress_callback, job_id):
-    """Pipes bytes directly from Telegram to VK using a thread-safe strict-length bridge."""
+    """Pipes bytes directly from Telegram to VK forcing a strict Content-Length via MultipartEncoder."""
     loop = asyncio.get_running_loop()
     
     def _sync_upload():
         reader = PyrogramStreamReader(client, message, loop, progress_callback, job_id)
-        files = {'video_file': ('video.mp4', reader, 'video/mp4')}
-        resp = requests.post(upload_url, files=files, timeout=None)
+        
+        # requests-toolbelt safely builds a streamed multipart/form-data payload with a fixed Content-Length
+        m = MultipartEncoder(
+            fields={'video_file': ('video.mp4', reader, 'video/mp4')}
+        )
+        
+        resp = requests.post(
+            upload_url, 
+            data=m, 
+            headers={'Content-Type': m.content_type}, 
+            timeout=None
+        )
         
         if resp.status_code != 200:
             raise Exception(f"VK upload failed with status {resp.status_code}: {resp.text[:300]}")
@@ -1234,7 +1243,7 @@ async def stream_worker(worker_id):
 
                 if not upload_info: raise Exception("VKVideoSaveFailed")
 
-                # ZERO HOP STREAM! (Thread-safe synchronous bridge)
+                # ZERO HOP STREAM! (Thread-safe synchronous toolbelt bridge)
                 await stream_telegram_to_vk(user_app, msg, upload_info['upload_url'], stream_progress, job_id)
 
                 video_id = upload_info.get('video_id')
