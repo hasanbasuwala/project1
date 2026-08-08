@@ -7,7 +7,7 @@ import sqlite3
 import asyncio
 import logging
 import requests
-import aiohttp
+import concurrent.futures
 import vk_api
 from collections import deque
 from pyrogram import Client, filters, enums
@@ -980,44 +980,84 @@ async def add_monitored_target(target_raw):
     except Exception as e: return False, str(e)
 
 # ============================================================
-# ZERO-HOP IN-MEMORY STREAMING ENGINE
+# ZERO-HOP IN-MEMORY STREAMING ENGINE (THREAD-SAFE FIXED)
 # ============================================================
-async def stream_telegram_to_vk(client, message, upload_url, progress_callback, job_id):
-    """Pipes bytes directly from Telegram's MTProto stream to VK's HTTP Upload Server. Zero disk usage."""
-    media = message.video or message.document
-    if not media:
-        raise Exception("No valid media found in message.")
+class PyrogramStreamReader(io.RawIOBase):
+    """
+    A synchronous file-like bridge that pulls data from an async Pyrogram stream.
+    This provides a strict __len__ method so VK gets a proper Content-Length header,
+    avoiding the HTTP 500 chunked-encoding crash.
+    """
+    def __init__(self, client, message, loop, progress_callback, job_id):
+        self.client = client
+        self.message = message
+        self.loop = loop
+        self.progress_callback = progress_callback
+        self.job_id = job_id
         
-    total_size = media.file_size
-    downloaded = [0] 
+        media = message.video or message.document
+        self.total_size = media.file_size
+        self.read_bytes = 0
+        
+        # Explicitly wrap the Pyrogram stream in a native async generator
+        self.async_gen = self._get_stream_generator()
+        self.buffer = bytearray()
 
-    async def telegram_chunk_generator():
-        async for chunk in client.stream_media(message):
-            if job_id in cancelled_jobs:
-                raise Exception("ForceAbort")
-            
-            downloaded[0] += len(chunk)
-            if time.time() < reduced_parallelism_until:
-                await asyncio.sleep(0.3)
-                
-            if progress_callback:
-                progress_callback(downloaded[0], total_size)
-                
+    async def _get_stream_generator(self):
+        """Forces the Pyrogram stream into a guaranteed async generator."""
+        async for chunk in self.client.stream_media(self.message):
             yield chunk
 
-    async with aiohttp.ClientSession() as session:
-        data = aiohttp.FormData()
-        data.add_field('video_file',
-                       telegram_chunk_generator(),
-                       filename='video.mp4',
-                       content_type='video/mp4')
+    def read(self, size=-1):
+        if self.job_id in cancelled_jobs:
+            raise Exception("ForceAbort")
+
+        if self.read_bytes >= self.total_size:
+            return b""
+
+        if size == -1: 
+            size = 1024 * 1024 * 2 # 2MB buffer standard
+
+        while len(self.buffer) < size and (self.read_bytes + len(self.buffer)) < self.total_size:
+            try:
+                # Call __anext__() safely on our native async generator wrapper
+                future = asyncio.run_coroutine_threadsafe(self.async_gen.__anext__(), self.loop)
+                chunk = future.result(timeout=60)
+                self.buffer.extend(chunk)
+            except StopAsyncIteration:
+                break
+            except Exception as e:
+                raise e
+
+        chunk_to_return = self.buffer[:size]
+        self.buffer = self.buffer[size:]
         
-        async with session.post(upload_url, data=data) as resp:
-            if resp.status != 200:
-                error_text = await resp.text()
-                raise Exception(f"VK upload failed with status {resp.status}: {error_text[:300]}")
+        self.read_bytes += len(chunk_to_return)
+        
+        if self.progress_callback:
+            self.progress_callback(self.read_bytes, self.total_size)
             
-            return await resp.json()
+        return bytes(chunk_to_return)
+
+    def __len__(self):
+        return self.total_size
+
+
+async def stream_telegram_to_vk(client, message, upload_url, progress_callback, job_id):
+    """Pipes bytes directly from Telegram to VK using a thread-safe strict-length bridge."""
+    loop = asyncio.get_running_loop()
+    
+    def _sync_upload():
+        reader = PyrogramStreamReader(client, message, loop, progress_callback, job_id)
+        files = {'video_file': ('video.mp4', reader, 'video/mp4')}
+        resp = requests.post(upload_url, files=files, timeout=None)
+        
+        if resp.status_code != 200:
+            raise Exception(f"VK upload failed with status {resp.status_code}: {resp.text[:300]}")
+            
+        return resp.json()
+
+    return await asyncio.to_thread(_sync_upload)
 
 # ============================================================
 # JOB COMPLETION / PLAYLIST BOOKKEEPING
@@ -1194,7 +1234,7 @@ async def stream_worker(worker_id):
 
                 if not upload_info: raise Exception("VKVideoSaveFailed")
 
-                # ZERO HOP STREAM!
+                # ZERO HOP STREAM! (Thread-safe synchronous bridge)
                 await stream_telegram_to_vk(user_app, msg, upload_info['upload_url'], stream_progress, job_id)
 
                 video_id = upload_info.get('video_id')
