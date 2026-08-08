@@ -1041,6 +1041,22 @@ class PyrogramStreamReader(io.RawIOBase):
     def __len__(self):
         return self.total_size
 
+    # --- THE FIX: DUMMY SEEK METHODS ---
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self.read_bytes
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        # requests-toolbelt asks to rewind to 0 before the upload starts.
+        # If we are already at byte 0, we can safely pretend we rewound it.
+        if offset == 0 and (whence == 0 or whence == io.SEEK_SET):
+            if self.read_bytes == 0:
+                return 0
+            raise Exception("Cannot rewind a live network stream after reading has started.")
+        raise io.UnsupportedOperation(f"seek not supported (offset={offset}, whence={whence})")
+
 
 async def stream_telegram_to_vk(client, message, upload_url, progress_callback, job_id):
     """Pipes bytes directly from Telegram to VK forcing a strict Content-Length via MultipartEncoder."""
