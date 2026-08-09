@@ -1603,22 +1603,11 @@ async def _deep_validate_video_file(file_path):
     return await asyncio.to_thread(_run)
 
 async def _ensure_h264_aac(file_path):
-    def _probe_stream(stream_type):
-        try:
-            res = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0", 
-                 "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", file_path],
-                capture_output=True, text=True, timeout=10
-            )
-            return res.stdout.strip().lower()
-        except Exception:
-            return ""
-
-    v_codec = await asyncio.to_thread(_probe_stream, "v")
-    a_codec = await asyncio.to_thread(_probe_stream, "a")
-
-    if v_codec == "h264" and (a_codec == "aac" or not a_codec):
-        return file_path
+    """
+    Bypassing local FFmpeg conversion. 
+    VK natively supports MKV, WEBM, HEVC, etc., and will transcode them on their servers.
+    """
+    return file_path
 
     console.print(f"[bold yellow]⚙️ Converting {os.path.basename(file_path)} (Video: {v_codec or 'none'}, Audio: {a_codec or 'none'}) to H.264/AAC...[/bold yellow]")
     
