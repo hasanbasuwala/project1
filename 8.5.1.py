@@ -529,7 +529,7 @@ class DownloaderEngine:
         import shutil
         import os
         
-        path_to_extension = "/root/stealth_bot_v13/uBOL-home-main/chromium"
+path_to_extension = "/home/ubuntu/bot/uBOL-home-main/chromium"
         user_data_dir = f"/tmp/pw_data_{jid}" 
         
         extracted_payload = {"url": None, "headers": {}, "cookie_str": "", "raw_cookies": []}
@@ -546,8 +546,9 @@ class DownloaderEngine:
             context = await p.chromium.launch_persistent_context(
                 user_data_dir,
                 headless=True,
+                channel="chrome",               # <--- 1. ADD THIS LINE
                 proxy=proxy_config,
-                executable_path="/usr/bin/chromium",
+                # executable_path="/usr/bin/chromium", # <--- 2. DELETE OR COMMENT OUT THIS LINE
                 user_agent=USER_AGENT,
                 viewport={"width": 1920, "height": 1080},
                 locale="en-US",
