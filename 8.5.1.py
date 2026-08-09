@@ -529,7 +529,7 @@ class DownloaderEngine:
         import shutil
         import os
         
-path_to_extension = "/home/ubuntu/bot/uBOL-home-main/chromium"
+        path_to_extension = "/home/ubuntu/bot/uBOL-home-main/chromium"
         user_data_dir = f"/tmp/pw_data_{jid}" 
         
         extracted_payload = {"url": None, "headers": {}, "cookie_str": "", "raw_cookies": []}
