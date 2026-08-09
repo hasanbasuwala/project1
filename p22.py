@@ -1590,9 +1590,10 @@ async def _validate_video_file(file_path):
 async def _deep_validate_video_file(file_path):
     def _run():
         try:
+            # -c copy tells FFmpeg to just copy the streams without decoding them
             result = subprocess.run(
-                ["ffmpeg", "-v", "error", "-i", file_path, "-map", "0", "-f", "null", "-"],
-                capture_output=True, text=True, timeout=300
+                ["ffmpeg", "-v", "error", "-i", file_path, "-c", "copy", "-f", "null", "-"],
+                capture_output=True, text=True, timeout=60
             )
             return result.returncode == 0 and not result.stderr.strip()
         except subprocess.TimeoutExpired:
