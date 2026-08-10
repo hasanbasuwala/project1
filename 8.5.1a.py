@@ -407,7 +407,16 @@ class DownloaderEngine:
 
         # --- PHASE 3: DOWNSTREAM ENGINES ---
         if ".m3u8" in extracted_url:
-            self.db.log_trace(jid, "PASS 8: Attempting FFmpeg direct capture over local Wi-Fi...")
+            
+            # --- NEW PASS 7.8: N_m3u8DL-RE ---
+            self.db.log_trace(jid, "PASS 7.8: Attempting N_m3u8DL-RE stream capture...")
+            if await self._run_nm3u8dlre_capture(extracted_url, jid, dl_dir, headers, cookie_str):
+                self.db.log_trace(jid, "PASS 7.8 SUCCESS: Payload captured via N_m3u8DL-RE.")
+                return
+            self.db.log_trace(jid, "PASS 7.8 FAILED: N_m3u8DL-RE stream capture dropped.")
+
+            # --- ORIGINAL PASS 8: FFmpeg Fallback ---
+            self.db.log_trace(jid, "PASS 8: Attempting FFmpeg direct capture fallback...")
             if await self._run_ffmpeg_capture(extracted_url, jid, dl_dir, headers, cookie_str):
                 return
             self.db.log_trace(jid, "PASS 8 FAILED: FFmpeg stream capture dropped.")
