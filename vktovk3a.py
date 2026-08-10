@@ -1147,12 +1147,20 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
     @app.on_message(filters.command(["scan"]) & filters.user(OWNER_ID))
     async def cmd_scan(_, msg: Message):
         args = msg.text.split(maxsplit=1)
-        if len(args) < 2: return await msg.reply("❌ Usage: `/scan https://vk.com/community_link`")
+        if len(args) < 2: 
+            return await msg.reply("❌ Usage: `/scan https://vk.com/community_link`")
+            
+        # --- THE FIX: Let hashtag scans pass through to the next handler ---
+        if args[1].strip().startswith("#"):
+            return msg.continue_propagation()
+        # -------------------------------------------------------------------
+            
         url = args[1].strip()
         m = await msg.reply("🔍 `Scanning community (this may take a moment for large groups)...`")
 
         def perform_scan():
             vk = get_vk_api()
+            # ... rest of your code remains exactly the same ...
             comm_id = resolve_vk_community_id(vk, url)
             videos, wall = [], []
             
