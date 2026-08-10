@@ -3296,17 +3296,28 @@ async def main():
 
     dashboard_chat_id = await get_control("dashboard_chat_id")
     if dashboard_chat_id:
+        dashboard_msg_id = await get_control("dashboard_msg_id")
         try:
-            dash_msg = await bot_app.send_message(
-                chat_id=int(dashboard_chat_id),
-                text="⚙️ **System Online / Reboot Detected**\nBooting Master Dashboard...",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            try: await dash_msg.pin(both_sides=True)
-            except: pass
-            await set_control("dashboard_msg_id", dash_msg.id)
+            if dashboard_msg_id:
+                # Attempt to edit the existing dashboard first (lower rate limits)
+                await bot_app.edit_message_text(
+                    chat_id=int(dashboard_chat_id),
+                    message_id=int(dashboard_msg_id),
+                    text="⚙️ **System Online / Reboot Detected**\nBooting Master Dashboard...",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                # Only send a new one if we don't have a tracked message ID
+                dash_msg = await bot_app.send_message(
+                    chat_id=int(dashboard_chat_id),
+                    text="⚙️ **System Online / Reboot Detected**\nBooting Master Dashboard...",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                try: await dash_msg.pin(both_sides=True)
+                except: pass
+                await set_control("dashboard_msg_id", dash_msg.id)
         except Exception as e:
-            console.print(f"[bold red]Failed to auto-pin fresh dashboard on startup: {e}[/bold red]")
+            console.print(f"[bold red]Failed to update dashboard on startup: {e}[/bold red]")
 
     always_groups = await db_execute("SELECT chat_id, chat_title, status, last_msg_id FROM always_monitors", fetch="all")
     if always_groups:
