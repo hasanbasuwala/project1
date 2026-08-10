@@ -377,6 +377,10 @@ class DownloaderEngine:
             
             self._save_cached_payload(dl_dir, playwright_data)
             self.db.log_trace(jid, "Playwright extraction successful and payload state cached.")
+
+            if playwright_data.get("browser_downloaded"):
+                self.db.log_trace(jid, "Media already downloaded via in-browser native fetch (PASS 7.5). Skipping downstream engines.")
+                return
         else:
             self.db.log_trace(jid, "Loaded cached Playwright payload. Bypassing browser extraction phases.")
 
@@ -456,7 +460,7 @@ class DownloaderEngine:
         path_to_extension = "/home/ubuntu/bot/uBOL-home-main/chromium"
         user_data_dir = f"/tmp/pw_data_{jid}" 
         
-        extracted_payload = {"url": None, "headers": {}, "cookie_str": "", "raw_cookies": []}
+        extracted_payload = {"url": None, "headers": {}, "cookie_str": "", "raw_cookies": [], "browser_downloaded": False}
         found_urls = []
         capture_headers = {}
 
@@ -727,6 +731,22 @@ class DownloaderEngine:
             extracted_payload["raw_cookies"] = cookies
             extracted_payload["cookie_str"] = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
 
+            # --- PASS 7.5: ATTEMPT IN-BROWSER NATIVE DOWNLOAD BEFORE CONTEXT TEARDOWN ---
+            # If the CDN is gating on a real browser's TLS/HTTP2 fingerprint and live
+            # cookies (rather than an IP block), fetching through the browser's own
+            # request context succeeds where curl_cffi/yt-dlp/aria2c get 403'd.
+            if extracted_payload.get("url"):
+                try:
+                    downloaded = await self._try_browser_native_download(
+                        context, jid, dl_dir, extracted_payload["url"],
+                        extracted_payload["headers"], extracted_payload["cookie_str"]
+                    )
+                    extracted_payload["browser_downloaded"] = downloaded
+                except Exception as e:
+                    self.db.log_trace(jid, f"PASS 7.5 FAILED: Unexpected error during in-browser download attempt: {e}")
+                    extracted_payload["browser_downloaded"] = False
+            # ------------------------------------------------------------------------------
+
             await context.close()
             try:
                 if os.path.exists(user_data_dir):
@@ -735,6 +755,150 @@ class DownloaderEngine:
                 self.db.log_trace(jid, f"Disk cleanup warning: {e}")
 
             return extracted_payload
+
+    async def _try_browser_native_download(self, context, jid: str, dl_dir: Path, media_url: str, headers: dict, cookie_str: str) -> bool:
+        """
+        Attempts to download the media payload using the live browser's own
+        network stack (Playwright's APIRequestContext), which carries the real
+        TLS/HTTP2 fingerprint and live session cookies. This bypasses CDN gates
+        that reject curl_cffi/yt-dlp/aria2c even when headers and cookies are
+        replicated manually, because those tools can't fully replicate a real
+        browser's handshake.
+        """
+        out_file = dl_dir / f"{jid}.mp4"
+        req_headers = {k: v for k, v in headers.items() if k.lower() not in ("host", "content-length")}
+
+        try:
+            self.db.log_trace(jid, "PASS 7.5: Attempting in-browser native fetch via Playwright request context...")
+            resp = await context.request.get(media_url, headers=req_headers, timeout=30000)
+
+            if not resp.ok:
+                self.db.log_trace(jid, f"PASS 7.5 FAILED: In-browser fetch returned HTTP {resp.status}")
+                return False
+
+            body = await resp.body()
+            content_type = (resp.headers.get("content-type") or "").lower()
+
+            is_m3u8 = ".m3u8" in media_url.lower() or "mpegurl" in content_type or body[:7] == b"#EXTM3U"
+
+            if is_m3u8:
+                manifest_text = body.decode("utf-8", errors="ignore")
+                return await self._download_hls_via_browser(context, jid, dl_dir, media_url, manifest_text, req_headers, out_file)
+
+            if len(body) < 100000:
+                self.db.log_trace(jid, f"PASS 7.5 FAILED: In-browser fetch returned suspiciously small payload ({len(body)} bytes).")
+                return False
+
+            with open(out_file, "wb") as f:
+                f.write(body)
+            self.db.log_trace(jid, f"PASS 7.5 SUCCESS: Direct media payload saved via browser fetch ({len(body)} bytes).")
+            return True
+
+        except Exception as e:
+            self.db.log_trace(jid, f"PASS 7.5 FAILED: In-browser fetch error: {e}")
+            return False
+
+    async def _download_hls_via_browser(self, context, jid: str, dl_dir: Path, manifest_url: str, manifest_text: str, headers: dict, out_file: Path) -> bool:
+        """
+        Parses an HLS manifest fetched via the browser context. Recurses into the
+        highest-bitrate variant if given a master playlist, then downloads every
+        segment through the same browser request context and remuxes with ffmpeg.
+        """
+        import urllib.parse as urlparse
+
+        lines = manifest_text.splitlines()
+
+        # Master playlist: pick the highest-bandwidth variant and recurse.
+        if any(l.startswith("#EXT-X-STREAM-INF") for l in lines):
+            best_bw = -1
+            variant_uri = None
+            for i, line in enumerate(lines):
+                if line.startswith("#EXT-X-STREAM-INF"):
+                    bw_match = re.search(r"BANDWIDTH=(\d+)", line)
+                    bw = int(bw_match.group(1)) if bw_match else 0
+                    if i + 1 < len(lines) and not lines[i + 1].startswith("#"):
+                        if bw >= best_bw:
+                            best_bw = bw
+                            variant_uri = lines[i + 1].strip()
+
+            if not variant_uri:
+                self.db.log_trace(jid, "PASS 7.5 FAILED: Master playlist had no usable variant streams.")
+                return False
+
+            variant_url = urlparse.urljoin(manifest_url, variant_uri)
+            self.db.log_trace(jid, f"PASS 7.5: Master playlist detected. Fetching highest-bitrate variant ({best_bw} bps)...")
+            try:
+                resp = await context.request.get(variant_url, headers=headers, timeout=30000)
+                if not resp.ok:
+                    self.db.log_trace(jid, f"PASS 7.5 FAILED: Variant playlist fetch returned HTTP {resp.status}")
+                    return False
+                variant_text = (await resp.body()).decode("utf-8", errors="ignore")
+            except Exception as e:
+                self.db.log_trace(jid, f"PASS 7.5 FAILED: Variant playlist fetch error: {e}")
+                return False
+
+            return await self._download_hls_via_browser(context, jid, dl_dir, variant_url, variant_text, headers, out_file)
+
+        # Media playlist: collect segment URIs in order.
+        segment_uris = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
+        if not segment_uris:
+            self.db.log_trace(jid, "PASS 7.5 FAILED: Media playlist contained no segments.")
+            return False
+
+        seg_dir = dl_dir / f"{jid}_segments"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        concat_list_path = seg_dir / "concat.txt"
+        seg_paths = []
+
+        self.db.log_trace(jid, f"PASS 7.5: Downloading {len(segment_uris)} HLS segments via browser fetch...")
+
+        for idx, seg_uri in enumerate(segment_uris):
+            seg_url = urlparse.urljoin(manifest_url, seg_uri)
+            seg_path = seg_dir / f"seg_{idx:05d}.ts"
+            try:
+                resp = await context.request.get(seg_url, headers=headers, timeout=30000)
+                if not resp.ok:
+                    self.db.log_trace(jid, f"PASS 7.5 FAILED: Segment {idx} fetch returned HTTP {resp.status}")
+                    shutil.rmtree(seg_dir, ignore_errors=True)
+                    return False
+                seg_bytes = await resp.body()
+                with open(seg_path, "wb") as f:
+                    f.write(seg_bytes)
+                seg_paths.append(seg_path)
+            except Exception as e:
+                self.db.log_trace(jid, f"PASS 7.5 FAILED: Segment {idx} fetch error: {e}")
+                shutil.rmtree(seg_dir, ignore_errors=True)
+                return False
+
+            if idx % 25 == 0 or idx == len(segment_uris) - 1:
+                pct = ((idx + 1) / len(segment_uris)) * 100
+                await self.db.update_job(jid, pct=pct, stage=f"downloading | browser-hls | seg {idx + 1}/{len(segment_uris)}")
+                global _live_ui_text
+                _live_ui_text[jid] = f"[browser-hls] segment {idx + 1}/{len(segment_uris)} ({pct:.1f}%)"
+
+        with open(concat_list_path, "w", encoding="utf-8") as f:
+            for p in seg_paths:
+                f.write(f"file '{p.name}'\n")
+
+        self.db.log_trace(jid, "PASS 7.5: All segments downloaded. Remuxing via ffmpeg concat...")
+
+        cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(concat_list_path),
+            "-c", "copy", "-bsf:a", "aac_adtstoasc",
+            str(out_file)
+        ]
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        _, stderr = await proc.communicate()
+
+        shutil.rmtree(seg_dir, ignore_errors=True)
+
+        if proc.returncode == 0 and out_file.exists() and out_file.stat().st_size > 1024:
+            self.db.log_trace(jid, f"PASS 7.5 SUCCESS: HLS stream remuxed to {out_file.name} ({out_file.stat().st_size} bytes).")
+            return True
+        else:
+            self.db.log_trace(jid, f"PASS 7.5 FAILED: ffmpeg remux failed. {stderr.decode(errors='ignore')[:300]}")
+            return False
 
     async def _run_ffmpeg_capture(self, url: str, jid: str, dl_dir: Path, headers: dict, cookie_str: str) -> bool:
         import re
