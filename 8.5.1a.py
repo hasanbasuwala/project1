@@ -899,6 +899,69 @@ class DownloaderEngine:
         else:
             self.db.log_trace(jid, f"PASS 7.5 FAILED: ffmpeg remux failed. {stderr.decode(errors='ignore')[:300]}")
             return False
+            
+    async def _run_nm3u8dlre_capture(self, url: str, jid: str, dl_dir: Path, headers: dict, cookie_str: str) -> bool:
+        out_file = dl_dir / f"{jid}.mp4"
+        
+        cmd = [
+            "N_m3u8DL-RE", url,
+            "--save-dir", str(dl_dir),
+            "--save-name", jid,
+            "--thread-count", "16",
+            "--auto-subtitle-fix", "True",
+            "--log-level", "INFO"
+        ]
+        
+        # Inject the spoofed Playwright headers
+        if headers:
+            for k, v in headers.items():
+                cmd.extend(["-H", f"{k}: {v}"])
+                
+        # Inject the live session cookies
+        if cookie_str:
+            cmd.extend(["-H", f"Cookie: {cookie_str}"])
+
+        self.db.log_trace(jid, f"N_m3u8DL-RE command initialized with {len(headers)} headers.")
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+
+        try:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                
+                line_str = line.decode('utf-8', errors='ignore').strip()
+                clean_str = re.sub(r"\x1b[^m]*m", "", line_str) # Strip ANSI colors
+                
+                # Basic UI Progress Hook for N_m3u8DL-RE
+                if "%" in clean_str or "Mbps" in clean_str:
+                    global _live_ui_text
+                    _live_ui_text[jid] = f"[N_m3u8DL-RE] {clean_str[:50]}"
+                    
+                    # Attempt to extract percentage for the dashboard bar
+                    m_pct = re.search(r"(\d{1,3}\.\d{1,2})%", clean_str)
+                    if m_pct:
+                        try:
+                            val = float(m_pct.group(1))
+                            await self.db.update_job(jid, pct=val, stage="downloading | RE-Engine")
+                        except Exception: pass
+                        
+        except Exception as e:
+            self.db.log_trace(jid, f"N_m3u8DL-RE Output Reader Error: {e}")
+
+        await proc.wait()
+        
+        # N_m3u8DL-RE might save as .mp4, .ts, or .mkv depending on the stream.
+        # Check if it successfully dropped a media payload into the directory.
+        valid_files = [f for f in dl_dir.rglob(f"{jid}.*") if f.is_file() and f.suffix.lower() in [".mp4", ".ts", ".mkv"]]
+        
+        if proc.returncode == 0 and valid_files:
+            return True
+            
+        return False
 
     async def _run_ffmpeg_capture(self, url: str, jid: str, dl_dir: Path, headers: dict, cookie_str: str) -> bool:
         import re
