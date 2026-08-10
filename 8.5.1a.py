@@ -1,5 +1,5 @@
 """
-bot.py - v8.5.1 (Proxy-Free Edition)
+bot.py - v8.5.1
 ───────────────────────────────────────────────────────────────
 ARCHITECTURE:
   • Single-file Micro-Orchestration (Classes).
@@ -78,7 +78,7 @@ if os.path.exists("extracted_cookies.txt"):
 
 VK_USERNAME = getattr(config, "VK_USERNAME", None)
 VK_PASSWORD = getattr(config, "VK_PASSWORD", None)
-VK_TOKEN = getattr(config, "VK_TOKEN", None)
+VK_TOKEN = getattr(config, "VK_TOKEN", None)  # <--- ADD THIS LINE
 # --------------------------------------
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -131,15 +131,18 @@ class JobScheduler:
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
+            # 1. Create the table if it's a completely fresh install
             conn.execute('''CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY, url TEXT, title TEXT, source TEXT, quality TEXT, strategy TEXT,
                 stage TEXT, pct REAL, last_ui_pct REAL, retries INTEGER, chat_id INTEGER, tracker_id INTEGER,
                 recovered_at_stage TEXT DEFAULT NULL
             )''')
             
+            # 2. Patch existing databases that are missing the new column
             try:
                 conn.execute('ALTER TABLE jobs ADD COLUMN recovered_at_stage TEXT DEFAULT NULL')
             except sqlite3.OperationalError:
+                # If the column already exists, SQLite throws an error. We just ignore it.
                 pass
 
     async def create_job(self, data: dict):
@@ -276,7 +279,7 @@ class DownloaderEngine:
         req_headers = headers.copy() if headers else {}
         if cookie_str:
             req_headers['Cookie'] = cookie_str
-            
+        
         try:
             async with AsyncSession(impersonate="chrome") as session:
                 response = await session.get(url, headers=req_headers, allow_redirects=True, stream=True)
@@ -335,12 +338,14 @@ class DownloaderEngine:
             extracted_player = await asyncio.to_thread(self._extract_vk_api, url, jid)
             if extracted_player:
                 self.db.log_trace(jid, f"VK API Token bypass successful! Rerouting payload URL to: {extracted_player}")
-                url = extracted_player  
+                url = extracted_player  # Overwrite original wall post URL with extracted video_ext link
         # -------------------------------------------------
 
         dl_dir = JOBS_DIR / f"JOB_{jid}" / "dl"
         
         self.db.log_trace(jid, f"Download Orchestrator engaged. Strategy: {strategy}")
+        
+        # ... rest of execute() remains unchanged ...
 
         if strategy == "TELEGRAM":
             async def tg_prog(c, t):
@@ -360,12 +365,12 @@ class DownloaderEngine:
             if variant_success:
                 return
 
-            self.db.log_trace(jid, "yt-dlp variants failed. Escalating to direct Playwright extraction...")
-            
+            self.db.log_trace(jid, "yt-dlp variants failed. Escalating to Playwright extraction...")
+
             try:
                 playwright_data = await self._run_playwright_extraction(url, jid, dl_dir)
             except Exception as e:
-                raise RuntimeError(f"PASS 11 FAILED: Direct local extraction failed: {e}")
+                raise RuntimeError(f"PASS 11 FAILED: Extraction failed: {e}")
 
             if not playwright_data or not playwright_data.get('url'):
                 raise RuntimeError("PASS 11 FAILED: All extraction methods exhausted. Target is highly protected.")
@@ -398,7 +403,7 @@ class DownloaderEngine:
 
         # --- PHASE 3: DOWNSTREAM ENGINES ---
         if ".m3u8" in extracted_url:
-            self.db.log_trace(jid, "PASS 8: Attempting FFmpeg direct capture...")
+            self.db.log_trace(jid, "PASS 8: Attempting FFmpeg direct capture over local Wi-Fi...")
             if await self._run_ffmpeg_capture(extracted_url, jid, dl_dir, headers, cookie_str):
                 return
             self.db.log_trace(jid, "PASS 8 FAILED: FFmpeg stream capture dropped.")
@@ -455,6 +460,7 @@ class DownloaderEngine:
         found_urls = []
         capture_headers = {}
 
+        # Check if saved auth state exists
         auth_state_path = Path("vk_state.json")
         storage_state = str(auth_state_path) if auth_state_path.exists() else None
         
@@ -462,7 +468,8 @@ class DownloaderEngine:
             context = await p.chromium.launch_persistent_context(
                 user_data_dir,
                 headless=True,
-                channel="chrome",
+                channel="chrome",               # <--- 1. ADD THIS LINE
+                # executable_path="/usr/bin/chromium", # <--- 2. DELETE OR COMMENT OUT THIS LINE
                 user_agent=USER_AGENT,
                 viewport={"width": 1920, "height": 1080},
                 locale="en-US",
@@ -542,17 +549,19 @@ class DownloaderEngine:
             try:
                 self.db.log_trace(jid, "Navigating to main target URL...")
                 await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(8000) 
+                await page.wait_for_timeout(8000) # Hard wait for SPA skeleton to render
                 
                 # --- ADDED: VK PLAYWRIGHT AUTHENTICATION ---
                 if "vk.com" in url or "vkvideo.ru" in url:
                     try:
+                        # 1. Check if we hit a guest error wall and need to click the UI "Sign in" button first
                         sign_in_btn = page.locator("text='Sign in', text='Войти'")
                         if await sign_in_btn.count() > 0 and await sign_in_btn.first.is_visible():
                             self.db.log_trace(jid, "Guest wall detected. Clicking Sign In to spawn auth form...")
                             await sign_in_btn.first.click()
                             await page.wait_for_timeout(3500)
 
+                        # 2. Look for the actual login input field
                         login_input = page.locator("input[name='login']")
                         if await login_input.count() > 0 and await login_input.first.is_visible():
                             self.db.log_trace(jid, "VK Auth Form detected. Injecting Playwright credentials...")
@@ -562,6 +571,7 @@ class DownloaderEngine:
                                 await page.keyboard.press("Enter")
                                 await page.wait_for_timeout(3500)
 
+                            # 3. Fill Password (VK loads this dynamically after the email)
                             pass_input = page.locator("input[name='password']")
                             if await pass_input.count() > 0 and await pass_input.first.is_visible() and VK_PASSWORD:
                                 await pass_input.first.fill(VK_PASSWORD)
@@ -570,7 +580,7 @@ class DownloaderEngine:
 
                             self.db.log_trace(jid, "Playwright auth sequence executed. Reloading target wall...")
                             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                            await page.wait_for_timeout(8000)
+                            await page.wait_for_timeout(8000) # Hard wait after auth reload
                     except Exception as e:
                         self.db.log_trace(jid, f"VK Auth automation bypassed or failed: {e}")
                 # -------------------------------------------
@@ -869,8 +879,10 @@ class DownloaderEngine:
         }
 
         # --- ADDED: DYNAMIC CDN SIGNATURE SPOOFING (COOKIELESS BYPASS) ---
+        # Default to a highly standard Windows Chrome User-Agent
         custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         
+        # Check the URL for VK's strict engine bindings
         if "srcAg=GECKO" in url:
             custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0"
             if hasattr(self, 'db'):
@@ -883,10 +895,12 @@ class DownloaderEngine:
             if hasattr(self, 'db'):
                 self.db.log_trace(jid, "Ghost Protocol: Chromium CDN signature detected. Using standard Chrome User-Agent.")
 
+        # Inject the spoofed User-Agent directly into yt-dlp's network options
         if "http_headers" not in opts:
             opts["http_headers"] = {}
         opts["http_headers"]["User-Agent"] = custom_ua
         
+        # Disable yt-dlp's default impersonation in Pass 3/4 if we are strictly spoofing a raw link
         if "impersonate" in opts and ("srcAg=" in url):
             del opts["impersonate"]
             if hasattr(self, 'db'):
@@ -902,6 +916,7 @@ class DownloaderEngine:
                     for item in VK_COOKIES.strip().split(';'):
                         if '=' in item:
                             k, v = item.strip().split('=', 1)
+                            # Write cookies for both domains so yt-dlp's extractor is fully authenticated
                             f.write(f".vk.com\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n")
                             f.write(f".vkvideo.ru\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n")
                 opts["cookiefile"] = str(cookie_path)
@@ -911,9 +926,13 @@ class DownloaderEngine:
 
         if custom_opts: opts.update(custom_opts)
             
+        # --- START DOWNLOAD EXECUTION WITH ARIA2C FALLBACK LOGIC ---
         base_opts = opts.copy()
 
+        # Phase 1: Inject Aria2c configuration for maximum speed
         opts["external_downloader"] = "aria2c"
+        
+        # FIX: Allow yt-dlp to read Aria2c's progress stream so the UI updates
         opts["noprogress"] = False  
         opts["quiet"] = False       
         
@@ -924,8 +943,8 @@ class DownloaderEngine:
                 "-x", "10",      
                 "-s", "10",      
                 "-k", "5M",      
-                "--summary-interval=1",       
-                "--console-log-level=notice"  
+                "--summary-interval=1",       # FIX: Force Aria2c to report speed every second
+                "--console-log-level=notice"  # FIX: Ensure Aria2c prints the progress bar
             ]
         }
 
@@ -933,6 +952,7 @@ class DownloaderEngine:
             self.db.log_trace(jid, "Executing yt-dlp via Aria2c multi-connection mode...")
 
         try:
+            # Attempt the accelerated download
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.extract_info(url, download=True)
                 
@@ -940,8 +960,11 @@ class DownloaderEngine:
             if hasattr(self, 'db'):
                 self.db.log_trace(jid, f"Aria2c download failed/rejected: {str(e)[:100]}. Falling back to boosted native yt-dlp...")
             
+            # Phase 2: Setup Boosted Native yt-dlp fallback
+            # This copies base_opts, which restores "quiet": True for the native downloader
             fallback_opts = base_opts.copy()
             
+            # Inject speed-boosting settings for native HTTP downloader
             fallback_opts["concurrent_fragment_downloads"] = 10  
             fallback_opts["http_chunk_size"] = 10485760          
             fallback_opts["buffersize"] = 32768                  
@@ -950,8 +973,10 @@ class DownloaderEngine:
             if hasattr(self, 'db'):
                 self.db.log_trace(jid, "Executing fallback via Native yt-dlp (Boosted HTTP Settings)...")
             
+            # Execute the fallback
             with yt_dlp.YoutubeDL(fallback_opts) as ydl_fallback:
                 ydl_fallback.extract_info(url, download=True)
+        # --- END DOWNLOAD EXECUTION ---
 
     async def _run_aria(self, url: str, jid: str, dl_dir: Path, headers: dict = None):
         out_name = f"{jid}.mp4"
@@ -997,6 +1022,10 @@ class EncoderEngine:
         self.db = scheduler
 
     async def validate_media_file(self, file_path: Path, jid: str) -> bool:
+        """
+        Validates the downloaded file before handing it to FFmpeg.
+        Implements checks for size, HTML magic bytes, and ffprobe stream verification.
+        """
         import json
         
         if not file_path.exists():
@@ -1008,6 +1037,7 @@ class EncoderEngine:
         size_mb = size_bytes / (1024 * 1024)
         self.db.log_trace(jid, f"Validation: File size is {size_mb:.2f} MB")
         
+        # If it is less than 100KB, it is likely an error page or tiny broken payload
         if size_bytes < 100000:  
             self.db.log_trace(jid, "Validation failed: File is suspiciously small. Likely an HTML error page.")
             return False
@@ -1015,6 +1045,7 @@ class EncoderEngine:
         # ─── 2. MAGIC BYTES / HTML CHECK ───
         try:
             with open(file_path, 'rb') as f:
+                # Read the first 256 bytes to sniff the headers
                 header = f.read(256).lower()
                 if b'<!doctype html' in header or b'<html' in header:
                     self.db.log_trace(jid, "Validation failed: File contains HTML magic bytes. Download aborted.")
@@ -1042,10 +1073,12 @@ class EncoderEngine:
                 
             probe_data = json.loads(stdout.decode())
             
+            # Save the ffprobe JSON alongside the download as recommended for diagnostics
             probe_dump_path = file_path.with_suffix('.probe.json')
             with open(probe_dump_path, 'w') as f:
                 json.dump(probe_data, f, indent=4)
                 
+            # Verify the file actually contains a video stream
             streams = probe_data.get('streams', [])
             has_video = any(s.get('codec_type') == 'video' for s in streams)
             
@@ -1145,7 +1178,7 @@ class UploaderEngine:
             eta_str = f"{int(eta // 60):02d}:{int(eta % 60):02d}"
             await self.db.update_job(jid, pct=pct, stage=f"uploading | {speed_str} | {eta_str}")
 
-        # 4. Execute the Upload
+        # 4. Execute the Upload (Targeting CHANNEL_ID with full metadata)
         caption = f"**{job_data['title']}**"
         
         await self.app.send_video(
@@ -1162,7 +1195,7 @@ class UploaderEngine:
         
         self.db.log_trace(jid, "Upload sequence complete. Running final UI cleanup...")
 
-        # 5. Final UI Freeze & Cleanup
+        # 5. Final UI Freeze & Cleanup in the tracking chat
         try:
             latest_job = await self.db.get_job(jid)
             if latest_job and latest_job.get('tracker_id'):
@@ -1183,13 +1216,16 @@ class UploaderEngine:
             self.db.log_trace(jid, "Zipping lightweight diagnostic data before cleanup...")
             zip_target = str(JOBS_DIR / f"JOB_{jid}_diagnostic_success.zip")
             
+            # 1. Nuke any lingering zip file from previous runs to prevent appending
             if os.path.exists(zip_target):
                 os.remove(zip_target)
             
+            # 2. Build a fresh zip using strict file extension whitelisting
             import zipfile
             with zipfile.ZipFile(zip_target, 'w', zipfile.ZIP_DEFLATED) as zf:
                 for root, dirs, files in os.walk(job_dir):
                     for file in files:
+                        # STRICT FILTER: Ignore absolutely everything except these 5 extensions
                         if file.lower().endswith(('.log', '.html', '.json', '.png', '.txt')):
                             file_path = os.path.join(root, file)
                             arcname = os.path.relpath(file_path, job_dir)
@@ -1198,6 +1234,7 @@ class UploaderEngine:
             cap = f"🕵️ **SUCCESS DEBUG**\nPayload captured for `{jid}`.\n(Video files excluded to save space)."
             await self.app.send_document(job_data['chat_id'], document=zip_target, caption=cap)
             
+            # 3. Clean up the zip after sending
             if os.path.exists(zip_target):
                 os.remove(zip_target)
         except Exception as e:
@@ -1228,15 +1265,18 @@ class CrashCourier:
         if job_dir.exists():
             zip_target = str(JOBS_DIR / f"JOB_{jid}_diagnostic.zip")
             
+            # 1. Nuke any lingering zip file from previous crashes
             if os.path.exists(zip_target):
                 try: os.remove(zip_target)
                 except Exception: pass
             
             try:
+                # 2. Build a fresh zip using strict file extension whitelisting
                 import zipfile
                 with zipfile.ZipFile(zip_target, 'w', zipfile.ZIP_DEFLATED) as zf:
                     for root, dirs, files in os.walk(job_dir):
                         for file in files:
+                            # STRICT FILTER: Ignore absolutely everything except these 5 extensions
                             if file.lower().endswith(('.log', '.html', '.json', '.png', '.txt')):
                                 file_path = os.path.join(root, file)
                                 arcname = os.path.relpath(file_path, job_dir)
@@ -1245,11 +1285,13 @@ class CrashCourier:
                 await app.send_document(chat_id, document=zip_target, caption=cap)
                 
             except Exception as e:
+                # Fallback: Just send the raw trace.log if zipping fails entirely
                 log_path = job_dir / "trace.log"
                 if log_path.exists():
                     try: await app.send_document(chat_id, document=str(log_path), caption=f"{cap}\n*(Failed to zip dir: {e})*")
                     except Exception: pass
             finally:
+                # 3. Clean up the zip after sending
                 if os.path.exists(zip_target):
                     try: os.remove(zip_target)
                     except Exception: pass
@@ -1298,17 +1340,23 @@ class RecoveryManager:
 # ──────────────────────────── PIPELINE MANAGER (Orchestrator) ───────────
 
 class TelegramDispatcher:
+    """
+    Centralizes all Telegram API requests through a single sender queue.
+    Implements token-bucket rate limiting and merges UI updates to prevent FloodWaits.
+    """
     def __init__(self, app: Client):
         self.app = app
         self.edit_queue = asyncio.Queue()
         self.pending_edits = {}  
         self.lock = asyncio.Lock()
         
+        # Token-bucket rate limiting setup
         self.tokens = 25.0
         self.last_refill = time.time()
-        self.rate = 25.0 
+        self.rate = 25.0  # Safe global limit
 
     async def _consume_token(self):
+        """Ensures we never burst past Telegram's hard global limits."""
         now = time.time()
         elapsed = now - self.last_refill
         self.tokens = min(30.0, self.tokens + elapsed * self.rate)
@@ -1321,6 +1369,10 @@ class TelegramDispatcher:
             self.tokens -= 1.0
 
     async def safe_edit_queued(self, chat_id: int, msg_id: int, text: str, kb: InlineKeyboardMarkup):
+        """
+        Puts an edit into the queue. If an edit is already pending for this message, 
+        it overwrites the old state, merging multiple UI updates into a single refresh.
+        """
         async with self.lock:
             key = (chat_id, msg_id)
             is_new = key not in self.pending_edits
@@ -1330,6 +1382,7 @@ class TelegramDispatcher:
             await self.edit_queue.put(key)
 
     async def sender_loop(self):
+        """The dedicated background worker that safely communicates with Telegram."""
         while True:
             key = await self.edit_queue.get()
             
@@ -1345,11 +1398,13 @@ class TelegramDispatcher:
                 await self._consume_token()
                 try:
                     await self.app.edit_message_text(key[0], key[1], text, reply_markup=kb)
+                    # Add a micro-sleep to prevent hammering the exact same chat ID too fast
                     await asyncio.sleep(1.0)
                     break
                 except MessageNotModified:
                     break
                 except FloodWait as e:
+                    # Catch FloodWait exceptions, sleep for requested duration, apply exponential backoff
                     sleep_time = e.value + backoff
                     await asyncio.sleep(sleep_time)
                     backoff *= 2
@@ -1360,6 +1415,11 @@ class TelegramDispatcher:
             self.edit_queue.task_done()
             
 class UIAccumulator:
+    """
+    Monitors database state and accumulates UI updates. 
+    Strictly fires Telegram edits ONLY when a job's stage changes, 
+    progress jumps by >= 10%, or the active job pool changes.
+    """
     def __init__(self, db: JobScheduler, dispatcher: TelegramDispatcher, pipeline: PipelineManager):
         self.db = db
         self.dispatcher = dispatcher
@@ -1373,7 +1433,7 @@ class UIAccumulator:
     async def run_loop(self):
         global _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab
         while True:
-            await asyncio.sleep(4) 
+            await asyncio.sleep(4)  # Polling interval (does not cost API calls)
             
             try:
                 jobs = await self.db.get_active_jobs()
@@ -1381,6 +1441,8 @@ class UIAccumulator:
                 
                 dashboard_needs_update = False
                 
+                # ─── POOL CHANGE DETECTION ───
+                # If a job was added, completed, or failed, we MUST refresh the dashboard
                 if current_jids != self.known_jids:
                     dashboard_needs_update = True
                     self.known_jids = current_jids
@@ -1396,6 +1458,7 @@ class UIAccumulator:
                     last_pct = self.last_pcts.get(jid, -10.0)
                     current_pct = float(job.get('pct', 0.0) or 0.0)
                     
+                    # Accumulate speed/eta history for smooth UI averages
                     if jid not in self.job_stats_history:
                         self.job_stats_history[jid] = {'speeds': [], 'etas': []}
                     if "|" in raw_stage:
@@ -1404,6 +1467,7 @@ class UIAccumulator:
                             self.job_stats_history[jid]['speeds'].append(_parse_speed(parts[1]))
                             self.job_stats_history[jid]['etas'].append(_parse_eta(parts[2]))
 
+                    # ─── STRICT THRESHOLD EVALUATION ───
                     stage_changed = (base_phase != last_phase)
                     progression_jump = (current_pct - last_pct) >= 10.0
                     
@@ -1419,14 +1483,18 @@ class UIAccumulator:
                              InlineKeyboardButton("❌ KILL", callback_data=f"kill|{jid}")]
                         ])
                         
+                        # Queue the individual Job Card update
                         await self.dispatcher.safe_edit_queued(job['chat_id'], job['tracker_id'], _job_tracker_text(job, avg_s, avg_e), kb)
                         
+                        # Lock in the new state thresholds
                         self.last_stages[jid] = base_phase
                         self.last_pcts[jid] = current_pct
                         self.job_stats_history[jid] = {'speeds': [], 'etas': []}
                         
+                        # Sync to DB so restarts remember the UI state
                         await self.db.update_job(jid, last_ui_pct=current_pct)
                         
+                # ─── ACCUMULATED DASHBOARD UPDATE ───
                 if dashboard_needs_update and _dashboard_msg_id and _dashboard_chat_id:
                     text, kb = await _get_dashboard_components(_dashboard_tab, self.db, self.pipeline)
                     await self.dispatcher.safe_edit_queued(_dashboard_chat_id, _dashboard_msg_id, text, kb)
@@ -1456,9 +1524,12 @@ class PipelineManager:
                 await self.db.update_job(jid, stage=success_stage.value, retries=0, recovered_at_stage=None)
                 
                 if next_q: 
+                    # ─── BATCH GATEKEEPER ───
+                    # If this is the Encoder passing to the Uploader, check if it's a batch task.
+                    # Normal tasks pass through instantly. Batch tasks are held back.
                     updated_job = await self.db.get_job(jid)
                     if next_q == self.up_q and updated_job and str(updated_job.get('source', '')).startswith('Batch_'):
-                        pass 
+                        pass # The Batch Orchestrator will manually release this later
                     else:
                         await next_q.put(jid)
                         
@@ -1534,6 +1605,7 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
     total_storage = sum(f.stat().st_size for f in JOBS_DIR.rglob("*") if f.is_file()) / (1024 ** 3)
     jobs = await db.get_active_jobs()
     
+    # Isolate Recovery Jobs from Standard Jobs
     recovery_pool = [j for j in jobs if j.get('recovered_at_stage') is not None]
     standard_jobs = [j for j in jobs if j.get('recovered_at_stage') is None]
 
@@ -1541,6 +1613,7 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
         if not stage_str: return ""
         return stage_str.split("|")[0].strip().lower() if "|" in stage_str else stage_str.strip().lower()
 
+    # Buckets for standard pipeline
     buckets = {
         "dl": [j for j in standard_jobs if _base(j['stage']) in ["queued", "downloading"]],
         "dl_done": [j for j in standard_jobs if _base(j['stage']) == "downloaded"],
@@ -1591,7 +1664,7 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
         stat_str = "ONLINE & SECURE"
     
     text = (
-        f"💻 **MAINFRAME v8.5.1 (Proxy-Free)**\n"
+        f"💻 **MAINFRAME v8.5.1**\n"
         f"`━━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
         f"`[⚡] STAT :` `{stat_str}`\n"
         f"`[⚠️] SYNC :` {sync_stat}\n"
@@ -1604,6 +1677,7 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
 
     kb_lines = []
 
+    # Helper for Batch Dropdowns
     def build_batch_dropdown(target_stage: str, label: str, icon: str, job_list: list, parent_tab: str = "root"):
         batch_jobs = [j for j in job_list if str(j.get('source', '')).startswith('Batch_')]
         if not batch_jobs: return
@@ -1660,11 +1734,13 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
                         else:
                             pct = float(j.get('pct', 0.0) or 0.0)
                             stage_short = _base(j.get('stage', ''))[:4].upper()
+                            # Updated callback data to include target, batch name, and job id
                             kb_lines.append([
                                 InlineKeyboardButton(f"      ├ [{stage_short}] {title}.. | {pct:.1f}%", callback_data=f"dash|{target_stage}:{b_name}:{jid}"),
                                 InlineKeyboardButton("❌", callback_data=f"kill|{j['id']}")
                             ])
 
+    # Helper for Standard Dropdowns
     def build_dropdown(target_stage: str, label: str, icon: str, job_list: list, parent_tab: str = "root"):
         is_stage_open = (stage_tab == target_stage)
         prefix = "[-]" if is_stage_open else "[+]"
@@ -1718,6 +1794,7 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
             rec_enc = [j for j in recovery_pool if _base(j['recovered_at_stage']) in ["encoding", "encoded"]]
             rec_up = [j for j in recovery_pool if _base(j['recovered_at_stage']) == "uploading"]
             
+            # Subsystem Batch injection in Recovery
             build_batch_dropdown("rec_batches", "STALLED BATCHES", "📦", recovery_pool, parent_tab="recovery")
             
             build_dropdown("rec_dl", "STALLED DOWNLOADS", "📥", rec_dl, parent_tab="recovery")
@@ -1726,6 +1803,7 @@ async def _get_dashboard_components(tab: str, db: JobScheduler, pipeline: Pipeli
             
             kb_lines.append([InlineKeyboardButton("🗑️ PURGE ALL RECOVERED", callback_data="purge_recovery")])
 
+    # Subsystem Batch injection in Main Dashboard
     build_batch_dropdown("main_batches", "ACTIVE BATCHES", "📦", standard_jobs, parent_tab="root")
 
     build_dropdown("dl", "DOWNLOADING", "📥", buckets["dl"])
@@ -1769,6 +1847,7 @@ async def _monitor_batch_completion(db: JobScheduler, chat_id: int, app: Client)
         await asyncio.sleep(5)
         active_jobs = await db.get_active_jobs()
         
+        # Check if any job is still in a pre-upload phase
         pending_stages = ["queued", "downloading", "downloaded", "encoding", "process"]
         is_processing = any(
             any(stage in j.get('stage', '').lower() for stage in pending_stages) 
@@ -1783,6 +1862,7 @@ async def _monitor_batch_completion(db: JobScheduler, chat_id: int, app: Client)
             except Exception:
                 pass
             
+            # Wait for mass upload to finish to reset UI state
             while _mass_upload_active:
                 await asyncio.sleep(5)
                 jobs = await db.get_active_jobs()
@@ -1791,10 +1871,13 @@ async def _monitor_batch_completion(db: JobScheduler, chat_id: int, app: Client)
             break
 
 async def _process_single_batch(batch_items: list, batch_counter: int, custom_name: str, db: JobScheduler, pipeline: PipelineManager, app: Client):
+    """Handles the lifecycle of a single batch independently, showing only one active job card at a time."""
+    # Use the custom name if provided, otherwise default to the counter
     actual_name = custom_name if custom_name else str(batch_counter)
     batch_source = f"Batch_{actual_name}"
     batch_jids = []
     
+    # 1. Register ALL items in the database IMMEDIATELY (Reboot-proofing)
     for url, title, chat_id in batch_items:
         jid = str(uuid.uuid4())[:8]
         batch_jids.append(jid)
@@ -1805,6 +1888,7 @@ async def _process_single_batch(batch_items: list, batch_counter: int, custom_na
             "chat_id": chat_id, "tracker_id": None
         })
         
+    # 2. Sequential Processing & Rolling UI Card Allocation
     for jid in batch_jids:
         job = await db.get_job(jid)
         if not job:
@@ -1816,41 +1900,54 @@ async def _process_single_batch(batch_items: list, batch_counter: int, custom_na
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
         )
         
+# ... [Keep the rest of _process_single_batch exactly as it was] ...
+        # Link the dynamic tracker ID to the active job
         await db.update_job(jid, tracker_id=tracker.id)
         
+        # Submit the item to download
         await pipeline.dl_q.put(jid)
         
+        # Wait for this specific item to clear the processing pipeline entirely (Download + Encode)
         while True:
             await asyncio.sleep(2)
             current_job = await db.get_job(jid)
             if not current_job: 
-                break 
+                break # Job was killed, break loop
                 
             base_stage = current_job.get('stage', '').split('|')[0].strip().lower()
+            # Wait until it finishes encoding (or hits completed/failed) before releasing the loop
             if base_stage in ["encoded", "completed", "failed", "cancelled"]: 
                 break
                 
+        # Send to the uploader queue immediately since this item finished processing
         updated_job = await db.get_job(jid)
         if updated_job and updated_job.get('stage') == "encoded":
             await pipeline.up_q.put(jid)
     
+    # Mark this specific batch as fully dispatched
     _pending_batches.task_done()
 
+
 async def _batch_runner(db: JobScheduler, pipeline: PipelineManager, app: Client):
+    """Dispatches incoming batches to independent asynchronous workers."""
     batch_counter = 0
     while True:
+        # Unpack the custom name and items from the queue
         custom_name, batch_items = await _pending_batches.get()
         batch_counter += 1
         
+        # Pass the custom name into the processor
         asyncio.create_task(_process_single_batch(batch_items, batch_counter, custom_name, db, pipeline, app))
         
 async def _resume_interrupted_batches(db: JobScheduler, pipeline: PipelineManager, batch_jids: list):
+    # 1. Isolate the jobs that still need to be downloaded
     dl_jids = []
     for jid in batch_jids:
         job = await db.get_job(jid)
         if job and job.get('stage') == "queued":
             dl_jids.append(jid)
             
+    # 2. Feed the queued downloads one by one
     for jid in dl_jids:
         await pipeline.dl_q.put(jid)
         while True:
@@ -1862,6 +1959,7 @@ async def _resume_interrupted_batches(db: JobScheduler, pipeline: PipelineManage
             if base_stage not in ["queued", "downloading"]: 
                 break
                 
+    # 3. Wait for ALL items in this recovered batch to finish encoding
     while True:
         await asyncio.sleep(3)
         all_done = True
@@ -1875,6 +1973,7 @@ async def _resume_interrupted_batches(db: JobScheduler, pipeline: PipelineManage
         if all_done:
             break
             
+    # 4. Dump to uploader
     for jid in batch_jids:
         job = await db.get_job(jid)
         if job:
@@ -1905,6 +2004,7 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
         _batch_mode = True
         _batch_collection = []
         
+        # Extract custom name if provided (e.g., "/go Marvel_Movies")
         args = msg.text.split(maxsplit=1)
         _current_batch_name = args[1].strip() if len(args) > 1 else None
         
@@ -1923,6 +2023,7 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
 
         await msg.reply(f"🚀 **BATCH SUBMITTED**\nSent {len(_batch_collection)} tasks to the Orchestrator.")
         
+        # Put the items AND the custom name into the processing queue
         await _pending_batches.put((_current_batch_name, list(_batch_collection)))
         _batch_collection.clear()
         _current_batch_name = None
@@ -1948,19 +2049,25 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
 
     @app.on_message(filters.text & filters.user(OWNER_ID) & filters.reply)
     async def update_catcher(_, msg: Message):
+        # Intercept the ForceReply for the update command
         if msg.reply_to_message and "UPDATE SEQUENCE" in msg.reply_to_message.text:
             input_name = msg.text.strip()
+            
+            # Automatically append .py if you didn't type it
             script_name = f"{input_name}.py" if not input_name.endswith(".py") else input_name
 
             if not os.path.exists(script_name):
                 return await msg.reply(f"❌ File `{script_name}` not found in the Debian directory.")
 
+            # The initial "updating" ping
             progress = await msg.reply(f"🔄 Updating to `{script_name}`... Suspending current processes.")
 
+            # 1. Stop the current client to release the Pyrogram session.session lock
             await app.stop()
 
             import subprocess
             try:
+                # 2. Launch the new script using Python 3.13
                 proc = subprocess.Popen(
                     ["python3.13", script_name],
                     stdout=subprocess.PIPE,
@@ -1968,18 +2075,302 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager):
                     text=True
                 )
 
+                # 3. Wait 6 seconds to monitor for initialization crashes
                 try:
                     outs, errs = proc.communicate(timeout=6)
                     crashed = True
                     exit_code = proc.returncode
                 except subprocess.TimeoutExpired:
+                    # If it didn't exit within 6 seconds, the bot loop is running safely.
                     crashed = False
 
                 if crashed:
+                    # 4a. ROLLBACK: Reclaim the session and report the failure
                     await app.start()
                     error_log = errs.strip()[-3500:] if errs else "No traceback available (Immediate Exit)."
                     
                     await progress.edit_text(
                         f"❌ **Update Failed! Rolled back to previous version.**\n"
                         f"**Target:** `{script_name}` | **Exit Code:** `{exit_code}`\n\n"
-                        f"**Error Logs:**\n```{error_log}
+                        f"**Error Logs:**\n```{error_log}```"
+                    )
+                else:
+                    # 4b. SUCCESS: Edit the message via REST to bypass session lock, then die.
+                    import aiohttp
+                    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
+                    payload = {
+                        "chat_id": msg.chat.id,
+                        "message_id": progress.id,
+                        "text": f"✅ **Updated to `{script_name}`.** The new mainframe instance is now online."
+                    }
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(url, json=payload)
+
+                    # Terminate the old process completely, leaving the new one running in Termux
+                    os._exit(0)
+
+            except Exception as e:
+                # Failsafe if the subprocess fails to spawn
+                await app.start()
+                await progress.edit_text(f"🚨 **Critical Execution Error during Update:**\n`{str(e)}`")
+            
+            return # Prevent this reply from falling through to the normal url_catcher
+
+    @app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["start", "dashboard", "go", "end"]))
+    async def url_catcher(_, msg: Message):
+        if msg.reply_to_message and msg.reply_to_message.text and "RENAME TASK" in msg.reply_to_message.text:
+            try:
+                jid = re.search(r"`([a-zA-Z0-9_]+)`", msg.reply_to_message.text).group(1)
+                new_title = msg.text.strip()
+                await db.update_job(jid, title=new_title)
+                await msg.reply_to_message.delete()
+                await msg.delete()
+                if _dashboard_msg_id:
+                    text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
+                    await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
+            except Exception: pass
+            return
+
+        url = next((w for w in msg.text.split() if w.startswith("http") or w.startswith("magnet:?")), None)
+        if url:
+            title = msg.text.replace(url, "").strip() or url[:40]
+            
+            global _batch_mode, _batch_collection
+            if _batch_mode:
+                # Add to holding list without triggering processing
+                _batch_collection.append((url, title, msg.chat.id))
+                await msg.reply(f"✅ Added to batch. Total: {len(_batch_collection)}. Send `/end` to process.", quote=True)
+            else:
+                # NORMAL LINK: Processes instantly, completely bypassing the batch holds
+                jid = str(uuid.uuid4())[:8]
+                tracker = await msg.reply(f"`[ ⚡ ] ＴＡＳＫ :` `{title[:30]}`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]]))
+                
+                await db.create_job({"id": jid, "url": url, "title": title, "source": "Direct", "quality": "auto", "strategy": LinkClassifier.classify(url), "chat_id": msg.chat.id, "tracker_id": tracker.id})
+                await pipeline.dl_q.put(jid)
+
+    # Note: Keep your existing @app.on_callback_query() exactly as it was originally.
+
+    @app.on_callback_query()
+    async def _router(client: Client, cb: CallbackQuery):
+        global _dashboard_tab, _dashboard_msg_id, _dashboard_chat_id
+        
+        if cb.data == "noop":
+            await cb.answer()
+            return
+            
+        if cb.data == "force_release":
+            global _hold_uploads, _mass_upload_active
+            _hold_uploads = False
+            _mass_upload_active = True
+            await cb.answer("🔓 Uploads released! Processing mass upload...", show_alert=True)
+            try:
+                text, kb = await _get_dashboard_components(_dashboard_tab, pipeline_ref.db, pipeline_ref)
+                await cb.message.edit_text(text, reply_markup=kb)
+            except Exception: pass
+            return
+
+        if cb.data.startswith("delmsg|"):
+            _, msg_id = cb.data.split("|")
+            try: 
+                await client.delete_messages(cb.message.chat.id, int(msg_id))
+                await cb.answer("Cleared from terminal.")
+            except Exception: 
+                await cb.answer("Failed to clear.", show_alert=True)
+            return
+
+        if cb.data.startswith("dash|"):
+            new_tab = cb.data.split("|")[1]
+            if new_tab != _dashboard_tab:
+                _dashboard_tab = new_tab
+                try:
+                    text, kb = await _get_dashboard_components(_dashboard_tab, pipeline_ref.db, pipeline_ref)
+                    await cb.message.edit_text(text, reply_markup=kb)
+                except MessageNotModified: pass
+            await cb.answer()
+            return
+
+        if cb.data.startswith("joblog|"):
+            jid = cb.data.split("|")[1]
+            log_path = JOBS_DIR / f"JOB_{jid}" / "trace.log"
+            if not log_path.exists():
+                await cb.answer("No logs found.", show_alert=True)
+                return
+            with open(log_path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+                recent_logs = "\n".join(lines[-15:]) if lines else "No data."
+            await cb.answer(f"--- TRACE LOGS ---\n{recent_logs}", show_alert=True)
+            return
+
+        if cb.data.startswith("rename|"):
+            jid = cb.data.split("|")[1]
+            await cb.message.reply(
+                f"✏️ **RENAME TASK:** `{jid}`\nReply to this exact message with the new file name.", 
+                reply_markup=ForceReply(selective=True)
+            )
+            await cb.answer()
+            return
+
+        if cb.data.startswith("forceup|"):
+            jid = cb.data.split("|")[1]
+            await pipeline_ref.db.update_job(jid, stage="downloaded")
+            await pipeline_ref.enc_q.put(jid)
+            await pipeline_ref.db.log_trace(jid, "SYS_OP OVERRIDE: FORCE UPLOAD INITIATED.")
+            
+            await cb.answer("Download interrupted. Pushing payload to encoder/uploader pipeline.", show_alert=True)
+            
+            try:
+                text, kb = await _get_dashboard_components(_dashboard_tab, pipeline_ref.db, pipeline_ref)
+                await cb.message.edit_text(text, reply_markup=kb)
+            except Exception: pass
+            return
+
+        if cb.data == "purge_recovery":
+            jobs = await pipeline_ref.db.get_active_jobs()
+            recovery_pool = [j for j in jobs if j.get('recovered_at_stage') is not None]
+            for j in recovery_pool:
+                jid = j['id']
+                await pipeline_ref.db.log_trace(jid, "SYS_OP INITIATED MANUAL OVERRIDE: PURGED FROM RECOVERY.")
+                await pipeline_ref.db.delete_job(jid)
+                shutil.rmtree(JOBS_DIR / f"JOB_{jid}", ignore_errors=True)
+            await cb.answer(f"Purged {len(recovery_pool)} stalled vectors.", show_alert=True)
+            try:
+                text, kb = await _get_dashboard_components("root", pipeline_ref.db, pipeline_ref)
+                await cb.message.edit_text(text, reply_markup=kb)
+            except Exception: pass
+            return
+
+        if cb.data.startswith("kill|"):
+            jid = cb.data.split("|")[1]
+            await pipeline_ref.db.log_trace(jid, "SYS_OP INITIATED MANUAL OVERRIDE: KILL COMMAND RECEIVED.")
+            await pipeline_ref.db.delete_job(jid)
+            
+            job_dir = JOBS_DIR / f"JOB_{jid}"
+            shutil.rmtree(job_dir, ignore_errors=True)
+            
+            if _dashboard_msg_id != cb.message.id:
+                try: await cb.message.edit_text(f"💀 **TASK TERMINATED:** `JOB_{jid}`", reply_markup=None)
+                except Exception: pass
+            else:
+                try:
+                    text, kb = await _get_dashboard_components(_dashboard_tab, pipeline_ref.db, pipeline_ref)
+                    await cb.message.edit_text(text, reply_markup=kb)
+                except Exception: pass
+            await cb.answer("Process terminated and payload destroyed.", show_alert=True)
+            return
+
+# ──────────────────────────── EVENT LOOPS ─────────────────────────────
+
+def _parse_speed(s: str) -> float:
+    try:
+        m = re.search(r"([\d\.]+)\s*([KMG]?i?B/s)", str(s).upper().replace(" ", ""))
+        if not m: return 0.0
+        v, u = float(m.group(1)), m.group(2)
+        return v * 1024**3 if "G" in u else v * 1024**2 if "M" in u else v * 1024 if "K" in u else v
+    except: return 0.0
+
+def _format_speed(b: float) -> str:
+    if b <= 0: return "—"
+    for u in ["B/s", "KiB/s", "MiB/s", "GiB/s"]:
+        if b < 1024.0: return f"{b:.2f} {u}"
+        b /= 1024.0
+    return f"{b:.2f} TiB/s"
+
+def _parse_eta(s: str) -> int:
+    try:
+        parts = re.findall(r"\d+", str(s))
+        if len(parts) == 3: return int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
+        if len(parts) == 2: return int(parts[0])*60 + int(parts[1])
+    except: pass
+    return 0
+
+def _format_eta(s: int) -> str:
+    if s <= 0: return "—"
+    h, s = divmod(int(s), 3600)
+    m, s = divmod(s, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+_last_ui_stage = {}
+_job_stats_history = {} 
+
+async def terminal_loop(db: JobScheduler, pipeline: PipelineManager):
+    sys.stdout.write("\033[2J") 
+    while True:
+        await asyncio.sleep(1) 
+        sys.stdout.write("\033[H") 
+        sys.stdout.write(f"{C_CYAN}{C_BOLD}=== STEALTH MAINFRAME [LIVE] ==={C_RESET}\n")
+        sys.stdout.write(f"QUEUES | DL: {pipeline.dl_q.qsize()} | ENC: {pipeline.enc_q.qsize()} | UP: {pipeline.up_q.qsize()}\n{'─' * 40}\n")
+        
+        jobs = await db.get_active_jobs()
+        if not jobs: 
+            sys.stdout.write(f"{C_GREEN}System Idle. Awaiting vectors.{C_RESET}\033[K\n")
+        else:
+            for j in jobs[:5]:
+                col = C_YELLOW if "download" in j['stage'] else C_CYAN if "enc" in j['stage'] else C_GREEN
+                
+                sys.stdout.write(f"{C_BOLD}[{j['title'][:15]}]{C_RESET} {col}{j['stage']}{C_RESET} | [{make_bar(j['pct'], 10)}] {j['pct']:.1f}%\033[K\n")
+                
+                log_path = JOBS_DIR / f"JOB_{j['id']}" / "trace.log"
+                last_log = "Initializing..."
+                if log_path.exists():
+                    try:
+                        with open(log_path, "r", encoding="utf-8") as f:
+                            lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+                            if lines: last_log = re.sub(r"^\[.*?\]\s*", "", lines[-1])
+                    except Exception: pass
+                sys.stdout.write(f"  ├ 📄 \033[2m{last_log[:70]}\033[0m\033[K\n")
+                
+                live_text = _live_ui_text.get(j['id'], "Awaiting data stream...")
+                sys.stdout.write(f"  └ 📡 \033[36m{live_text[:75]}\033[0m\033[K\n")
+        
+        sys.stdout.write("\033[J") 
+        sys.stdout.flush()
+
+# ──────────────────────────── BOOTSTRAP ───────────────────────────────
+
+async def main():
+    app = Client("stealth_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+    db = JobScheduler(DB_PATH)
+    pipeline = PipelineManager(app, db)
+    dispatcher = TelegramDispatcher(app) 
+    
+    # Initialize the new Accumulator
+    ui_accumulator = UIAccumulator(db, dispatcher, pipeline)
+    
+    setup_router(app, db, pipeline)
+
+    async with app:
+        recovering_batch_jids = await RecoveryManager.scan_and_requeue(db, pipeline.dl_q, pipeline.enc_q, pipeline.up_q, app)
+        pipeline.start_workers()
+        
+        asyncio.create_task(dispatcher.sender_loop()) 
+        asyncio.create_task(ui_accumulator.run_loop()) 
+        asyncio.create_task(terminal_loop(db, pipeline))
+        
+        # ... [Keep previous bootstrap code in main()] ...
+        
+        # ─── BATCH ORCHESTRATORS ───
+        asyncio.create_task(_batch_runner(db, pipeline, app))
+        if recovering_batch_jids:
+            asyncio.create_task(_resume_interrupted_batches(db, pipeline, recovering_batch_jids))
+        
+        if OWNER_ID:
+            m = await app.send_message(OWNER_ID, "🟢 Mainframe Systems Online.")
+            
+            # --- Auto-Pin Logic Added Here ---
+            try:
+                await app.unpin_all_chat_messages(m.chat.id)
+                await m.pin(disable_notification=True, both_sides=True)
+            except Exception:
+                pass
+            # ---------------------------------
+            
+            global _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab
+            _dashboard_msg_id, _dashboard_chat_id = m.id, m.chat.id
+            text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
+            await dispatcher.safe_edit_queued(_dashboard_chat_id, _dashboard_msg_id, text, kb)
+
+        while True: await asyncio.sleep(3600)
+
+if __name__ == "__main__":
+    try: loop.run_until_complete(main())
+    except KeyboardInterrupt: sys.exit(0)
