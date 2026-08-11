@@ -466,6 +466,40 @@ def parse_caption(caption: str):
     return production, names_list, description
 
 
+def extract_videos_from_post(post: dict, depth: int = 0, max_depth: int = 4) -> list[dict]:
+    """
+    Collects video attachments from a wall post AND any reposts nested inside it.
+    VK stores a repost's original post under 'copy_history' — if a community
+    reposts another community's post that contains a video, that video lives
+    inside copy_history, not in the outer post's own 'attachments'. Without this,
+    reposted/bundled videos from other communities are silently skipped.
+    """
+    videos = []
+    if depth > max_depth or not post:
+        return videos
+    for att in post.get('attachments', []) or []:
+        if att.get('type') == 'video':
+            v = att['video']
+            videos.append({'owner_id': v['owner_id'], 'id': v['id'], 'title': v.get('title', 'VK Video')})
+    for repost in post.get('copy_history', []) or []:
+        videos.extend(extract_videos_from_post(repost, depth + 1, max_depth))
+    return videos
+
+
+def extract_text_chain(post: dict, depth: int = 0, max_depth: int = 4) -> str:
+    """
+    Concatenates a post's own caption with the captions of any reposts nested
+    inside it, so a hashtag placed on the outer repost OR the original inner
+    post is still found by pattern matching.
+    """
+    if depth > max_depth or not post:
+        return ""
+    parts = [post.get('text', '') or '']
+    for repost in post.get('copy_history', []) or []:
+        parts.append(extract_text_chain(repost, depth + 1, max_depth))
+    return "\n".join(parts)
+
+
 class FuzzyTagManager:
     """Manages VK Fave Tags with fuzzy matching to avoid duplicate tag creation."""
     def __init__(self, vk):
@@ -1290,8 +1324,58 @@ def render_deepscan_ui(chat_id: int):
 
 
 def _hashtag_pattern(tag: str) -> re.Pattern:
-    spaced_tag = re.sub(r'([a-z])([A-Z])', r'\1 \2', tag)
-    return re.compile(rf"#?\b(?:{re.escape(tag)}|{re.escape(spaced_tag)})\b", re.IGNORECASE)
+    """
+    Builds a flexible matcher for a tag so it catches every real-world
+    caption style we've seen, not just '#TagName' verbatim:
+      #HasanBasu, #Hasan Basu, #Hasan_Basu, #Hasan-Basu,
+      xxxxx.Hasan.Basu.xxxxx, hasan.basu, HASAN BASU, etc.
+
+    Strategy: split the tag into "word" chunks — first on any existing
+    separator (space/dot/underscore/hyphen), then further on camelCase
+    boundaries — then rejoin the chunks allowing ANY run of separator
+    characters (or none at all) between them. Word-boundary anchors on
+    each end mean "xxxxx.Hasan.Basu.xxxxx" matches (dot is a boundary)
+    while "HasanBasuExtra" as one solid run of letters won't falsely
+    match a totally different tag.
+    """
+    raw_chunks = [c for c in re.split(r'[\s._\-]+', tag) if c]
+    words = []
+    for chunk in raw_chunks:
+        found = re.findall(r'[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])', chunk)
+        words.extend(found if found else [chunk])
+    if not words:
+        words = [tag]
+    sep = r'[\s._\-]*'
+    body = sep.join(re.escape(w) for w in words)
+    return re.compile(rf"#?\b{body}\b", re.IGNORECASE)
+
+
+def _iter_post_texts_and_videos(post: dict, max_depth: int = 5) -> tuple[list[str], list[dict]]:
+    """
+    Recursively walks a wall post AND any reposts nested under it via
+    VK's 'copy_history' field. A post that bundles/reposts content from
+    another community stores the original post (with its own text and
+    attachments) inside copy_history rather than at the top level — so
+    without this, hashtag matching and video collection both silently
+    skip anything that was reposted in.
+
+    Returns (all_text_strings_found, all_video_attachment_dicts_found)
+    across the post and every nested repost, deepest-first order.
+    """
+    texts, videos = [], []
+
+    def walk(p: dict, depth: int):
+        if not p or depth > max_depth:
+            return
+        texts.append(p.get('text', '') or '')
+        for att in (p.get('attachments') or []):
+            if att.get('type') == 'video':
+                videos.append(att['video'])
+        for nested in (p.get('copy_history') or []):
+            walk(nested, depth + 1)
+
+    walk(post, 0)
+    return texts, videos
 
 
 async def deepscan_search_community(vk, comm_id: int, pattern: re.Pattern) -> list[dict]:
@@ -1302,14 +1386,13 @@ async def deepscan_search_community(vk, comm_id: int, pattern: re.Pattern) -> li
         posts = res.get('items', [])
         if not posts: break
         for post in posts:
-            if pattern.search(post.get('text', '')):
-                for att in post.get('attachments', []):
-                    if att.get('type') == 'video':
-                        v = att['video']
-                        uid = f"{v['owner_id']}_{v['id']}"
-                        if uid not in seen:
-                            seen.add(uid)
-                            videos.append({'url': f"https://vk.com/video{uid}", 'title': v.get('title', 'VK Video'), 'unique_id': uid})
+            texts, post_videos = _iter_post_texts_and_videos(post)
+            if any(pattern.search(t) for t in texts):
+                for v in post_videos:
+                    uid = f"{v['owner_id']}_{v['id']}"
+                    if uid not in seen:
+                        seen.add(uid)
+                        videos.append({'url': f"https://vk.com/video{uid}", 'title': v.get('title', 'VK Video'), 'unique_id': uid})
         offset += count
         if offset >= res.get('count', 0) or offset >= DEEPSCAN_MAX_POSTS_PER_COMMUNITY: break
         await asyncio.sleep(DEEPSCAN_PAGE_DELAY_SEC)
@@ -1372,18 +1455,26 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
 
                     for post in posts:
                         processed += 1
-                        caption = post.get('text', '')
-                        video_atts = [att['video'] for att in post.get('attachments', []) if att.get('type') == 'video']
+                        texts, video_atts = _iter_post_texts_and_videos(post)
 
                         if not video_atts:
-                            log.info(f"⏭ SKIPPED Post {post.get('id')}: No native video attachments found.")
+                            log.info(f"⏭ SKIPPED Post {post.get('id')}: No native video attachments found (incl. reposts).")
                             skipped += 1
                             continue
 
-                        parsed_data = parse_caption(caption)
+                        # Try parsing every text found (top post + any nested
+                        # reposts) — the caption with the [Production] Name x Name
+                        # format may live on the original post being reposted in,
+                        # not on the top-level wrapper post.
+                        parsed_data = None
+                        for candidate_text in texts:
+                            parsed_data = parse_caption(candidate_text)
+                            if parsed_data:
+                                caption = candidate_text
+                                break
                         if not parsed_data:
-                            clean_cap = caption.replace('\n', ' ')[:50]
-                            log.info(f"⏭ SKIPPED Post {post.get('id')}: Caption didn't match format. Capt: '{clean_cap}...'")
+                            clean_cap = (texts[0] if texts else '').replace('\n', ' ')[:50]
+                            log.info(f"⏭ SKIPPED Post {post.get('id')}: No caption (incl. reposts) matched format. Capt: '{clean_cap}...'")
                             skipped += 1
                             continue
 
@@ -1481,11 +1572,10 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                     posts = res.get('items', [])
                     if not posts: break
                     for post in posts:
-                        for att in post.get('attachments', []):
-                            if att.get('type') == 'video':
-                                v = att['video']
-                                uid = f"{v['owner_id']}_{v['id']}"
-                                wall.append({'url': f"https://vk.com/video{uid}", 'title': v.get('title', 'VK Video'), 'unique_id': uid})
+                        _, post_videos = _iter_post_texts_and_videos(post)
+                        for v in post_videos:
+                            uid = f"{v['owner_id']}_{v['id']}"
+                            wall.append({'url': f"https://vk.com/video{uid}", 'title': v.get('title', 'VK Video'), 'unique_id': uid})
                     offset += count
                     if offset >= res.get('count', 0) or offset >= 1000: break
             except Exception as e: print(f"Wall fetch err: {e}")
@@ -1592,14 +1682,13 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                 if not posts: break
 
                 for post in posts:
-                    if pattern.search(post.get('text', '')):
-                        for att in post.get('attachments', []):
-                            if att.get('type') == 'video':
-                                v = att['video']
-                                uid = f"{v['owner_id']}_{v['id']}"
-                                if uid not in seen_uids:
-                                    seen_uids.add(uid)
-                                    matching_videos.append({'url': f"https://vk.com/video{uid}", 'title': v.get('title', 'VK Video'), 'unique_id': uid})
+                    texts, post_videos = _iter_post_texts_and_videos(post)
+                    if any(pattern.search(t) for t in texts):
+                        for v in post_videos:
+                            uid = f"{v['owner_id']}_{v['id']}"
+                            if uid not in seen_uids:
+                                seen_uids.add(uid)
+                                matching_videos.append({'url': f"https://vk.com/video{uid}", 'title': v.get('title', 'VK Video'), 'unique_id': uid})
 
                 offset += count
                 now = time.time()
