@@ -660,8 +660,12 @@ class JobScheduler:
             self.conn.commit()
 
     async def get_pending_items(self, pl_id: str, limit: int = 2) -> list[dict]:
+        # ORDER BY rowid guarantees we always claim items in the exact
+        # order they were inserted — critical for oldest-first queuing
+        # (see CH 04 helper `oldest_first` / call sites in CH 11), since
+        # VK's own list endpoints return newest-first by default.
         async with self.lock:
-            return [dict(r) for r in self.conn.execute('SELECT * FROM playlist_items WHERE playlist_id = ? AND status = "pending" LIMIT ?', (pl_id, limit)).fetchall()]
+            return [dict(r) for r in self.conn.execute('SELECT * FROM playlist_items WHERE playlist_id = ? AND status = "pending" ORDER BY rowid ASC LIMIT ?', (pl_id, limit)).fetchall()]
 
     async def update_item_status(self, item_id: str, status: str):
         async with self.lock:
@@ -1378,6 +1382,18 @@ def _iter_post_texts_and_videos(post: dict, max_depth: int = 5) -> tuple[list[st
     return texts, videos
 
 
+def oldest_first(videos: list[dict]) -> list[dict]:
+    """
+    VK's video.get / wall.get endpoints return items newest-first by
+    default. Since VK albums display newest-*added* on top, uploading
+    in that same newest-first order actually puts the OLDEST video on
+    top (each later upload pushes earlier ones down). Reversing here
+    before we queue means we upload oldest -> newest, so the newest
+    video naturally ends up on top of the album once the batch finishes.
+    """
+    return list(reversed(videos))
+
+
 async def deepscan_search_community(vk, comm_id: int, pattern: re.Pattern) -> list[dict]:
     videos, seen = [], set()
     offset, count = 0, 100
@@ -1396,7 +1412,7 @@ async def deepscan_search_community(vk, comm_id: int, pattern: re.Pattern) -> li
         offset += count
         if offset >= res.get('count', 0) or offset >= DEEPSCAN_MAX_POSTS_PER_COMMUNITY: break
         await asyncio.sleep(DEEPSCAN_PAGE_DELAY_SEC)
-    return videos
+    return oldest_first(videos)
 
 
 async def queue_tagged_videos(db: JobScheduler, chat_id: int, tag: str, videos: list[dict], source_label: str = None) -> tuple[int, int]:
@@ -1580,7 +1596,7 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                     if offset >= res.get('count', 0) or offset >= 1000: break
             except Exception as e: print(f"Wall fetch err: {e}")
 
-            return videos, wall
+            return oldest_first(videos), oldest_first(wall)
 
         try:
             videos, wall = await asyncio.to_thread(perform_scan)
@@ -1704,7 +1720,8 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                 if offset >= (total_count or 0): break
                 await asyncio.sleep(HASHTAG_SCAN_PAGE_DELAY_SEC)
 
-            session['videos'] = matching_videos
+            session['videos'] = oldest_first(matching_videos)
+            matching_videos = session['videos']
             if not matching_videos:
                 _hashtag_scan_sessions.pop(msg.chat.id, None)
                 return await safe_edit(app, msg.chat.id, m.id, TXT.HSCAN_NONE_FOUND.format(tag=tag))
@@ -1845,6 +1862,7 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                             v_url = e.get('url') or e.get('webpage_url')
                             if v_url: all_videos.append({'url': v_url, 'title': e.get('title', 'VK Video'), 'unique_id': str(e.get('id', uuid.uuid4().hex[:10]))})
 
+            all_videos = oldest_first(all_videos)
             missing_videos = [v for v in all_videos if v['unique_id'] not in existing_ids]
             return target_album_id, len(all_videos), missing_videos
 
