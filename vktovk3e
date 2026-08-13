@@ -852,6 +852,11 @@ class JobScheduler:
         async with self.lock:
             return [dict(r) for r in self.conn.execute('SELECT * FROM playlist_items WHERE playlist_id = ? AND status = "pending" ORDER BY rowid ASC LIMIT ?', (pl_id, limit)).fetchall()]
 
+    async def get_pending_count(self, pl_id: str) -> int:
+        async with self.lock:
+            row = self.conn.execute('SELECT COUNT(*) FROM playlist_items WHERE playlist_id = ? AND status = "pending"', (pl_id,)).fetchone()
+            return row[0] if row else 0
+
     async def update_item_status(self, item_id: str, status: str):
         async with self.lock:
             self.conn.execute('UPDATE playlist_items SET status = ? WHERE id = ?', (status, item_id))
@@ -996,6 +1001,8 @@ class JobScheduler:
 # ═══════════════════════════════════════════════════════════════════════
 async def playlist_drip_feed_loop(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.Queue, up_q: asyncio.Queue,
                                    dl_pool: "WorkerPool", enc_pool: "WorkerPool", up_pool: "WorkerPool"):
+    import random  # Imported locally to ensure lottery system works immediately
+    
     while True:
         await asyncio.sleep(3)
         try:
@@ -1022,19 +1029,39 @@ async def playlist_drip_feed_loop(db: JobScheduler, dl_q: asyncio.Queue, enc_q: 
             global_slots_free = min(effective_cap - total_in_flight, slots_by_space)
             if global_slots_free <= 0: continue
 
+            # Weighted allocation system
             eligible_playlists = [pl for pl in active_playlists if pl['status'] not in ('paused', 'cancelled', 'completed', 'cancelling')]
-            made_progress = True
-            while global_slots_free > 0 and eligible_playlists and made_progress:
-                made_progress = False
-                for pl in eligible_playlists:
-                    if global_slots_free <= 0: break
-                    pending_items = await db.get_pending_items(pl['id'], limit=1)
-                    if not pending_items: continue
+            valid_pls, weights = [], []
+            
+            # Evaluate weights based on how many pending items exist
+            for pl in eligible_playlists:
+                p_count = await db.get_pending_count(pl['id'])
+                if p_count > 0:
+                    valid_pls.append(pl)
+                    weights.append(p_count)
+
+            # Assign available worker slots
+            while global_slots_free > 0 and valid_pls:
+                # Weighted random selection (larger queue = more likely to claim the slot)
+                chosen_pl = random.choices(valid_pls, weights=weights, k=1)[0]
+                idx = valid_pls.index(chosen_pl)
+
+                pending_items = await db.get_pending_items(chosen_pl['id'], limit=1)
+                if pending_items:
                     item = pending_items[0]
-                    await db.claim_item_as_job(item, pl['chat_id'])
+                    await db.claim_item_as_job(item, chosen_pl['chat_id'])
                     await dl_q.put(item['id'])
                     global_slots_free -= 1
-                    made_progress = True
+                    
+                    # Decrement its weight so it scales dynamically
+                    weights[idx] -= 1
+                    if weights[idx] <= 0:
+                        valid_pls.pop(idx)
+                        weights.pop(idx)
+                else:
+                    valid_pls.pop(idx)
+                    weights.pop(idx)
+
         except Exception as e:
             log.exception(f"Drip Feed Loop Error: {e}")
 
