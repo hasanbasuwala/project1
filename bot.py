@@ -412,51 +412,67 @@ class VKPlaylistManager:
             return None
 
     async def upload_video(self, file_path: Path, title: str, description: str, album_id: int | None, jid: str, db: JobScheduler) -> dict:
-        """Blocking multipart upload via vk_api's VkUpload, run off-thread.
-        NOTE: no native per-chunk progress here — see module docstring."""
+        """Bypasses vk_api.VkUpload to manually orchestrate the upload sequence, 
+        preventing Error 10 caused by hardcoded wrapper parameters."""
         if not self._session:
             raise RuntimeError("VK upload unavailable: vk_api not installed or VK_TOKEN missing.")
 
         def _do_upload():
-            uploader = vk_api.VkUpload(self._session)
-            kwargs = dict(
-                video_file=str(file_path),
-                name=(title or "Unknown Video")[:200],  # Fallback added to prevent empty-title crashes
-                description=description or "",
-                is_private=False,
-                wallpost=False,
-            )
-            
-            # FIX: We intentionally DO NOT pass album_id to uploader.video() here.
-            # Passing album_id during the initial video.save request causes VK API 
-            # Error 10 (Internal Server Error) on their backend.
-            
-            result = uploader.video(**kwargs)
-            
-            # Phase 2: Post-upload Album Assignment
-            if album_id:
-                try:
-                    # vk_api can sometimes return a list of dicts or a single dict
-                    res_dict = result[0] if isinstance(result, list) else result
-                    vid_id = res_dict.get('video_id')
-                    own_id = res_dict.get('owner_id')
-                    
-                    if vid_id and own_id:
-                        self._vk.video.addToAlbum(
-                            owner_id=own_id,
-                            video_id=vid_id,
-                            album_id=album_id
-                        )
-                except Exception as e:
-                    # We catch this so the job doesn't completely fail and retry 
-                    # if the video actually successfully uploaded but just failed to move.
-                    pass 
+            import requests  # Using requests off-thread to mimic standard behavior safely
 
-            return result
+            # 1. Sanitize metadata and request the upload URL directly
+            kwargs = {}
+            clean_title = (title or "").strip()
+            if clean_title:
+                kwargs['name'] = clean_title[:200]
+            
+            clean_desc = (description or "").strip()
+            if clean_desc:
+                kwargs['description'] = clean_desc
+
+            try:
+                # Ask VK for the upload server
+                save_resp = self._vk.video.save(**kwargs)
+            except vk_api.exceptions.ApiError as e:
+                if e.code == 10:
+                    db.log_trace(jid, "[VK] API Error 10 on metadata. Retrying with bare-minimum payload...")
+                    # Fallback: VK sometimes silently rejects names/descriptions. Send an empty request.
+                    save_resp = self._vk.video.save() 
+                else:
+                    raise e
+
+            upload_url = save_resp.get('upload_url')
+            vid_id = save_resp.get('video_id')
+            own_id = save_resp.get('owner_id')
+
+            if not upload_url:
+                raise RuntimeError(f"Failed to retrieve upload URL from VK. Response: {save_resp}")
+
+            # 2. Push the payload using standard requests
+            db.log_trace(jid, "[VK] Upload URL acquired. Streaming payload to VK servers...")
+            with open(file_path, 'rb') as f:
+                upload_result = requests.post(upload_url, files={'video_file': f}).json()
+
+            # VK returns size or video_hash on success
+            if 'video_hash' not in upload_result and 'size' not in upload_result:
+                raise RuntimeError(f"VK File stream rejected: {upload_result}")
+
+            # 3. Post-upload Album Assignment
+            if album_id and vid_id and own_id:
+                try:
+                    self._vk.video.addToAlbum(
+                        owner_id=own_id,
+                        video_id=vid_id,
+                        album_id=album_id
+                    )
+                except Exception as e:
+                    db.log_trace(jid, f"[VK] Album assignment warning (video uploaded, but not moved): {e}")
+
+            return save_resp
 
         db.log_trace(jid, TXT.VK_UPLOAD_START)
         result = await asyncio.to_thread(_do_upload)
-        db.log_trace(jid, TXT.VK_UPLOAD_DONE.format(result=result))
+        db.log_trace(jid, TXT.VK_UPLOAD_DONE.format(result="Success"))
         return result
 
 # ═══════════════════════════════════════════════════════════════════════
