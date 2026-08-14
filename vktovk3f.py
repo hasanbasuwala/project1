@@ -2328,28 +2328,9 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
     # ──────────────────────────────────────────────
     # 11.3 — /scan #Hashtag (wall search by tag, WITH progress bar)
     # ──────────────────────────────────────────────
-    @app.on_message(filters.regex(r"^/scan\s+#(\w+)") & filters.user(OWNER_ID))
-    async def cmd_scan_hashtag(_, msg: Message):
-        match = re.search(r"^/scan\s+#(\w+)", msg.text.strip())
-        if not match:
-            return await msg.reply(TXT.HSCAN_USAGE)
-
-        tag_raw = match.group(1).strip()
-        _hashtag_scan_sessions[msg.chat.id] = {'tag': tag_raw, 'stage': 'awaiting_link', 'videos': [], 'url': None}
-        await msg.reply(TXT.HSCAN_INIT.format(tag=tag_raw))
-
-    @app.on_message(filters.regex(r"https?://") & filters.user(OWNER_ID))
-    async def handle_hashtag_community_link(_, msg: Message):
-        session = _hashtag_scan_sessions.get(msg.chat.id)
-        if not session or session.get('stage') != 'awaiting_link':
-            return msg.continue_propagation()
-
-        url = msg.text.strip()
-        tag = session['tag']
-        session['stage'] = 'searching'
-        session['url'] = url
-        m = await msg.reply(TXT.HSCAN_RESOLVING)
-
+    async def run_hashtag_scan(chat_id: int, tag: str, url: str):
+        """Runs independently for each tag, spawning its own UI card."""
+        m = await app.send_message(chat_id, TXT.HSCAN_RESOLVING)
         try:
             vk = await asyncio.to_thread(get_vk_api)
             comm_id = await _vk_call(resolve_vk_community_id, vk, url)
@@ -2377,7 +2358,7 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                 now = time.time()
                 if now - last_edit >= PROGRESS_EDIT_MIN_INTERVAL_SEC or offset >= (total_count or 0):
                     pct = min(offset / total_count * 100.0, 100.0) if total_count else 0.0
-                    await safe_edit(app, msg.chat.id, m.id,
+                    await safe_edit(app, chat_id, m.id,
                         f"{TXT.HSCAN_PROGRESS_TITLE.format(tag=tag)}\n{TXT.DIVIDER}\n"
                         f"`[{make_bar(pct, 16)}] {pct:.0f}%`\n"
                         f"{TXT.HSCAN_PROGRESS_POSTS} `{min(offset, total_count or offset)}/{total_count or '?'}`\n"
@@ -2387,24 +2368,58 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                 if offset >= (total_count or 0): break
                 await asyncio.sleep(HASHTAG_SCAN_PAGE_DELAY_SEC)
 
-            session['videos'] = oldest_first(matching_videos)
-            matching_videos = session['videos']
-            if not matching_videos:
-                _hashtag_scan_sessions.pop(msg.chat.id, None)
-                return await safe_edit(app, msg.chat.id, m.id, TXT.HSCAN_NONE_FOUND.format(tag=tag))
+            videos = oldest_first(matching_videos)
+            if not videos:
+                return await safe_edit(app, chat_id, m.id, TXT.HSCAN_NONE_FOUND.format(tag=tag))
 
-            session['stage'] = 'awaiting_confirmation'
+            # Key the session state to this specific bot message ID! (Allows concurrent sessions)
+            _hashtag_scan_results[m.id] = {'tag': tag, 'url': url, 'videos': videos}
+
             kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(TXT.HSCAN_DOWNLOAD_BTN.format(count=len(matching_videos)), callback_data="ht_confirm_download"),
+                InlineKeyboardButton(TXT.HSCAN_DOWNLOAD_BTN.format(count=len(videos)), callback_data="ht_confirm_download"),
                 InlineKeyboardButton(TXT.HSCAN_CANCEL_BTN, callback_data="ht_cancel")
             ]])
-            await safe_edit(app, msg.chat.id, m.id,
+            await safe_edit(app, chat_id, m.id,
                 f"{TXT.HSCAN_COMPLETE_TITLE}\n{TXT.DIVIDER}\n"
-                f"{TXT.HSCAN_ROW_TERM} `#{tag}`\n{TXT.HSCAN_ROW_MATCHES} `{len(matching_videos)}`\n"
-                f"{TXT.HSCAN_ROW_ALBUM} `{tag}`\n{TXT.HSCAN_CONFIRM_PROMPT.format(count=len(matching_videos), tag=tag)}", kb)
+                f"{TXT.HSCAN_ROW_TERM} `#{tag}`\n{TXT.HSCAN_ROW_MATCHES} `{len(videos)}`\n"
+                f"{TXT.HSCAN_ROW_ALBUM} `{tag}`\n{TXT.HSCAN_CONFIRM_PROMPT.format(count=len(videos), tag=tag)}", kb)
         except Exception as e:
-            _hashtag_scan_sessions.pop(msg.chat.id, None)
-            await safe_edit(app, msg.chat.id, m.id, TXT.HSCAN_ERROR.format(err=e))
+            await safe_edit(app, chat_id, m.id, TXT.HSCAN_ERROR.format(err=e))
+
+    @app.on_message(filters.regex(r"^/scan\s+(#[^\s]+.*)") & filters.user(OWNER_ID))
+    async def cmd_scan_hashtag(_, msg: Message):
+        # Extract all hashtags
+        tags = re.findall(r'#([A-Za-z0-9_]+)', msg.text)
+        if not tags: return await msg.reply(TXT.HSCAN_USAGE)
+            
+        # Check if they also provided a URL in the same command
+        urls = re.findall(r'(https?://[^\s]+)', msg.text)
+        if urls:
+            url = urls[0]
+            # Immediately spawn a background task for EACH hashtag simultaneously
+            for tag in tags:
+                asyncio.create_task(run_hashtag_scan(msg.chat.id, tag, url))
+            return
+
+        if msg.chat.id not in _hashtag_scan_pending:
+            _hashtag_scan_pending[msg.chat.id] = []
+            
+        _hashtag_scan_pending[msg.chat.id].append({'tags': tags, 'stage': 'awaiting_link'})
+        tags_formatted = ", ".join(f"#{t}" for t in tags)
+        await msg.reply(TXT.HSCAN_INIT.format(tag=tags_formatted))
+
+    @app.on_message(filters.regex(r"https?://") & filters.user(OWNER_ID))
+    async def intercept_urls_for_hashtags(_, msg: Message):
+        pending = _hashtag_scan_pending.get(msg.chat.id, [])
+        if not pending:
+            return msg.continue_propagation()
+            
+        session = pending.pop(0)  # FIFO: Take the oldest waiting request
+        url = msg.text.strip()
+        
+        # Spawn a separate UI card and search process for EVERY tag requested
+        for tag in session['tags']:
+            asyncio.create_task(run_hashtag_scan(msg.chat.id, tag, url))
 
     # ──────────────────────────────────────────────
     # 11.4 — /deepscan #Hashtag (scan every joined community, WITH progress bar)
@@ -2554,6 +2569,14 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
     @app.on_message(filters.command(["vk_dash"]) & filters.user(OWNER_ID))
     async def cmd_dash(_, msg: Message):
         global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid
+        global _stack_msg_id, _stack_chat_id
+        
+        # 1. Spawn the Active Jobs (Stack) card first
+        jobs = await db.get_active_jobs()
+        stack_msg = await msg.reply(render_stack_card(jobs))
+        _stack_msg_id, _stack_chat_id = stack_msg.id, stack_msg.chat.id
+
+        # 2. Spawn the Main Dashboard card right under it
         text, kb = await render_dashboard(db, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid)
         m = await msg.reply(text, reply_markup=kb)
         _dash_msg_id, _dash_chat_id = m.id, m.chat.id
@@ -2720,12 +2743,12 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
 
         # --- Hashtag Scan Confirmation Callbacks ---
         if cb.data == "ht_cancel":
-            _hashtag_scan_sessions.pop(cb.message.chat.id, None)
+            _hashtag_scan_results.pop(cb.message.id, None)
             await cb.answer("Cancelled.")
             return await cb.message.edit(TXT.HSCAN_CANCELLED)
 
         elif cb.data == "ht_confirm_download":
-            session = _hashtag_scan_sessions.get(cb.message.chat.id)
+            session = _hashtag_scan_results.get(cb.message.id)
             if not session or not session.get('videos'):
                 return await cb.answer(TXT.HSCAN_SESSION_EXPIRED, show_alert=True)
 
@@ -2737,10 +2760,10 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                 queued, skipped = await queue_tagged_videos(db, cb.message.chat.id, album_name, videos, source_label=comm_url)
 
                 if queued == 0:
-                    _hashtag_scan_sessions.pop(cb.message.chat.id, None)
+                    _hashtag_scan_results.pop(cb.message.id, None)
                     return await cb.message.edit(TXT.HSCAN_ALL_PRESENT.format(count=len(videos), album=album_name))
 
-                _hashtag_scan_sessions.pop(cb.message.chat.id, None)
+                _hashtag_scan_results.pop(cb.message.id, None)
                 await cb.message.edit(
                     f"{TXT.HSCAN_BATCH_TITLE}\n{TXT.DIVIDER}\n"
                     f"{TXT.HSCAN_ROW_ALBUM} `{album_name}`\n"
