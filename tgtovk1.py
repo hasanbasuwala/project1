@@ -1823,3 +1823,395 @@ async def upload_worker(worker_id):
             active_jobs.pop(up_key, None)
             upload_queue.task_done()
             
+# ============================================================
+# CHAPTER 7: UI & DASHBOARD RENDERER
+# ============================================================
+
+def _engine_banner():
+    if engine_state == ENGINE_RUNNING:
+        return "⚡ RUNNING (Hybrid Zero-Disk + Fallback)"
+    if engine_state == ENGINE_PAUSE_REQUESTED:
+        return "🟡 Pause Requested — draining active transfers..."
+    return "⏸️ PAUSED"
+
+async def render_dashboard():
+    chat_id = await get_control("dashboard_chat_id")
+    msg_id = await get_control("dashboard_msg_id")
+    if not chat_id or not msg_id: return
+
+    global monitor_page
+    scheduled_pending = sum(len(v) for v in playlist_queues.values())
+    queued_total = relay_queue.qsize() + download_queue_t1.qsize() + download_queue_t2.qsize() + scheduled_pending
+    staged_up = upload_queue.qsize()
+    
+    active_relays = [j for j in active_jobs.values() if j['action'] == "🚀 RELAY"]
+    active_dls = [j for j in active_jobs.values() if j['action'] == "📥 DL"]
+    active_ups = [j for j in active_jobs.values() if j['action'] == "📤 UP"]
+
+    text = ""
+    buttons = []
+
+    if ui_state == "MAIN":
+        monitored_chat_count = await db_execute("SELECT COUNT(*) FROM monitored_chats", fetch="one")
+        m_count = monitored_chat_count[0] if monitored_chat_count else 0
+
+        always_count = await db_execute("SELECT COUNT(*) FROM always_monitors WHERE status='ACTIVE'", fetch="one")
+        a_count = always_count[0] if always_count else 0
+
+        selected_count = await db_execute("SELECT COUNT(*) FROM selected_monitors WHERE status='ACTIVE'", fetch="one")
+        s_count = selected_count[0] if selected_count else 0
+
+        tags_count = await db_execute("SELECT COUNT(*) FROM selected_tags", fetch="one")
+        t_count = tags_count[0] if tags_count else 0
+
+        autotransfer_count = await db_execute("SELECT COUNT(*) FROM autotransfer_monitors WHERE status='ACTIVE'", fetch="one")
+        at_count = autotransfer_count[0] if autotransfer_count else 0
+
+        text = (f"{UI_STRINGS['dashboard_header']}\n{_engine_banner()} | 💾 Free Disk: {free_space_gb():.1f} GB\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🚀 **Zero-Disk Relays Active:** {len(active_relays)} | Queued: {queued_total}\n"
+                f"📥 **Fallback Downloads:** {len(active_dls)} Active\n"
+                f"📦 **Staged on Disk:** {staged_up} Files\n"
+                f"📤 **Fallback Uploads:** {len(active_ups)} Active\n"
+                f"👁️ **Monitored Chats:** {m_count} Active\n"
+                f"📡 **Auto-Sync Groups:** {a_count} Active\n"
+                f"🎯 **Selective Monitors:** {s_count} Active | {t_count} Tags\n"
+                f"🚀 **Auto-Transfer Groups:** {at_count} Active\n"
+                f"━━━━━━━━━━━━━━━━━━\n")
+
+        waiting_playlists = await db_execute(
+            "SELECT playlist_id, album_name, total FROM playlists WHERE status='WAITING_CONFIRMATION' ORDER BY updated_at DESC LIMIT 3",
+            fetch="all"
+        )
+        if waiting_playlists:
+            text += "🧪 **Pilots awaiting confirmation:**\n"
+            for pid, album_name, total in waiting_playlists:
+                text += f"• {album_name} ({total - 1} more videos)\n"
+                buttons.append([
+                    InlineKeyboardButton(f"▶️ Continue {album_name}", callback_data=f"plcontinue_{pid}"),
+                    InlineKeyboardButton("💀 Kill", callback_data=f"plkill_{pid}")
+                ])
+            text += "━━━━━━━━━━━━━━━━━━\n"
+
+        buttons.append([
+            InlineKeyboardButton(f"🚀 Relays ({len(active_relays)})", callback_data="ui_RELAY_VIEW"),
+            InlineKeyboardButton(f"📥 DLs ({len(active_dls)}) | UPs ({len(active_ups)})", callback_data="ui_UP_VIEW")
+        ])
+        buttons.append([
+            InlineKeyboardButton("🎯 Selective Sync", callback_data="ui_SELECTED_VIEW"),
+            InlineKeyboardButton("📡 Auto-Sync Groups", callback_data="ui_ALWAYS_VIEW")
+        ])
+        buttons.append([
+            InlineKeyboardButton("👁️ Monitor Findings", callback_data="ui_MONITOR_VIEW"),
+            InlineKeyboardButton("📋 Playlists", callback_data="ui_PLAYLISTS")
+        ])
+        buttons.append([
+            InlineKeyboardButton("🚀 Auto-Transfer Groups", callback_data="ui_AUTOTRANSFER_VIEW")
+        ])
+        buttons.append([
+            InlineKeyboardButton("▶️ Global Resume" if engine_state != ENGINE_RUNNING else "⏸️ Global Pause", callback_data="toggle_pause"),
+            InlineKeyboardButton("🛑 Clear Queues", callback_data="clear_queue")
+        ])
+
+    elif ui_state == "RELAY_VIEW":
+        text = f"🚀 **ZERO-DISK RELAYS ACTIVE ({len(active_relays)})**\n━━━━━━━━━━━━━━━━━━\n"
+        for job in active_relays:
+            filled = int(job['progress'] / 10)
+            bar = "🟩" * filled + "⬜" * (10 - filled)
+            text += f"▶️ **{job['name']}**\n↳ {bar} {job['progress']:.1f}% ({job['speed']})\n\n"
+            buttons.append([InlineKeyboardButton(f"💀 Kill {job['name']}", callback_data=f"kill_{job['job_id']}")])
+        if not active_relays: text += "No active zero-disk relay streams.\n"
+        buttons.append([InlineKeyboardButton("🔙 Back to Main", callback_data="ui_MAIN")])
+
+    elif ui_state == "SELECTED_VIEW":
+        groups = await db_execute("SELECT chat_id, chat_title, status FROM selected_monitors", fetch="all")
+        tags_rows = await db_execute("SELECT tag FROM selected_tags", fetch="all")
+        tags_list = [r[0] for r in tags_rows] if tags_rows else []
+
+        text = (f"🎯 **SELECTIVE MONITORS (/MonitorSelected)**\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🏷️ **Global Target Tags ({len(tags_list)}):**\n"
+                f"{', '.join(tags_list) if tags_list else '_No tags set yet_'}\n\n"
+                f"📱 **Monitored Groups ({len(groups or [])}):**\n")
+
+        for c_id, c_title, st in (groups or []):
+            pending_row = await db_execute("SELECT COUNT(*) FROM jobs WHERE chat_id=? AND status IN ('queued','waiting')", (c_id,), fetch="one")
+            p_cnt = pending_row[0] if pending_row else 0
+            text += f"• **{c_title}** (`{c_id}`)\n  Status: **{st}** | Pending Queue: `{p_cnt}` vids\n"
+            buttons.append([
+                InlineKeyboardButton(f"🔍 Scan History", callback_data=f"sel_scan_{c_id}"),
+                InlineKeyboardButton(f"⏸️ Pause" if st == "ACTIVE" else f"▶️ Proceed", callback_data=f"sel_pause_{c_id}" if st == "ACTIVE" else f"sel_proceed_{c_id}"),
+                InlineKeyboardButton(f"🛑 Stop", callback_data=f"sel_stop_{c_id}")
+            ])
+
+        buttons.append([
+            InlineKeyboardButton("➕ Add Group(s)", callback_data="sel_add_group"),
+            InlineKeyboardButton("🏷️ Add/Remove Tags", callback_data="sel_manage_tags")
+        ])
+        buttons.append([InlineKeyboardButton("🔙 Back to Main", callback_data="ui_MAIN")])
+
+    elif ui_state == "ALWAYS_VIEW":
+        rows = await db_execute("SELECT chat_id, chat_title, status FROM always_monitors", fetch="all")
+        text = "📡 **AUTO-SYNC MONITORS (/MonitorAlways)**\n━━━━━━━━━━━━━━━━━━\n"
+        for c_id, c_title, st in (rows or []):
+            text += f"• **{c_title}** (`{c_id}`)\n  Status: **{st}**\n\n"
+            if st == "ACTIVE":
+                buttons.append([InlineKeyboardButton(f"⏸️ Pause {c_title[:15]}", callback_data=f"always_pause_{c_id}"), InlineKeyboardButton(f"🛑 Stop", callback_data=f"always_stop_{c_id}")])
+            else:
+                buttons.append([InlineKeyboardButton(f"▶️ Proceed {c_title[:15]}", callback_data=f"always_proceed_{c_id}"), InlineKeyboardButton(f"🛑 Stop", callback_data=f"always_stop_{c_id}")])
+        buttons.append([InlineKeyboardButton("🔙 Back to Main", callback_data="ui_MAIN")])
+
+    elif ui_state == "AUTOTRANSFER_VIEW":
+        rows = await db_execute("SELECT chat_id, chat_title, status, delete_originals FROM autotransfer_monitors", fetch="all")
+        text = "🚀 **AUTO-TRANSFER GROUPS (/AutoTransfer)**\n━━━━━━━━━━━━━━━━━━\n"
+        for c_id, c_title, st, del_orig in (rows or []):
+            mode = "🗑️ Delete originals" if del_orig else "📋 Keep originals"
+            text += f"• **{c_title}** (`{c_id}`)\n  Status: **{st}** | {mode}\n\n"
+            if st == "ACTIVE":
+                buttons.append([InlineKeyboardButton(f"⏸️ Pause {c_title[:15]}", callback_data=f"atr_pause_{c_id}"), InlineKeyboardButton(f"🛑 Stop", callback_data=f"atr_stop_{c_id}")])
+            else:
+                buttons.append([InlineKeyboardButton(f"▶️ Proceed {c_title[:15]}", callback_data=f"atr_proceed_{c_id}"), InlineKeyboardButton(f"🛑 Stop", callback_data=f"atr_stop_{c_id}")])
+        buttons.append([InlineKeyboardButton("🔙 Back to Main", callback_data="ui_MAIN")])
+
+    elif ui_state == "MONITOR_VIEW":
+        total_tags_row = await db_execute("SELECT COUNT(DISTINCT tag) FROM monitored_messages WHERE is_queued=0", fetch="one")
+        total_tags = total_tags_row[0] if total_tags_row else 0
+        total_vids_row = await db_execute("SELECT COUNT(*) FROM monitored_messages WHERE is_queued=0", fetch="one")
+        total_vids = total_vids_row[0] if total_vids_row else 0
+
+        PAGE_SIZE = 5
+        max_pages = max(1, math.ceil(total_tags / PAGE_SIZE))
+        if monitor_page >= max_pages: monitor_page = max_pages - 1
+        if monitor_page < 0: monitor_page = 0
+
+        tags_data = await db_execute(
+            "SELECT tag, COUNT(*) as cnt FROM monitored_messages WHERE is_queued=0 GROUP BY tag ORDER BY cnt DESC LIMIT ? OFFSET ?",
+            (PAGE_SIZE, monitor_page * PAGE_SIZE), fetch="all"
+        )
+
+        text = f"👁️ **MONITOR FINDINGS** (Page {monitor_page + 1} of {max_pages})\nTotal Tags: {total_tags} | Unqueued: {total_vids}\n━━━━━━━━━━━━━━━━━━\n"
+        for tag, cnt in (tags_data or []):
+            buttons.append([InlineKeyboardButton(f"🚀 Queue {tag} ({cnt} vids)", callback_data=f"mon_inspect_{tag}")])
+
+        nav_row = []
+        if monitor_page > 0: nav_row.append(InlineKeyboardButton("◀️ Prev", callback_data="mon_prev_page"))
+        nav_row.append(InlineKeyboardButton(f"Page {monitor_page + 1}/{max_pages}", callback_data="noop"))
+        if monitor_page < max_pages - 1: nav_row.append(InlineKeyboardButton("Next ▶️", callback_data="mon_next_page"))
+        if nav_row: buttons.append(nav_row)
+
+        buttons.append([InlineKeyboardButton("🔍 Search Tag", callback_data="mon_search_prompt")])
+        buttons.append([InlineKeyboardButton("🔙 Back to Main", callback_data="ui_MAIN")])
+
+    elif ui_state.startswith("MON_INSPECT_"):
+        tag = ui_state.replace("MON_INSPECT_", "")
+        tg_total_row = await db_execute("SELECT COUNT(*) FROM monitored_messages WHERE tag=?", (tag,), fetch="one")
+        tg_total = tg_total_row[0] if tg_total_row else 0
+        album_name = tag.replace("#", "")
+        album_id = await get_or_create_vk_album(album_name)
+        vk_count = len(await refresh_vk_cache(album_id)) if album_id else 0
+        will_add = max(0, tg_total - vk_count)
+
+        text = f"🔍 **HASHTAG DETAILS: {tag}**\n━━━━━━━━━━━━━━━━━━\n📱 Telegram Found: {tg_total}\n✅ Already in VK: {vk_count}\n📥 Will Queue: {will_add}\n━━━━━━━━━━━━━━━━━━\n"
+        buttons.append([InlineKeyboardButton(f"🚀 Queue {will_add} Videos", callback_data=f"mon_queue_tag_{tag}")])
+        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="ui_MONITOR_VIEW")])
+
+    elif ui_state == "PLAYLISTS":
+        rows = await list_playlists()
+        text = "📋 **PLAYLISTS**\n━━━━━━━━━━━━━━━━━━\n"
+        if not rows: text += "No playlists yet.\n"
+        for pid, album_name, status, total, completed, failed, skipped in rows:
+            text += f"• **{album_name}** — {status} ({completed}/{total})\n\n"
+            if status == "WAITING_CONFIRMATION":
+                buttons.append([InlineKeyboardButton(f"▶️ Continue {album_name}", callback_data=f"plcontinue_{pid}"), InlineKeyboardButton("💀 Kill", callback_data=f"plkill_{pid}")])
+            elif status in ("PILOT_RUNNING", "RUNNING"):
+                buttons.append([InlineKeyboardButton(f"💀 Kill {album_name}", callback_data=f"plkill_{pid}")])
+        buttons.append([InlineKeyboardButton("🔙 Back to Main", callback_data="ui_MAIN")])
+
+    try:
+        await bot_app.edit_message_text(chat_id=int(chat_id), message_id=int(msg_id), text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
+    except Exception:
+        pass
+
+async def dashboard_updater():
+    global engine_state
+    while True:
+        await asyncio.sleep(4)
+        if engine_state == ENGINE_PAUSE_REQUESTED:
+            if relay_queue.empty() and not any(j['action'] == "🚀 RELAY" for j in active_jobs.values()):
+                engine_state = ENGINE_PAUSED
+                await set_control("engine_state", ENGINE_PAUSED)
+        await render_dashboard()
+
+
+# ============================================================
+# CHAPTER 8: BOT COMMANDS, EVENT HANDLERS & MAIN STARTUP
+# ============================================================
+
+@bot_app.on_message(filters.command("start"))
+async def start_cmd(client, message):
+    msg = await message.reply_text(UI_STRINGS["booting"])
+    try: await msg.pin(both_sides=True)
+    except: pass
+    await set_control("dashboard_chat_id", message.chat.id)
+    await set_control("dashboard_msg_id", msg.id)
+    global ui_state
+    ui_state = "MAIN"
+    await render_dashboard()
+
+@bot_app.on_message(filters.command("refresh"))
+async def refresh_cmd(client, message):
+    global engine_state
+    status_msg = await message.reply_text(UI_STRINGS["refresh_step_1"], parse_mode=ParseMode.MARKDOWN)
+    prev_state = engine_state
+    engine_state = ENGINE_PAUSE_REQUESTED
+    pause_event.clear()
+    await asyncio.sleep(1)
+
+    while not relay_queue.empty(): relay_queue.get_nowait(); relay_queue.task_done()
+    while not download_queue_t1.empty(): download_queue_t1.get_nowait(); download_queue_t1.task_done()
+    while not download_queue_t2.empty(): download_queue_t2.get_nowait(); download_queue_t2.task_done()
+    while not upload_queue.empty(): upload_queue.get_nowait(); upload_queue.task_done()
+
+    playlist_queues.clear()
+    playlist_order.clear()
+    cancelled_jobs.clear()
+    vk_video_title_cache.clear()
+    vk_album_name_cache.clear()
+
+    await db_execute("DELETE FROM jobs WHERE status != 'done'")
+    await db_execute("UPDATE monitored_messages SET is_queued=0")
+
+    synced_cnt, dupes_cnt, broken_cnt = await sync_vk_to_local_db()
+
+    engine_state = ENGINE_RUNNING if prev_state == ENGINE_RUNNING else prev_state
+    if engine_state == ENGINE_RUNNING: pause_event.set()
+
+    await status_msg.edit_text(
+        f"✅ **System & VK Sync Refresh Complete!**\n\n"
+        f"• **Live VK Videos Indexed:** `{synced_cnt}`\n"
+        f"• **Duplicates Purged:** `{dupes_cnt}`\n"
+        f"• **Broken Videos Cleaned:** `{broken_cnt}`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    await render_dashboard()
+
+@bot_app.on_message(filters.command("setmasterforum"))
+async def set_master_forum_cmd(client, message):
+    if message.chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP):
+        full_chat = await client.get_chat(message.chat.id)
+        forum_id = full_chat.id
+        if not getattr(full_chat, "is_forum", False):
+            return await message.reply_text("⚠️ **Topics are not enabled here.** Enable Topics in group settings first.")
+    else:
+        if len(message.command) < 2:
+            return await message.reply_text("Usage in DM: `/setmasterforum <chat_id>`")
+        forum_id = message.command[1].strip()
+
+    await set_control("master_forum_id", str(forum_id))
+    await message.reply_text(UI_STRINGS["topic_set"].format(forum_id=forum_id), parse_mode=ParseMode.MARKDOWN)
+
+@user_app.on_message(filters.video | filters.document)
+async def live_monitor_handler(client, message):
+    chat_id = message.chat.id
+    txt = message.caption or message.text or ""
+    f_id = message.video.file_unique_id if message.video else (message.document.file_unique_id if message.document else "")
+    await extract_and_store_message(chat_id, message.id, txt, f_id)
+
+    always_row = await db_execute("SELECT status FROM always_monitors WHERE chat_id=?", (chat_id,), fetch="one")
+    if always_row and always_row[0] == "ACTIVE":
+        tag_clean = extract_first_tag(txt)
+        if tag_clean:
+            album_id = await get_or_create_vk_album(tag_clean)
+            if album_id and not await vk_title_exists(album_id, display_title(tag_clean, 1, txt, message.id)) and not await is_msg_in_db(chat_id, message.id):
+                job = {
+                    'job_id': f"{chat_id}_{message.id}", 'playlist_id': None, 'chat_id': chat_id,
+                    'msg_chat_id': chat_id, 'msg_id': message.id, 'album_id': album_id,
+                    'album_name': tag_clean, 'query': f"#{tag_clean}", 'idx': 1,
+                    'is_pilot': False, 'status': 'queued', 'file_path': None, 'caption': txt, 'tier': 2, 'is_zero_disk': 1
+                }
+                await save_job(job)
+                await relay_queue.put(job)
+
+@bot_app.on_callback_query()
+async def handle_buttons(client, callback):
+    global engine_state, ui_state, monitor_page
+    chat_id = callback.message.chat.id
+    data = callback.data
+
+    if data.startswith("ui_"):
+        ui_state = data.replace("ui_", "")
+        await render_dashboard()
+        return await callback.answer()
+    elif data == "noop":
+        return await callback.answer()
+    elif data.startswith("kill_"):
+        job_id = data.replace("kill_", "")
+        cancelled_jobs.add(job_id)
+        await update_job_status(job_id, "cancelled")
+        await callback.answer("💀 Poison pill dropped. Job aborting...", show_alert=True)
+        await render_dashboard()
+    elif data == "toggle_pause":
+        if engine_state == ENGINE_RUNNING:
+            engine_state = ENGINE_PAUSE_REQUESTED
+            pause_event.clear()
+            await set_control("engine_state", ENGINE_PAUSE_REQUESTED)
+            await callback.answer("🟡 Pause requested...")
+        else:
+            engine_state = ENGINE_RUNNING
+            pause_event.set()
+            await set_control("engine_state", ENGINE_RUNNING)
+            await callback.answer("▶️ Resumed")
+        await render_dashboard()
+    elif data == "clear_queue":
+        cleared = 0
+        while not relay_queue.empty():
+            job = relay_queue.get_nowait()
+            relay_queue.task_done()
+            cancelled_jobs.add(job['job_id'])
+            await delete_job_row(job['job_id'])
+            cleared += 1
+        await render_dashboard()
+        await callback.answer(f"Cleared {cleared} pending jobs.", show_alert=True)
+
+async def main():
+    global engine_state
+    await user_app.start()
+    await bot_app.start()
+
+    await bot_app.set_bot_commands([
+        BotCommand("start", "⚙️ Master Dashboard"),
+        BotCommand("refresh", "🔄 Refresh DB & Resync VK"),
+        BotCommand("setmasterforum", "🏷️ Set Master Forum Topic Hub")
+    ])
+
+    await sync_vk_to_local_db()
+    console.print("[bold green]✅ BotFather command menu set.[/bold green]")
+
+    saved_state = await get_control("engine_state", ENGINE_RUNNING)
+    engine_state = saved_state if saved_state in (ENGINE_RUNNING, ENGINE_PAUSED) else ENGINE_RUNNING
+    if engine_state != ENGINE_RUNNING: pause_event.clear()
+
+    dashboard_chat_id = await get_control("dashboard_chat_id")
+    if dashboard_chat_id:
+        try:
+            dash_msg = await bot_app.send_message(chat_id=int(dashboard_chat_id), text="⚙️ **System Online / Hybrid Zero-Disk Ready**", parse_mode=ParseMode.MARKDOWN)
+            try: await dash_msg.pin(both_sides=True)
+            except: pass
+            await set_control("dashboard_msg_id", dash_msg.id)
+        except Exception: pass
+
+    # Startup worker allocations
+    asyncio.create_task(dashboard_updater())
+    asyncio.create_task(scheduler_loop())
+    
+    for i in range(MAX_RELAY_WORKERS): asyncio.create_task(relay_worker(i))
+    for i in range(DL_WORKERS): asyncio.create_task(download_worker(i))
+    for i in range(UP_WORKERS): asyncio.create_task(upload_worker(i))
+
+    with Live(progress_ui, console=console, refresh_per_second=4):
+        console.print("[bold green]🚀 Master Hybrid Engine Online.[/bold green]")
+        await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
