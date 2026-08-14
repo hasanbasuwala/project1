@@ -397,7 +397,8 @@ _expanded_jid = None
 
 # --- In-Memory Session State ---
 _scan_sessions = {}          # /scan community scan
-_hashtag_scan_sessions = {}  # /scan #Tag wall search
+_hashtag_scan_pending = {}   # Chat ID -> List of pending tags waiting for a URL
+_hashtag_scan_results = {}   # Bot Message ID -> Session data for concurrent scanning
 _deepscan_sessions = {}      # /deepscan #Tag all-communities search
 _autoscan_wizard_sessions = {}  # /autoscan setup wizard: chat_id -> {'stage','tags','comms','setup_msg_id'}
 _autoscan_pending = {}          # dashboard quick add: chat_id -> 'add_tag' | 'add_comm' (plain string, single-shot)
