@@ -1829,7 +1829,7 @@ async def upload_worker(worker_id):
 
 def _engine_banner():
     if engine_state == ENGINE_RUNNING:
-        return "⚡ RUNNING (Hybrid Zero-Disk + Fallback)"
+        return "⚡ RUNNING"
     if engine_state == ENGINE_PAUSE_REQUESTED:
         return "🟡 Pause Requested — draining active transfers..."
     return "⏸️ PAUSED"
@@ -1841,7 +1841,10 @@ async def render_dashboard():
 
     global monitor_page
     scheduled_pending = sum(len(v) for v in playlist_queues.values())
-    queued_total = relay_queue.qsize() + download_queue_t1.qsize() + download_queue_t2.qsize() + scheduled_pending
+    
+    # Unified Queue Metrics
+    queued_relay = relay_queue.qsize() + scheduled_pending
+    queued_dl = download_queue_t1.qsize() + download_queue_t2.qsize()
     staged_up = upload_queue.qsize()
     
     active_relays = [j for j in active_jobs.values() if j['action'] == "🚀 RELAY"]
@@ -1867,16 +1870,16 @@ async def render_dashboard():
         autotransfer_count = await db_execute("SELECT COUNT(*) FROM autotransfer_monitors WHERE status='ACTIVE'", fetch="one")
         at_count = autotransfer_count[0] if autotransfer_count else 0
 
-        text = (f"{UI_STRINGS['dashboard_header']}\n{_engine_banner()} | 💾 Free Disk: {free_space_gb():.1f} GB\n"
+        text = (f"{UI_STRINGS['dashboard_header']}\n"
+                f"{_engine_banner()} | 💾 Free Disk: {free_space_gb():.1f} GB\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f"🚀 **Zero-Disk Relays Active:** {len(active_relays)} | Queued: {queued_total}\n"
-                f"📥 **Fallback Downloads:** {len(active_dls)} Active\n"
+                f"🚀 **Zero-Disk Relay:** {len(active_relays)} Active | {queued_relay} Queued\n"
+                f"📥 **Disk Download:** {len(active_dls)} Active | {queued_dl} Queued\n"
                 f"📦 **Staged on Disk:** {staged_up} Files\n"
-                f"📤 **Fallback Uploads:** {len(active_ups)} Active\n"
-                f"👁️ **Monitored Chats:** {m_count} Active\n"
-                f"📡 **Auto-Sync Groups:** {a_count} Active\n"
-                f"🎯 **Selective Monitors:** {s_count} Active | {t_count} Tags\n"
-                f"🚀 **Auto-Transfer Groups:** {at_count} Active\n"
+                f"📤 **Disk Upload:** {len(active_ups)} Active\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"👁️ **Monitors:** {m_count} Active | 📡 **Auto-Sync:** {a_count} Active\n"
+                f"🎯 **Selective:** {s_count} Active | 🚀 **Auto-Transfer:** {at_count} Active\n"
                 f"━━━━━━━━━━━━━━━━━━\n")
 
         waiting_playlists = await db_execute(
@@ -1894,8 +1897,11 @@ async def render_dashboard():
             text += "━━━━━━━━━━━━━━━━━━\n"
 
         buttons.append([
-            InlineKeyboardButton(f"🚀 Relays ({len(active_relays)})", callback_data="ui_RELAY_VIEW"),
-            InlineKeyboardButton(f"📥 DLs ({len(active_dls)}) | UPs ({len(active_ups)})", callback_data="ui_UP_VIEW")
+            InlineKeyboardButton(f"🚀 View Relays ({len(active_relays)})", callback_data="ui_RELAY_VIEW")
+        ])
+        buttons.append([
+            InlineKeyboardButton(f"📥 View DLs ({len(active_dls)})", callback_data="ui_DL_VIEW"),
+            InlineKeyboardButton(f"📤 View UPs ({len(active_ups)})", callback_data="ui_UP_VIEW")
         ])
         buttons.append([
             InlineKeyboardButton("🎯 Selective Sync", callback_data="ui_SELECTED_VIEW"),
@@ -1913,14 +1919,26 @@ async def render_dashboard():
             InlineKeyboardButton("🛑 Clear Queues", callback_data="clear_queue")
         ])
 
-    elif ui_state == "RELAY_VIEW":
-        text = f"🚀 **ZERO-DISK RELAYS ACTIVE ({len(active_relays)})**\n━━━━━━━━━━━━━━━━━━\n"
-        for job in active_relays:
+    elif ui_state in ["RELAY_VIEW", "DL_VIEW", "UP_VIEW"]:
+        if ui_state == "RELAY_VIEW":
+            target_list = active_relays
+            icon = "🚀 ZERO-DISK RELAYING"
+        elif ui_state == "DL_VIEW":
+            target_list = active_dls
+            icon = "📥 DOWNLOADING"
+        else:
+            target_list = active_ups
+            icon = "📤 UPLOADING"
+            
+        text = f"{icon} **({len(target_list)} Active Workers)**\n━━━━━━━━━━━━━━━━━━\n"
+
+        for job in target_list:
             filled = int(job['progress'] / 10)
             bar = "🟩" * filled + "⬜" * (10 - filled)
             text += f"▶️ **{job['name']}**\n↳ {bar} {job['progress']:.1f}% ({job['speed']})\n\n"
             buttons.append([InlineKeyboardButton(f"💀 Kill {job['name']}", callback_data=f"kill_{job['job_id']}")])
-        if not active_relays: text += "No active zero-disk relay streams.\n"
+
+        if not target_list: text += "No active jobs in this category.\n"
         buttons.append([InlineKeyboardButton("🔙 Back to Main", callback_data="ui_MAIN")])
 
     elif ui_state == "SELECTED_VIEW":
@@ -1934,10 +1952,13 @@ async def render_dashboard():
                 f"{', '.join(tags_list) if tags_list else '_No tags set yet_'}\n\n"
                 f"📱 **Monitored Groups ({len(groups or [])}):**\n")
 
+        if not groups: text += "_No selective groups configured yet._\n"
+
         for c_id, c_title, st in (groups or []):
             pending_row = await db_execute("SELECT COUNT(*) FROM jobs WHERE chat_id=? AND status IN ('queued','waiting')", (c_id,), fetch="one")
             p_cnt = pending_row[0] if pending_row else 0
             text += f"• **{c_title}** (`{c_id}`)\n  Status: **{st}** | Pending Queue: `{p_cnt}` vids\n"
+            
             buttons.append([
                 InlineKeyboardButton(f"🔍 Scan History", callback_data=f"sel_scan_{c_id}"),
                 InlineKeyboardButton(f"⏸️ Pause" if st == "ACTIVE" else f"▶️ Proceed", callback_data=f"sel_pause_{c_id}" if st == "ACTIVE" else f"sel_proceed_{c_id}"),
@@ -1953,24 +1974,42 @@ async def render_dashboard():
     elif ui_state == "ALWAYS_VIEW":
         rows = await db_execute("SELECT chat_id, chat_title, status FROM always_monitors", fetch="all")
         text = "📡 **AUTO-SYNC MONITORS (/MonitorAlways)**\n━━━━━━━━━━━━━━━━━━\n"
+        if not rows: text += "No continuous auto-sync monitors configured yet.\n"
+        
         for c_id, c_title, st in (rows or []):
-            text += f"• **{c_title}** (`{c_id}`)\n  Status: **{st}**\n\n"
+            pending_row = await db_execute("SELECT COUNT(*) FROM jobs WHERE chat_id=? AND status IN ('queued','waiting')", (c_id,), fetch="one")
+            p_cnt = pending_row[0] if pending_row else 0
+            text += f"• **{c_title}** (`{c_id}`)\n  Status: **{st}** | Pending Queue: `{p_cnt}` vids\n\n"
             if st == "ACTIVE":
-                buttons.append([InlineKeyboardButton(f"⏸️ Pause {c_title[:15]}", callback_data=f"always_pause_{c_id}"), InlineKeyboardButton(f"🛑 Stop", callback_data=f"always_stop_{c_id}")])
+                buttons.append([
+                    InlineKeyboardButton(f"⏸️ Pause {c_title[:15]}", callback_data=f"always_pause_{c_id}"),
+                    InlineKeyboardButton(f"🛑 Stop Sync", callback_data=f"always_stop_{c_id}")
+                ])
             else:
-                buttons.append([InlineKeyboardButton(f"▶️ Proceed {c_title[:15]}", callback_data=f"always_proceed_{c_id}"), InlineKeyboardButton(f"🛑 Stop", callback_data=f"always_stop_{c_id}")])
+                buttons.append([
+                    InlineKeyboardButton(f"▶️ Proceed {c_title[:15]}", callback_data=f"always_proceed_{c_id}"),
+                    InlineKeyboardButton(f"🛑 Stop Sync", callback_data=f"always_stop_{c_id}")
+                ])
         buttons.append([InlineKeyboardButton("🔙 Back to Main", callback_data="ui_MAIN")])
 
     elif ui_state == "AUTOTRANSFER_VIEW":
         rows = await db_execute("SELECT chat_id, chat_title, status, delete_originals FROM autotransfer_monitors", fetch="all")
         text = "🚀 **AUTO-TRANSFER GROUPS (/AutoTransfer)**\n━━━━━━━━━━━━━━━━━━\n"
+        if not rows: text += "No auto-transfer monitors configured yet.\n"
+
         for c_id, c_title, st, del_orig in (rows or []):
             mode = "🗑️ Delete originals" if del_orig else "📋 Keep originals"
             text += f"• **{c_title}** (`{c_id}`)\n  Status: **{st}** | {mode}\n\n"
             if st == "ACTIVE":
-                buttons.append([InlineKeyboardButton(f"⏸️ Pause {c_title[:15]}", callback_data=f"atr_pause_{c_id}"), InlineKeyboardButton(f"🛑 Stop", callback_data=f"atr_stop_{c_id}")])
+                buttons.append([
+                    InlineKeyboardButton(f"⏸️ Pause {c_title[:15]}", callback_data=f"atr_pause_{c_id}"),
+                    InlineKeyboardButton(f"🛑 Stop", callback_data=f"atr_stop_{c_id}")
+                ])
             else:
-                buttons.append([InlineKeyboardButton(f"▶️ Proceed {c_title[:15]}", callback_data=f"atr_proceed_{c_id}"), InlineKeyboardButton(f"🛑 Stop", callback_data=f"atr_stop_{c_id}")])
+                buttons.append([
+                    InlineKeyboardButton(f"▶️ Proceed {c_title[:15]}", callback_data=f"atr_proceed_{c_id}"),
+                    InlineKeyboardButton(f"🛑 Stop", callback_data=f"atr_stop_{c_id}")
+                ])
         buttons.append([InlineKeyboardButton("🔙 Back to Main", callback_data="ui_MAIN")])
 
     elif ui_state == "MONITOR_VIEW":
@@ -1989,7 +2028,10 @@ async def render_dashboard():
             (PAGE_SIZE, monitor_page * PAGE_SIZE), fetch="all"
         )
 
-        text = f"👁️ **MONITOR FINDINGS** (Page {monitor_page + 1} of {max_pages})\nTotal Tags: {total_tags} | Unqueued: {total_vids}\n━━━━━━━━━━━━━━━━━━\n"
+        text = (f"👁️ **MONITOR FINDINGS** (Page {monitor_page + 1} of {max_pages})\n"
+                f"Total Tags Discovered: {total_tags} | Unqueued Videos: {total_vids}\n"
+                f"━━━━━━━━━━━━━━━━━━\n")
+
         for tag, cnt in (tags_data or []):
             buttons.append([InlineKeyboardButton(f"🚀 Queue {tag} ({cnt} vids)", callback_data=f"mon_inspect_{tag}")])
 
@@ -2006,29 +2048,64 @@ async def render_dashboard():
         tag = ui_state.replace("MON_INSPECT_", "")
         tg_total_row = await db_execute("SELECT COUNT(*) FROM monitored_messages WHERE tag=?", (tag,), fetch="one")
         tg_total = tg_total_row[0] if tg_total_row else 0
+
+        meta_row = await db_execute("SELECT last_seen_count FROM monitored_tags_meta WHERE tag=?", (tag,), fetch="one")
+        last_seen = meta_row[0] if meta_row else tg_total
+        delta_new = max(0, tg_total - last_seen)
+
         album_name = tag.replace("#", "")
         album_id = await get_or_create_vk_album(album_name)
-        vk_count = len(await refresh_vk_cache(album_id)) if album_id else 0
+        
+        vk_count = 0
+        if album_id:
+            await refresh_vk_cache(album_id)
+            titles = vk_video_title_cache.get(album_id, set())
+            vk_count = len(titles)
+
         will_add = max(0, tg_total - vk_count)
 
-        text = f"🔍 **HASHTAG DETAILS: {tag}**\n━━━━━━━━━━━━━━━━━━\n📱 Telegram Found: {tg_total}\n✅ Already in VK: {vk_count}\n📥 Will Queue: {will_add}\n━━━━━━━━━━━━━━━━━━\n"
-        buttons.append([InlineKeyboardButton(f"🚀 Queue {will_add} Videos", callback_data=f"mon_queue_tag_{tag}")])
-        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="ui_MONITOR_VIEW")])
+        text = (f"🔍 **HASHTAG DETAILS: {tag}**\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📱 Telegram Total Found: {tg_total} videos\n"
+                f"🆕 Added in Telegram since last check: +{delta_new} videos\n\n"
+                f"🌐 **VK Status Breakdown:**\n"
+                f"✅ Already in VK: {vk_count} videos\n"
+                f"📥 Will be Added to VK: {will_add} videos\n"
+                f"━━━━━━━━━━━━━━━━━━\n")
+
+        await db_execute(
+            "INSERT INTO monitored_tags_meta (tag, last_seen_count, last_checked_at) VALUES (?,?,?) ON CONFLICT(tag) DO UPDATE SET last_seen_count=excluded.last_seen_count, last_checked_at=excluded.last_checked_at",
+            (tag, tg_total, time.time())
+        )
+        buttons.append([InlineKeyboardButton(f"🚀 Queue {will_add} Videos for VK", callback_data=f"mon_queue_tag_{tag}")])
+        buttons.append([InlineKeyboardButton("🔙 Back to Findings", callback_data="ui_MONITOR_VIEW")])
 
     elif ui_state == "PLAYLISTS":
         rows = await list_playlists()
         text = "📋 **PLAYLISTS**\n━━━━━━━━━━━━━━━━━━\n"
         if not rows: text += "No playlists yet.\n"
         for pid, album_name, status, total, completed, failed, skipped in rows:
-            text += f"• **{album_name}** — {status} ({completed}/{total})\n\n"
+            text += f"• **{album_name}** — {status}\n  {completed}/{total} done"
+            if failed: text += f", {failed} failed"
+            if skipped: text += f", {skipped} skipped (dupes)"
+            text += "\n\n"
             if status == "WAITING_CONFIRMATION":
-                buttons.append([InlineKeyboardButton(f"▶️ Continue {album_name}", callback_data=f"plcontinue_{pid}"), InlineKeyboardButton("💀 Kill", callback_data=f"plkill_{pid}")])
-            elif status in ("PILOT_RUNNING", "RUNNING"):
+                buttons.append([
+                    InlineKeyboardButton(f"▶️ Continue {album_name}", callback_data=f"plcontinue_{pid}"),
+                    InlineKeyboardButton("💀 Kill", callback_data=f"plkill_{pid}")
+                ])
+            elif status in ("PILOT_RUNNING", "RUNNING", "WAITING"):
                 buttons.append([InlineKeyboardButton(f"💀 Kill {album_name}", callback_data=f"plkill_{pid}")])
         buttons.append([InlineKeyboardButton("🔙 Back to Main", callback_data="ui_MAIN")])
 
     try:
-        await bot_app.edit_message_text(chat_id=int(chat_id), message_id=int(msg_id), text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
+        await bot_app.edit_message_text(
+            chat_id=int(chat_id),
+            message_id=int(msg_id),
+            text=text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
     except Exception:
         pass
 
@@ -2037,181 +2114,9 @@ async def dashboard_updater():
     while True:
         await asyncio.sleep(4)
         if engine_state == ENGINE_PAUSE_REQUESTED:
-            if relay_queue.empty() and not any(j['action'] == "🚀 RELAY" for j in active_jobs.values()):
+            no_active = not any(j['action'] in ("📥 DL", "📤 UP", "🚀 RELAY") for j in active_jobs.values())
+            if no_active and upload_queue.empty():
                 engine_state = ENGINE_PAUSED
                 await set_control("engine_state", ENGINE_PAUSED)
         await render_dashboard()
-
-
-# ============================================================
-# CHAPTER 8: BOT COMMANDS, EVENT HANDLERS & MAIN STARTUP
-# ============================================================
-
-@bot_app.on_message(filters.command("start"))
-async def start_cmd(client, message):
-    msg = await message.reply_text(UI_STRINGS["booting"])
-    try: await msg.pin(both_sides=True)
-    except: pass
-    await set_control("dashboard_chat_id", message.chat.id)
-    await set_control("dashboard_msg_id", msg.id)
-    global ui_state
-    ui_state = "MAIN"
-    await render_dashboard()
-
-@bot_app.on_message(filters.command("refresh"))
-async def refresh_cmd(client, message):
-    global engine_state
-    status_msg = await message.reply_text(UI_STRINGS["refresh_step_1"], parse_mode=ParseMode.MARKDOWN)
-    prev_state = engine_state
-    engine_state = ENGINE_PAUSE_REQUESTED
-    pause_event.clear()
-    await asyncio.sleep(1)
-
-    while not relay_queue.empty(): relay_queue.get_nowait(); relay_queue.task_done()
-    while not download_queue_t1.empty(): download_queue_t1.get_nowait(); download_queue_t1.task_done()
-    while not download_queue_t2.empty(): download_queue_t2.get_nowait(); download_queue_t2.task_done()
-    while not upload_queue.empty(): upload_queue.get_nowait(); upload_queue.task_done()
-
-    playlist_queues.clear()
-    playlist_order.clear()
-    cancelled_jobs.clear()
-    vk_video_title_cache.clear()
-    vk_album_name_cache.clear()
-
-    await db_execute("DELETE FROM jobs WHERE status != 'done'")
-    await db_execute("UPDATE monitored_messages SET is_queued=0")
-
-    synced_cnt, dupes_cnt, broken_cnt = await sync_vk_to_local_db()
-
-    engine_state = ENGINE_RUNNING if prev_state == ENGINE_RUNNING else prev_state
-    if engine_state == ENGINE_RUNNING: pause_event.set()
-
-    await status_msg.edit_text(
-        f"✅ **System & VK Sync Refresh Complete!**\n\n"
-        f"• **Live VK Videos Indexed:** `{synced_cnt}`\n"
-        f"• **Duplicates Purged:** `{dupes_cnt}`\n"
-        f"• **Broken Videos Cleaned:** `{broken_cnt}`",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    await render_dashboard()
-
-@bot_app.on_message(filters.command("setmasterforum"))
-async def set_master_forum_cmd(client, message):
-    if message.chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP):
-        full_chat = await client.get_chat(message.chat.id)
-        forum_id = full_chat.id
-        if not getattr(full_chat, "is_forum", False):
-            return await message.reply_text("⚠️ **Topics are not enabled here.** Enable Topics in group settings first.")
-    else:
-        if len(message.command) < 2:
-            return await message.reply_text("Usage in DM: `/setmasterforum <chat_id>`")
-        forum_id = message.command[1].strip()
-
-    await set_control("master_forum_id", str(forum_id))
-    await message.reply_text(UI_STRINGS["topic_set"].format(forum_id=forum_id), parse_mode=ParseMode.MARKDOWN)
-
-@user_app.on_message(filters.video | filters.document)
-async def live_monitor_handler(client, message):
-    chat_id = message.chat.id
-    txt = message.caption or message.text or ""
-    f_id = message.video.file_unique_id if message.video else (message.document.file_unique_id if message.document else "")
-    await extract_and_store_message(chat_id, message.id, txt, f_id)
-
-    always_row = await db_execute("SELECT status FROM always_monitors WHERE chat_id=?", (chat_id,), fetch="one")
-    if always_row and always_row[0] == "ACTIVE":
-        tag_clean = extract_first_tag(txt)
-        if tag_clean:
-            album_id = await get_or_create_vk_album(tag_clean)
-            if album_id and not await vk_title_exists(album_id, display_title(tag_clean, 1, txt, message.id)) and not await is_msg_in_db(chat_id, message.id):
-                job = {
-                    'job_id': f"{chat_id}_{message.id}", 'playlist_id': None, 'chat_id': chat_id,
-                    'msg_chat_id': chat_id, 'msg_id': message.id, 'album_id': album_id,
-                    'album_name': tag_clean, 'query': f"#{tag_clean}", 'idx': 1,
-                    'is_pilot': False, 'status': 'queued', 'file_path': None, 'caption': txt, 'tier': 2, 'is_zero_disk': 1
-                }
-                await save_job(job)
-                await relay_queue.put(job)
-
-@bot_app.on_callback_query()
-async def handle_buttons(client, callback):
-    global engine_state, ui_state, monitor_page
-    chat_id = callback.message.chat.id
-    data = callback.data
-
-    if data.startswith("ui_"):
-        ui_state = data.replace("ui_", "")
-        await render_dashboard()
-        return await callback.answer()
-    elif data == "noop":
-        return await callback.answer()
-    elif data.startswith("kill_"):
-        job_id = data.replace("kill_", "")
-        cancelled_jobs.add(job_id)
-        await update_job_status(job_id, "cancelled")
-        await callback.answer("💀 Poison pill dropped. Job aborting...", show_alert=True)
-        await render_dashboard()
-    elif data == "toggle_pause":
-        if engine_state == ENGINE_RUNNING:
-            engine_state = ENGINE_PAUSE_REQUESTED
-            pause_event.clear()
-            await set_control("engine_state", ENGINE_PAUSE_REQUESTED)
-            await callback.answer("🟡 Pause requested...")
-        else:
-            engine_state = ENGINE_RUNNING
-            pause_event.set()
-            await set_control("engine_state", ENGINE_RUNNING)
-            await callback.answer("▶️ Resumed")
-        await render_dashboard()
-    elif data == "clear_queue":
-        cleared = 0
-        while not relay_queue.empty():
-            job = relay_queue.get_nowait()
-            relay_queue.task_done()
-            cancelled_jobs.add(job['job_id'])
-            await delete_job_row(job['job_id'])
-            cleared += 1
-        await render_dashboard()
-        await callback.answer(f"Cleared {cleared} pending jobs.", show_alert=True)
-
-async def main():
-    global engine_state
-    await user_app.start()
-    await bot_app.start()
-
-    await bot_app.set_bot_commands([
-        BotCommand("start", "⚙️ Master Dashboard"),
-        BotCommand("refresh", "🔄 Refresh DB & Resync VK"),
-        BotCommand("setmasterforum", "🏷️ Set Master Forum Topic Hub")
-    ])
-
-    await sync_vk_to_local_db()
-    console.print("[bold green]✅ BotFather command menu set.[/bold green]")
-
-    saved_state = await get_control("engine_state", ENGINE_RUNNING)
-    engine_state = saved_state if saved_state in (ENGINE_RUNNING, ENGINE_PAUSED) else ENGINE_RUNNING
-    if engine_state != ENGINE_RUNNING: pause_event.clear()
-
-    dashboard_chat_id = await get_control("dashboard_chat_id")
-    if dashboard_chat_id:
-        try:
-            dash_msg = await bot_app.send_message(chat_id=int(dashboard_chat_id), text="⚙️ **System Online / Hybrid Zero-Disk Ready**", parse_mode=ParseMode.MARKDOWN)
-            try: await dash_msg.pin(both_sides=True)
-            except: pass
-            await set_control("dashboard_msg_id", dash_msg.id)
-        except Exception: pass
-
-    # Startup worker allocations
-    asyncio.create_task(dashboard_updater())
-    asyncio.create_task(scheduler_loop())
-    
-    for i in range(MAX_RELAY_WORKERS): asyncio.create_task(relay_worker(i))
-    for i in range(DL_WORKERS): asyncio.create_task(download_worker(i))
-    for i in range(UP_WORKERS): asyncio.create_task(upload_worker(i))
-
-    with Live(progress_ui, console=console, refresh_per_second=4):
-        console.print("[bold green]🚀 Master Hybrid Engine Online.[/bold green]")
-        await asyncio.Event().wait()
-
-if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+        
