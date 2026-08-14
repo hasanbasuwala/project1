@@ -2170,8 +2170,10 @@ async def refresh_cmd(client, message):
     await db_execute("DELETE FROM jobs WHERE status != 'done'")
     await db_execute("UPDATE monitored_messages SET is_queued=0")
 
-    await status_msg.edit_text("🔄 **Initiating System & VK Database Refresh...**\n`[3/5]` Querying live VK catalog & purging broken/duplicate videos...", parse_mode=ParseMode.MARKDOWN)
-    synced_cnt, dupes_cnt, broken_cnt = await sync_vk_to_local_db()
+    await status_msg.edit_text("🔄 **Initiating System & VK Database Refresh...**\n`[3/5]` Querying live VK catalog & finding broken/duplicate videos...", parse_mode=ParseMode.MARKDOWN)
+    
+    # Capture the pending purges instead of deleted counts
+    synced_cnt, pending_purges = await sync_vk_to_local_db()
 
     await status_msg.edit_text("🔄 **Initiating System & VK Database Refresh...**\n`[4/5]` Resynchronizing monitored tags with database...", parse_mode=ParseMode.MARKDOWN)
     await asyncio.sleep(1)
@@ -2183,11 +2185,31 @@ async def refresh_cmd(client, message):
     await status_msg.edit_text(
         f"✅ **System & VK Sync Refresh Complete!**\n\n"
         f"• **Live VK Videos Indexed:** `{synced_cnt}`\n"
-        f"• **Duplicates Purged from VK:** `{dupes_cnt}`\n"
-        f"• **Broken Videos Cleaned:** `{broken_cnt}`\n"
+        f"• **Pending Purges Found:** `{len(pending_purges)}`\n"
         f"• **Pending Queues:** Reset & Ready",
         parse_mode=ParseMode.MARKDOWN
     )
+    
+    # TRIGGER THE PURGE CONFIRMATION UI
+    if pending_purges:
+        user_states['pending_purges'] = pending_purges
+        
+        purge_text = f"⚠️ **Found {len(pending_purges)} videos requiring cleanup in VK:**\n\n"
+        for i, p in enumerate(pending_purges[:10]): # Show max 10 in the message to avoid text limits
+            purge_text += f"• **{p['title']}**\n  ↳ Playlist: _{p['album_name']}_\n  ↳ Reason: {p['reason']}\n\n"
+            
+        if len(pending_purges) > 10:
+            purge_text += f"...and {len(pending_purges) - 10} more.\n\n"
+            
+        purge_text += "Do you want to permanently delete these from your VK account?"
+        
+        kbd = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑️ Yes, Purge Them", callback_data="confirm_purge")],
+            [InlineKeyboardButton("❌ No, Keep Them", callback_data="cancel_purge")]
+        ])
+        
+        await message.reply_text(purge_text, reply_markup=kbd, parse_mode=ParseMode.MARKDOWN)
+        
     await render_dashboard()
 
 @bot_app.on_message(filters.command("monitor"))
@@ -2403,6 +2425,30 @@ async def handle_buttons(client, callback):
 
     elif data == "noop": return await callback.answer()
 
+    elif data == "confirm_purge":
+        purges = user_states.pop('pending_purges', [])
+        if not purges:
+            return await callback.answer("No pending purges found or session expired.", show_alert=True)
+            
+        await callback.message.edit_text(f"🗑️ **Purging {len(purges)} videos from VK...** Please wait.")
+        
+        deleted = 0
+        for p in purges:
+            try:
+                await asyncio.to_thread(vk.video.delete, owner_id=p['owner_id'], video_id=p['video_id'])
+                deleted += 1
+                await asyncio.sleep(0.3) # Avoid VK rate limits
+            except Exception as e:
+                console.print(f"[yellow]⚠️ Failed to delete {p['video_id']}: {e}[/yellow]")
+                
+        await callback.message.edit_text(f"✅ **Purge Complete!**\nSuccessfully deleted {deleted}/{len(purges)} videos from VK.")
+        return await callback.answer()
+
+    elif data == "cancel_purge":
+        user_states.pop('pending_purges', None)
+        await callback.message.edit_text("❌ **Purge Cancelled.**\nNo videos were deleted from VK.")
+        return await callback.answer()
+
     elif data in ("direct_copy_forum", "direct_transfer_forum"):
         state = user_states.get(chat_id)
         if not state or 'found_msgs' not in state: return await callback.answer("Session expired.", show_alert=True)
@@ -2613,6 +2659,9 @@ async def main():
         BotCommand("reset", "⚠️ Full factory reset")
     ])
 
+    # Fire sync and collect pending purges (if any)
+    # The UI for these will only pop up when the user types /refresh manually,
+    # but we sync the DB state here quietly on boot.
     await sync_vk_to_local_db()
     console.print("[bold green]✅ BotFather command menu set.[/bold green]")
 
