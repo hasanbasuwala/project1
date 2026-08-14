@@ -980,3 +980,162 @@ async def add_monitored_target(target_raw):
         return True, resolved_id
     except Exception as e:
         return False, str(e)
+        
+# ============================================================
+# CHAPTER 4: CORE PRE-FLIGHT, DEEP PROBE & FFMPEG TRANSCODING
+# ============================================================
+
+async def deep_probe_codec(client: Client, message, job_id: str):
+    """
+    Downloads the first 2MB of a video to inspect its actual codec.
+    Returns True if it is H.264/AAC (Web-Optimized) and safe for Zero-Disk.
+    Returns False if it requires FFmpeg transcoding via Disk Fallback.
+    """
+    chunk_file = os.path.join(DOWNLOAD_DIR, f"probe_{job_id}.mp4")
+    
+    try:
+        bytes_downloaded = 0
+        with open(chunk_file, "wb") as f:
+            async for chunk in client.stream_media(message, limit=2): # 2 MiB
+                f.write(chunk)
+                bytes_downloaded += len(chunk)
+                
+        if bytes_downloaded == 0:
+            return False
+
+        def run_ffprobe(stream_type):
+            try:
+                res = subprocess.run(
+                    ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0", 
+                     "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", chunk_file],
+                    capture_output=True, text=True, timeout=5
+                )
+                return res.stdout.strip().lower()
+            except Exception:
+                return "unknown"
+
+        v_codec = await asyncio.to_thread(run_ffprobe, "v")
+        a_codec = await asyncio.to_thread(run_ffprobe, "a")
+        
+        console.print(f"[cyan]🔬 Probe {job_id}: Video={v_codec or 'none'}, Audio={a_codec or 'none'}[/cyan]")
+        
+        if v_codec == "h264" and (a_codec == "aac" or not a_codec):
+            return True
+        return False
+        
+    except Exception as e:
+        console.print(f"[yellow]⚠️ Deep probe failed for {job_id}: {e}[/yellow]")
+        return False
+    finally:
+        if os.path.exists(chunk_file):
+            try: os.remove(chunk_file)
+            except: pass
+
+
+async def inspect_media_for_routing(client: Client, message, job_id: str):
+    """
+    The Master Gatekeeper. Decides if a job goes to Zero-Disk or Disk Fallback.
+    """
+    media = message.video or message.document
+    if not media:
+        return False
+        
+    mime_type = getattr(media, "mime_type", "Unknown")
+    file_name = str(getattr(media, "file_name", "Unknown")).lower()
+    
+    # 1. Fast Metadata Check
+    is_mp4_mime = mime_type == "video/mp4"
+    is_mp4_ext = file_name.endswith(".mp4")
+    
+    if not is_mp4_mime and not is_mp4_ext:
+        console.print(f"[yellow]⚠️ {job_id} is {mime_type}. Routing to Disk Fallback.[/yellow]")
+        return False
+        
+    # 2. Deep Probe for internal codecs and 'moov' atom placement
+    is_zero_disk_safe = await deep_probe_codec(client, message, job_id)
+    return is_zero_disk_safe
+
+
+# --- DISK FALLBACK VALIDATION & TRANSCODING ---
+
+async def _validate_video_file(file_path):
+    def _run():
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", file_path],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode != 0:
+                return False
+            duration = result.stdout.strip()
+            return bool(duration) and float(duration) > 0
+        except Exception:
+            return False
+    return await asyncio.to_thread(_run)
+
+async def _deep_validate_video_file(file_path):
+    def _run():
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-v", "error", "-i", file_path, "-map", "0", "-f", "null", "-"],
+                capture_output=True, text=True, timeout=300
+            )
+            return result.returncode == 0 and not result.stderr.strip()
+        except subprocess.TimeoutExpired:
+            console.print(f"[yellow]⚠️ Deep validation timed out for {os.path.basename(file_path)}, skipping deep check.[/yellow]")
+            return True
+        except Exception:
+            return False
+    return await asyncio.to_thread(_run)
+
+async def _ensure_h264_aac(file_path):
+    """
+    Forces non-compliant videos into H.264/AAC for VK processing.
+    Used exclusively by the Disk Fallback workers.
+    """
+    def _probe_stream(stream_type):
+        try:
+            res = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0", 
+                 "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", file_path],
+                capture_output=True, text=True, timeout=10
+            )
+            return res.stdout.strip().lower()
+        except Exception:
+            return ""
+
+    v_codec = await asyncio.to_thread(_probe_stream, "v")
+    a_codec = await asyncio.to_thread(_probe_stream, "a")
+
+    if v_codec == "h264" and (a_codec == "aac" or not a_codec):
+        return file_path
+
+    console.print(f"[bold yellow]⚙️ Converting {os.path.basename(file_path)} (Video: {v_codec or 'none'}, Audio: {a_codec or 'none'}) to H.264/AAC...[/bold yellow]")
+    
+    out_path = f"{file_path}.converted.mp4"
+    
+    conv_cmd = [
+        "ffmpeg", "-y", "-i", file_path,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        out_path
+    ]
+
+    process = await asyncio.create_subprocess_exec(
+        *conv_cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    await process.wait()
+
+    if process.returncode == 0 and os.path.exists(out_path):
+        os.remove(file_path)
+        os.rename(out_path, file_path)
+        return file_path
+    else:
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        raise Exception(f"FFmpeg conversion failed with code {process.returncode}")
+        
