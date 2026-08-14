@@ -1139,3 +1139,264 @@ async def _ensure_h264_aac(file_path):
             os.remove(out_path)
         raise Exception(f"FFmpeg conversion failed with code {process.returncode}")
         
+# ============================================================
+# CHAPTER 5: TRANSFER ENGINES (ZERO-DISK & DISK FALLBACK)
+# ============================================================
+
+# --- 5A. ZERO-DISK ENGINE ---
+
+class QueueStreamReader:
+    """
+    Synchronous wrapper around our asyncio Queue.
+    Tricks `requests` into thinking it's reading a local file, forcing the Content-Length header.
+    """
+    def __init__(self, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop, total_size: int, callback=None):
+        self.queue = queue
+        self.loop = loop
+        self.total_size = total_size
+        self.buffer = bytearray()
+        self.read_bytes = 0
+        self.callback = callback
+
+    def read(self, size=-1):
+        while (size == -1 or len(self.buffer) < size) and self.read_bytes < self.total_size:
+            if job_id_context.get() in cancelled_jobs:
+                break # Abort signal
+            try:
+                chunk = asyncio.run_coroutine_threadsafe(self.queue.get(), self.loop).result()
+                if chunk is None: 
+                    break
+                self.buffer.extend(chunk)
+                self.queue.task_done()
+            except Exception:
+                break
+        
+        if size == -1:
+            data = bytes(self.buffer)
+            self.buffer.clear()
+        else:
+            data = bytes(self.buffer[:size])
+            del self.buffer[:size]
+            
+        self.read_bytes += len(data)
+        if self.callback:
+            self.callback(self.read_bytes, self.total_size)
+            
+        return data
+
+    def __len__(self):
+        return self.total_size
+
+
+import contextvars
+job_id_context = contextvars.ContextVar('job_id', default='')
+
+
+async def telegram_producer(client: Client, message, queue: asyncio.Queue, file_size: int, job_id: str):
+    """
+    Smart zero-disk streaming. Safely disconnects from Telegram if RAM fills up 
+    to prevent idle timeouts, and resumes automatically when RAM frees up.
+    """
+    chunks_yielded = 0
+    total_chunks = math.ceil(file_size / CHUNK_SIZE)
+    
+    while chunks_yielded < total_chunks:
+        if job_id in cancelled_jobs:
+            break
+            
+        if queue.qsize() >= QUEUE_MAX_CHUNKS:
+            await asyncio.sleep(0.5)
+            continue
+
+        try:
+            async for chunk in client.stream_media(message, offset=chunks_yielded):
+                if job_id in cancelled_jobs:
+                    break
+                    
+                await queue.put(chunk)
+                chunks_yielded += 1
+                
+                if queue.qsize() >= QUEUE_MAX_CHUNKS:
+                    break 
+                    
+        except Exception as e:
+            await asyncio.sleep(2)
+
+    await queue.put(None)
+
+
+def sync_vk_upload_consumer(upload_url: str, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop, file_size: int, callback):
+    """
+    Runs in a background thread, consuming the queue via requests.post
+    """
+    reader = QueueStreamReader(queue, loop, file_size, callback)
+    files = {'video_file': ('relay_video.mp4', reader, 'video/mp4')}
+    
+    resp = requests.post(upload_url, files=files, timeout=None)
+    if resp.status_code != 200:
+        raise Exception(f"VK returned {resp.status_code}: {resp.text[:300]}")
+    
+    return resp.json()
+
+
+# --- 5B. DISK FALLBACK ENGINE ---
+
+class ProgressFileReader(io.IOBase):
+    def __init__(self, filename, callback):
+        self._f = open(filename, 'rb')
+        self._callback = callback
+        self._total = os.path.getsize(filename)
+        self._read_bytes = 0
+
+    def read(self, size=-1):
+        chunk = self._f.read(size)
+        self._read_bytes += len(chunk)
+        if self._callback:
+            self._callback(self._read_bytes, self._total)
+        return chunk
+
+    def fileno(self): return self._f.fileno()
+    def tell(self): return self._f.tell()
+    def seek(self, offset, whence=io.SEEK_SET):
+        res = self._f.seek(offset, whence)
+        self._read_bytes = self._f.tell()
+        return res
+    def close(self): self._f.close()
+    def __len__(self): return self._total
+
+def _sync_vk_fallback_upload(upload_url, file_path, progress_callback, job_id):
+    reader = ProgressFileReader(file_path, progress_callback)
+    try:
+        files = {'video_file': (os.path.basename(file_path), reader, 'video/mp4')}
+        resp = requests.post(upload_url, files=files, timeout=None)
+        if resp.status_code != 200:
+            raise Exception(f"VK upload {resp.status_code}: {resp.text[:300]}")
+        return resp.json()
+    finally:
+        reader.close()
+
+
+def get_part_count(file_size):
+    mb = file_size / (1024 * 1024)
+    if mb < 200: return 1
+    elif mb < 1024: return 2
+    elif mb < 3072: return 3
+    else: return 4
+
+class ProgressTracker:
+    def __init__(self, total, callback):
+        self.total = total
+        self.downloaded = 0
+        self.callback = callback
+        self.lock = asyncio.Lock()
+
+    async def update(self, bytes_added):
+        async with self.lock:
+            self.downloaded += bytes_added
+            self.callback(self.downloaded, self.total)
+
+async def _download_segment(client, file_id, chunk_offset, chunk_limit, part_file, job_id, tracker, expected_bytes):
+    retries = 5
+    MEM_BUFFER_SIZE = 8 * 1024 * 1024
+    
+    while retries > 0:
+        downloaded_this_attempt = 0
+        try:
+            buffer = bytearray()
+            with open(part_file, "wb") as f:
+                async for chunk in client.stream_media(file_id, limit=chunk_limit, offset=chunk_offset):
+                    if job_id in cancelled_jobs:
+                        raise Exception("ForceAbort")
+                    await pause_event.wait()
+
+                    buffer.extend(chunk)
+                    downloaded_this_attempt += len(chunk)
+                    await tracker.update(len(chunk))
+
+                    if len(buffer) >= MEM_BUFFER_SIZE:
+                        f.write(buffer)
+                        buffer.clear()
+                        await asyncio.sleep(0.01) 
+
+                if buffer:
+                    f.write(buffer)
+                    buffer.clear()
+
+            actual_bytes = os.path.getsize(part_file) if os.path.exists(part_file) else 0
+            if actual_bytes != expected_bytes:
+                raise Exception(f"SegmentSizeMismatch: got {actual_bytes}, expected {expected_bytes}")
+
+            break
+        except Exception as e:
+            if str(e) == "ForceAbort": raise
+            retries -= 1
+            await tracker.update(-downloaded_this_attempt)
+            if retries == 0: raise e
+            await asyncio.sleep(5 * (5 - retries))
+
+async def async_fast_download(client, message, file_path, progress_callback, job_id):
+    media = message.video or message.document
+    if not media:
+        raise Exception("No valid media found in message.")
+        
+    file_size = media.file_size
+    file_id = media.file_id  
+    
+    total_chunks = math.ceil(file_size / CHUNK_SIZE)
+    parts_count = get_part_count(file_size)
+    if total_chunks <= 1: parts_count = 1
+
+    base_chunks = total_chunks // parts_count
+    remainder = total_chunks % parts_count
+    last_chunk_size = file_size - (total_chunks - 1) * CHUNK_SIZE if total_chunks > 0 else 0
+
+    ranges = []
+    current_offset = 0
+    for i in range(parts_count):
+        limit = base_chunks + (1 if i < remainder else 0)
+        ranges.append((current_offset, limit))
+        current_offset += limit
+
+    tracker = ProgressTracker(file_size, progress_callback)
+    part_files = [f"{file_path}.part{i}" for i in range(parts_count)]
+
+    tasks = []
+    for i, (chunk_offset, chunk_limit) in enumerate(ranges):
+        if chunk_limit == 0: continue
+        includes_final = (chunk_offset + chunk_limit) >= total_chunks
+        expected_bytes = (chunk_limit - 1) * CHUNK_SIZE + last_chunk_size if includes_final else chunk_limit * CHUNK_SIZE
+
+        tasks.append(asyncio.create_task(
+            _download_segment(client, file_id, chunk_offset, chunk_limit, part_files[i], job_id, tracker, expected_bytes)
+        ))
+        await asyncio.sleep(SEGMENT_STAGGER_SECONDS)
+
+    try:
+        await asyncio.gather(*tasks)
+    except Exception as e:
+        for task in tasks:
+            if not task.done(): task.cancel()
+        for part in part_files:
+            if os.path.exists(part):
+                try: os.remove(part)
+                except: pass
+        raise e
+
+    with open(file_path, 'wb') as outfile:
+        for part in part_files:
+            if os.path.exists(part):
+                with open(part, 'rb') as infile:
+                    while True:
+                        chunk = infile.read(8 * 1024 * 1024)
+                        if not chunk: break
+                        outfile.write(chunk)
+                os.remove(part)
+
+    final_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+    if final_size != file_size:
+        try: os.remove(file_path)
+        except Exception: pass
+        raise Exception(f"IncompleteDownload: assembled {final_size} bytes, expected {file_size}")
+
+    return file_path
+    
