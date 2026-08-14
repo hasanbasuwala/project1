@@ -2594,6 +2594,20 @@ async def handle_buttons(client, callback):
         user_states.pop(chat_id, None)
         await callback.message.delete()
         await render_dashboard()
+        
+    elif data.startswith("plcontinue_"):
+        playlist_id = data[len("plcontinue_"):]
+        await continue_playlist(playlist_id)
+        await callback.answer("▶️ Continuing playlist...")
+        await render_dashboard()
+        return
+
+    elif data.startswith("plkill_"):
+        playlist_id = data[len("plkill_"):]
+        await kill_playlist(playlist_id)
+        await callback.answer("💀 Playlist killed.", show_alert=True)
+        await render_dashboard()
+        return
 
     elif data == "clear_queue":
         cleared = 0
