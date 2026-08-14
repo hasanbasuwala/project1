@@ -2120,3 +2120,566 @@ async def dashboard_updater():
                 await set_control("engine_state", ENGINE_PAUSED)
         await render_dashboard()
         
+# ============================================================
+# CHAPTER 8: BOT COMMANDS, HANDLERS & MAIN LOOP
+# ============================================================
+
+@bot_app.on_message(filters.command("start"))
+async def start_cmd(client, message):
+    msg = await message.reply_text(UI_STRINGS["booting"])
+    try: await msg.pin(both_sides=True)
+    except: pass
+    await set_control("dashboard_chat_id", message.chat.id)
+    await set_control("dashboard_msg_id", msg.id)
+    global ui_state
+    ui_state = "MAIN"
+    await render_dashboard()
+
+@bot_app.on_message(filters.command("refresh"))
+async def refresh_cmd(client, message):
+    global engine_state
+    status_msg = await message.reply_text(UI_STRINGS["refresh_step_1"], parse_mode=ParseMode.MARKDOWN)
+
+    prev_state = engine_state
+    engine_state = ENGINE_PAUSE_REQUESTED
+    pause_event.clear()
+    await asyncio.sleep(1)
+
+    await status_msg.edit_text("🔄 **Initiating System & VK Database Refresh...**\n`[2/5]` Clearing local job cache & stale message status...", parse_mode=ParseMode.MARKDOWN)
+
+    while not relay_queue.empty(): relay_queue.get_nowait(); relay_queue.task_done()
+    while not download_queue_t1.empty(): download_queue_t1.get_nowait(); download_queue_t1.task_done()
+    while not download_queue_t2.empty(): download_queue_t2.get_nowait(); download_queue_t2.task_done()
+    while not upload_queue.empty(): upload_queue.get_nowait(); upload_queue.task_done()
+    
+    playlist_queues.clear()
+    playlist_order.clear()
+    cancelled_jobs.clear()
+    vk_video_title_cache.clear()
+    vk_album_name_cache.clear()
+
+    await db_execute("DELETE FROM jobs WHERE status != 'done'")
+    await db_execute("UPDATE monitored_messages SET is_queued=0")
+
+    await status_msg.edit_text("🔄 **Initiating System & VK Database Refresh...**\n`[3/5]` Querying live VK catalog & purging broken/duplicate videos...", parse_mode=ParseMode.MARKDOWN)
+    synced_cnt, dupes_cnt, broken_cnt = await sync_vk_to_local_db()
+
+    await status_msg.edit_text("🔄 **Initiating System & VK Database Refresh...**\n`[4/5]` Resynchronizing monitored tags with database...", parse_mode=ParseMode.MARKDOWN)
+    await asyncio.sleep(1)
+
+    engine_state = ENGINE_RUNNING if prev_state == ENGINE_RUNNING else prev_state
+    if engine_state == ENGINE_RUNNING:
+        pause_event.set()
+
+    await status_msg.edit_text(
+        f"✅ **System & VK Sync Refresh Complete!**\n\n"
+        f"• **Live VK Videos Indexed:** `{synced_cnt}`\n"
+        f"• **Duplicates Purged from VK:** `{dupes_cnt}`\n"
+        f"• **Broken Videos Cleaned:** `{broken_cnt}`\n"
+        f"• **Pending Queues:** Reset & Ready",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    await render_dashboard()
+
+@bot_app.on_message(filters.command("monitor"))
+async def monitor_cmd(client, message):
+    user_states[message.chat.id] = {'awaiting_monitor_input': True}
+    await message.reply_text(UI_STRINGS["monitor_setup"], parse_mode=ParseMode.MARKDOWN)
+
+@bot_app.on_message(filters.command("monitoralways"))
+async def monitor_always_cmd(client, message):
+    user_states[message.chat.id] = {'awaiting_always_input': True}
+    await message.reply_text(UI_STRINGS["auto_sync_setup"], parse_mode=ParseMode.MARKDOWN)
+
+@bot_app.on_message(filters.command("monitorselected"))
+async def monitor_selected_cmd(client, message):
+    global ui_state
+    ui_state = "SELECTED_VIEW"
+    await render_dashboard()
+
+@bot_app.on_message(filters.command("setmasterforum"))
+async def set_master_forum_cmd(client, message):
+    if message.chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP):
+        full_chat = await client.get_chat(message.chat.id)
+        forum_id = full_chat.id
+        if not getattr(full_chat, "is_forum", False):
+            return await message.reply_text("⚠️ **Topics are not enabled here.**\nGo to Group Settings -> Enable 'Topics', then run again.", parse_mode=ParseMode.MARKDOWN)
+    else:
+        if len(message.command) < 2:
+            return await message.reply_text("Usage in DM: `/setmasterforum <chat_id>`", parse_mode=ParseMode.MARKDOWN)
+        forum_id = message.command[1].strip()
+
+    await set_control("master_forum_id", str(forum_id))
+    await message.reply_text(UI_STRINGS["topic_set"].format(forum_id=forum_id), parse_mode=ParseMode.MARKDOWN)
+
+async def _resolve_target_chat(message, command_name):
+    if message.chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP):
+        return message.chat.id, (message.chat.title or str(message.chat.id))
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply_text(f"Usage in DM: `/{command_name} <group_id_or_@username>`", parse_mode=ParseMode.MARKDOWN)
+        return None, None
+
+    raw_target = parts[1].strip()
+    try:
+        if raw_target.lstrip("-").isdigit():
+            chat_obj = await user_app.get_chat(int(raw_target))
+        else:
+            chat_obj = await user_app.get_chat(raw_target)
+        return chat_obj.id, (chat_obj.title or raw_target)
+    except Exception as e:
+        await message.reply_text(UI_STRINGS["error_resolution"].format(target=raw_target, error=e), parse_mode=ParseMode.MARKDOWN)
+        return None, None
+
+@bot_app.on_message(filters.command(["transfer", "copy", "autotransfer"]))
+async def transfer_copy_auto_cmd(client, message):
+    command_name = message.command[0].lower()
+    target_chat_id, target_title = await _resolve_target_chat(message, command_name)
+    if target_chat_id is None: return
+
+    user_states[message.chat.id] = {
+        'cmd_type': command_name,
+        'target_chat_id': target_chat_id,
+        'target_title': target_title
+    }
+
+    action_word = "Auto-Transfer" if command_name == "autotransfer" else command_name.title()
+    kbd = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗂️ Process ALL Messages", callback_data="tc_mode_all")],
+        [InlineKeyboardButton("🏷️ Process Specific Tags", callback_data="tc_mode_tags")]
+    ])
+    await message.reply_text(f"⚙️ **Setup {action_word} for: {target_title}**", reply_markup=kbd, parse_mode=ParseMode.MARKDOWN)
+
+@bot_app.on_message(filters.command("reset"))
+async def reset_cmd(client, message):
+    confirm_kbd = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⚠️ Yes, wipe everything", callback_data="reset_confirm"),
+        InlineKeyboardButton("Cancel", callback_data="reset_cancel")
+    ]])
+    await message.reply_text("⚠️ **This will permanently delete ALL jobs, playlists, monitors, topic mappings, transfer history, and downloaded files, and reset the engine to a clean slate.**\n\nAre you sure?", reply_markup=confirm_kbd, parse_mode=ParseMode.MARKDOWN)
+
+@bot_app.on_message(filters.private & filters.text & ~filters.command(["start", "help", "refresh", "monitor", "monitoralways", "monitorselected", "transfer", "copy", "autotransfer", "reset", "setmasterforum"]))
+async def handle_user_input(client, message):
+    chat_id = message.chat.id
+    state = user_states.get(chat_id, {})
+
+    if state.get('awaiting_custom_tags'):
+        state['awaiting_custom_tags'] = False
+        custom_tags = [x.strip().lower().replace("#", "") for x in message.text.split(",") if x.strip()]
+        state['custom_tags'] = custom_tags
+        
+        if state['cmd_type'] == "autotransfer":
+            kbd = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑️ Delete originals", callback_data="atr_setup_del")],
+                [InlineKeyboardButton("📋 Keep originals", callback_data="atr_setup_keep")]
+            ])
+            await message.reply_text(f"📡 **Auto-Transfer Setup: {state['target_title']}**\nShould originals be deleted after copying to the Master Forum, or kept?", reply_markup=kbd, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await message.reply_text(f"🚀 Processing {len(custom_tags)} custom tags for {state['target_title']}...")
+            asyncio.create_task(run_custom_transfer(chat_id, state, mode="TAGS", custom_tags=custom_tags))
+            user_states.pop(chat_id, None)
+        return
+
+    if state.get('awaiting_monitor_input'):
+        user_states.pop(chat_id, None)
+        raw_inputs = message.text.split(",")
+        status_msg = await message.reply_text("⚙️ Launching background history scanners...")
+        success_count = 0
+        for target in raw_inputs:
+            if not target.strip(): continue
+            success, _ = await add_monitored_target(target)
+            if success: success_count += 1
+        await status_msg.edit_text(f"✅ Successfully registered **{success_count}** groups!", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if state.get('awaiting_tag_search'):
+        user_states.pop(chat_id, None)
+        query_tag = message.text.strip().lower()
+        if not query_tag.startswith("#"): query_tag = f"#{query_tag}"
+        exists = await db_execute("SELECT COUNT(*) FROM monitored_messages WHERE tag=?", (query_tag,), fetch="one")
+        if not exists or exists[0] == 0:
+            return await message.reply_text(f"❌ Tag `{query_tag}` not found in monitored database.")
+        global ui_state
+        ui_state = f"MON_INSPECT_{query_tag}"
+        await render_dashboard()
+        return
+
+    if not state.get('awaiting_group'):
+        search_query = message.text.strip()
+        search_query = search_query.lower() if search_query.startswith("#") else f"#{search_query.lower()}"
+        user_states[chat_id] = {'query': search_query, 'awaiting_group': True}
+        return await message.reply_text(UI_STRINGS["vk_search"].format(query=search_query), parse_mode=ParseMode.MARKDOWN)
+
+    try: target_group_id = int(message.text.strip())
+    except ValueError: return await message.reply_text("⚠️ Invalid numeric ID.")
+
+    status_msg = await message.reply_text(UI_STRINGS["scanning_group"])
+    raw_found, processed_groups = [], set()
+
+    try:
+        async for msg in user_app.search_messages(chat_id=target_group_id, query=state['query']):
+            if msg.media_group_id:
+                if msg.media_group_id not in processed_groups:
+                    processed_groups.add(msg.media_group_id)
+                    album_msgs = await user_app.get_media_group(target_group_id, msg.id)
+                    matched = parse_master_caption_bundle(sorted(album_msgs, key=lambda x: x.id), [state['query']])
+                    raw_found.extend(matched)
+            elif msg.video or msg.document:
+                msg._custom_album = state['query'].replace("#", "")
+                msg._custom_caption = msg.caption or f"Imported ({state['query']})"
+                msg._relative_idx = 1
+                raw_found.append(msg)
+    except Exception as e:
+        user_states.pop(chat_id, None)
+        return await status_msg.edit_text(f"❌ Error accessing group: `{e}`")
+
+    new_msgs, skipped_count = [], 0
+    for msg in raw_found:
+        if await is_msg_in_db(msg.chat.id, msg.id): skipped_count += 1
+        else: new_msgs.append(msg)
+
+    if not new_msgs:
+        user_states.pop(chat_id, None)
+        return await status_msg.edit_text(f"❌ No *new* matching videos found.\n(Skipped {skipped_count} already processed).", parse_mode=ParseMode.MARKDOWN)
+
+    state['found_msgs'] = sorted(new_msgs, key=lambda m: getattr(m, '_relative_idx', 1))
+    
+    kbd = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🚀 Queue {len(new_msgs)} videos for VK", callback_data="queue_transfer")],
+        [InlineKeyboardButton(f"📋 Copy to Master Forum", callback_data="direct_copy_forum")],
+        [InlineKeyboardButton(f"🚀 Transfer to Master Forum (Delete Orig)", callback_data="direct_transfer_forum")]
+    ])
+    
+    await status_msg.edit_text(UI_STRINGS["found_preview"].format(query=state['query'], new=len(new_msgs), skipped=skipped_count), parse_mode=ParseMode.MARKDOWN, reply_markup=kbd)
+
+@user_app.on_message(filters.video | filters.document)
+async def live_monitor_handler(client, message):
+    chat_id = message.chat.id
+    txt = message.caption or message.text or ""
+    f_id = message.video.file_unique_id if message.video else (message.document.file_unique_id if message.document else "")
+
+    row = await db_execute("SELECT chat_identifier FROM monitored_chats WHERE resolved_id=?", (chat_id,), fetch="one")
+    if row: await extract_and_store_message(chat_id, message.id, txt, f_id)
+
+    always_row = await db_execute("SELECT status, chat_title FROM always_monitors WHERE chat_id=?", (chat_id,), fetch="one")
+    if always_row and always_row[0] == "ACTIVE":
+        tag_clean = extract_first_tag(txt)
+        if tag_clean:
+            album_id = await get_or_create_vk_album(tag_clean)
+            if album_id:
+                title = display_title(tag_clean, 1, txt, message.id)
+                if not await vk_title_exists(album_id, title) and not await is_msg_in_db(chat_id, message.id):
+                    job_id = f"{chat_id}_{message.id}"
+                    job = {
+                        'job_id': job_id, 'playlist_id': None, 'chat_id': chat_id,
+                        'msg_chat_id': chat_id, 'msg_id': message.id, 'album_id': album_id,
+                        'album_name': tag_clean, 'query': f"#{tag_clean}", 'idx': 1,
+                        'is_pilot': False, 'status': 'queued', 'file_path': None, 'caption': txt, 'tier': 2
+                    }
+                    await save_job(job)
+                    await db_execute("UPDATE always_monitors SET last_msg_id=? WHERE chat_id=?", (message.id, chat_id))
+                    await relay_queue.put(job) # Pushed directly to relay gatekeeper
+
+@bot_app.on_callback_query()
+async def handle_buttons(client, callback):
+    global engine_state, ui_state, monitor_page
+    chat_id = callback.message.chat.id
+    data = callback.data
+
+    if data.startswith("ui_"):
+        ui_state = data.replace("ui_", "")
+        await render_dashboard()
+        return await callback.answer()
+
+    elif data == "noop": return await callback.answer()
+
+    elif data in ("direct_copy_forum", "direct_transfer_forum"):
+        state = user_states.get(chat_id)
+        if not state or 'found_msgs' not in state: return await callback.answer("Session expired.", show_alert=True)
+        delete_originals = (data == "direct_transfer_forum")
+        action_name = "Transfer" if delete_originals else "Copy"
+        tag = state['query']
+        msgs = state['found_msgs']
+        target_chat_id = msgs[0].chat.id if msgs else None
+
+        if not target_chat_id: return await callback.answer("No valid chat ID.", show_alert=True)
+        await callback.answer(f"Starting {action_name} to Master Forum...")
+        await callback.message.edit_text(f"⚙️ **Executing {action_name} for {tag}**\nPlease wait...")
+
+        try:
+            master_forum_id, topic_id, topic_title = await tg_resolve_destination_topic(tag)
+            topic_cache = await build_topic_dedupe_cache(master_forum_id, topic_id)
+            copied = 0
+            for m in msgs:
+                f_id = m.video.file_unique_id if m.video else (m.document.file_unique_id if m.document else None)
+                if f_id and f_id in topic_cache: continue
+                try:
+                    if await tg_execute_message_copy(target_chat_id, m, master_forum_id, topic_id, tag, delete_originals, topic_cache):
+                        copied += 1
+                except Exception: pass
+            await callback.message.edit_text(f"✅ **{action_name} Complete!**\nMoved {copied}/{len(msgs)} messages to **{topic_title}**.")
+        except Exception as e:
+            await callback.message.edit_text(f"❌ **Error during {action_name}:** {e}")
+        user_states.pop(chat_id, None)
+        await render_dashboard()
+        return
+
+    elif data in ("tc_mode_all", "tc_mode_tags"):
+        state = user_states.get(chat_id)
+        if not state: return await callback.answer("Session expired.", show_alert=True)
+        mode = "ALL" if data == "tc_mode_all" else "TAGS"
+        state['mode'] = mode
+        if mode == "TAGS":
+            state['awaiting_custom_tags'] = True
+            await callback.message.edit_text("🏷️ **Tag Filter Mode**\nType tags separated by commas.", parse_mode=ParseMode.MARKDOWN)
+            return
+        if state['cmd_type'] == "autotransfer":
+            kbd = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Delete originals", callback_data="atr_setup_del")], [InlineKeyboardButton("📋 Keep originals", callback_data="atr_setup_keep")]])
+            await callback.message.edit_text(f"📡 **Auto-Transfer Setup: {state['target_title']}**\nShould originals be deleted?", reply_markup=kbd, parse_mode=ParseMode.MARKDOWN)
+            return
+        else:
+            await callback.message.edit_text(f"🚀 Processing ALL messages for {state['target_title']}...")
+            asyncio.create_task(run_custom_transfer(chat_id, state, mode="ALL", custom_tags=[]))
+            user_states.pop(chat_id, None)
+            return
+
+    elif data == "reset_confirm":
+        prev_state = engine_state
+        engine_state = ENGINE_PAUSE_REQUESTED
+        pause_event.clear()
+        await callback.message.edit_text("🔄 Resetting everything...")
+        await asyncio.sleep(1)
+
+        while not relay_queue.empty(): relay_queue.get_nowait(); relay_queue.task_done()
+        while not download_queue_t1.empty(): download_queue_t1.get_nowait(); download_queue_t1.task_done()
+        while not download_queue_t2.empty(): download_queue_t2.get_nowait(); download_queue_t2.task_done()
+        while not upload_queue.empty(): upload_queue.get_nowait(); upload_queue.task_done()
+
+        playlist_queues.clear()
+        playlist_order.clear()
+        cancelled_jobs.clear()
+        vk_video_title_cache.clear()
+        vk_album_name_cache.clear()
+        active_jobs.clear()
+        user_states.clear()
+        vk_reupload_attempts.clear()
+
+        for table in ("jobs", "playlists", "monitored_chats", "monitored_messages", "monitored_tags_meta",
+                      "always_monitors", "selected_monitors", "selected_tags",
+                      "tg_routing_destinations", "tg_copied_messages", "autotransfer_monitors"):
+            await db_execute(f"DELETE FROM {table}")
+
+        if os.path.exists(DOWNLOAD_DIR):
+            shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+            os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+        engine_state = ENGINE_RUNNING
+        pause_event.set()
+        await set_control("engine_state", ENGINE_RUNNING)
+        await callback.message.edit_text("✅ **Full reset complete.** All state wiped, engine restarted clean.", parse_mode=ParseMode.MARKDOWN)
+        ui_state = "MAIN"
+        await render_dashboard()
+        return
+
+    elif data == "reset_cancel":
+        await callback.message.edit_text("Reset cancelled.")
+        return await callback.answer()
+
+    elif data == "queue_transfer":
+        state = user_states.get(chat_id)
+        if not state: return await callback.answer("Expired session.")
+
+        await callback.answer("Building playlist & running pilot video...")
+        album_name = state['query'].replace("#", "")
+        album_id = await get_or_create_vk_album(album_name)
+        if not album_id:
+            user_states.pop(chat_id, None)
+            return await callback.message.edit_text("❌ Failed to resolve VK album.")
+
+        await refresh_vk_cache(album_id)
+        non_dupe_msgs, skipped_dupes = [], 0
+        for msg in state['found_msgs']:
+            idx = getattr(msg, '_relative_idx', 1)
+            caption = getattr(msg, '_custom_caption', "")
+            if await vk_title_exists(album_id, display_title(album_name, idx, caption, msg.id)):
+                skipped_dupes += 1
+            else:
+                non_dupe_msgs.append(msg)
+
+        if not non_dupe_msgs:
+            user_states.pop(chat_id, None)
+            await callback.message.delete()
+            await render_dashboard()
+            return
+
+        playlist_id = await create_playlist(chat_id, state['query'], album_name, album_id, len(non_dupe_msgs))
+        await db_execute("UPDATE playlists SET skipped_dupes=? WHERE playlist_id=?", (skipped_dupes, playlist_id))
+
+        pilot_msg = non_dupe_msgs[0]
+        for msg in non_dupe_msgs:
+            idx = getattr(msg, '_relative_idx', 1)
+            caption = getattr(msg, '_custom_caption', "")
+            is_pilot = (msg is pilot_msg)
+            job_id = f"{msg.chat.id}_{msg.id}"
+            job = {
+                'job_id': job_id, 'playlist_id': playlist_id, 'chat_id': chat_id,
+                'msg_chat_id': msg.chat.id, 'msg_id': msg.id, 'album_id': album_id,
+                'album_name': album_name, 'query': state['query'], 'idx': idx,
+                'is_pilot': is_pilot, 'status': 'waiting', 'file_path': None, 'caption': caption, 'tier': 1
+            }
+            await save_job(job)
+            cancelled_jobs.discard(job_id)
+
+            if is_pilot:
+                await update_job_status(job_id, "queued")
+                await relay_queue.put(job) # Pilot starts in the Relay Queue
+
+        await set_playlist_status(playlist_id, "PILOT_RUNNING")
+        user_states.pop(chat_id, None)
+        await callback.message.delete()
+        await render_dashboard()
+
+    elif data == "clear_queue":
+        cleared = 0
+        while not relay_queue.empty():
+            job = relay_queue.get_nowait(); relay_queue.task_done()
+            cancelled_jobs.add(job['job_id']); await delete_job_row(job['job_id']); cleared += 1
+        while not download_queue_t1.empty():
+            job = download_queue_t1.get_nowait(); download_queue_t1.task_done()
+            cancelled_jobs.add(job['job_id']); await delete_job_row(job['job_id']); cleared += 1
+        while not download_queue_t2.empty():
+            job = download_queue_t2.get_nowait(); download_queue_t2.task_done()
+            cancelled_jobs.add(job['job_id']); await delete_job_row(job['job_id']); cleared += 1
+        for pid in list(playlist_queues.keys()):
+            q = playlist_queues.pop(pid)
+            for job in q:
+                cancelled_jobs.add(job['job_id']); await delete_job_row(job['job_id']); cleared += 1
+        playlist_order.clear()
+        await render_dashboard()
+        await callback.answer(f"Cleared {cleared} pending downloads.", show_alert=True)
+
+    elif data == "toggle_pause":
+        if engine_state == ENGINE_RUNNING:
+            engine_state = ENGINE_PAUSE_REQUESTED
+            pause_event.clear()
+            await set_control("engine_state", ENGINE_PAUSE_REQUESTED)
+            await callback.answer("🟡 Pause requested — draining active transfers...")
+        else:
+            engine_state = ENGINE_RUNNING
+            pause_event.set()
+            await set_control("engine_state", ENGINE_RUNNING)
+            await callback.answer("▶️ Resumed")
+        await render_dashboard()
+
+    elif data.startswith("kill_"):
+        job_id = data.replace("kill_", "")
+        cancelled_jobs.add(job_id)
+        await update_job_status(job_id, "cancelled")
+        await callback.answer("💀 Poison pill dropped. Job aborting...", show_alert=True)
+        await render_dashboard()
+        
+    elif data == "mon_next_page": monitor_page += 1; await render_dashboard(); return await callback.answer()
+    elif data == "mon_prev_page": monitor_page -= 1; await render_dashboard(); return await callback.answer()
+
+async def connection_watchdog():
+    # Placeholder for the network watchdog implementation (from original script)
+    pass
+
+async def main():
+    global engine_state
+    await user_app.start()
+    await bot_app.start()
+
+    await bot_app.set_bot_commands([
+        BotCommand("start", "⚙️ Master Dashboard"),
+        BotCommand("refresh", "🔄 Refresh DB & Resync VK"),
+        BotCommand("setmasterforum", "🏷️ Set Master Forum Topic Hub"),
+        BotCommand("monitorselected", "🎯 Selective Sync (/MonitorSelected)"),
+        BotCommand("monitoralways", "📡 Continuous Auto-Sync (/MonitorAlways)"),
+        BotCommand("monitor", "👁️ Monitor Chat History (VK)"),
+        BotCommand("transfer", "🚀 Transfer tagged videos (TG Copy + Delete)"),
+        BotCommand("copy", "📋 Copy tagged videos (TG Copy + Keep)"),
+        BotCommand("autotransfer", "📡 Continuous Telegram Auto-Transfer"),
+        BotCommand("reset", "⚠️ Full factory reset")
+    ])
+
+    await sync_vk_to_local_db()
+    console.print("[bold green]✅ BotFather command menu set.[/bold green]")
+
+    saved_state = await get_control("engine_state", ENGINE_RUNNING)
+    engine_state = saved_state if saved_state in (ENGINE_RUNNING, ENGINE_PAUSED) else ENGINE_RUNNING
+    if engine_state != ENGINE_RUNNING: pause_event.clear()
+
+    # Recover waiting jobs and feed them into the Relay Gatekeeper
+    rows = await db_execute("SELECT job_id, playlist_id, chat_id, msg_chat_id, msg_id, album_id, album_name, query, idx, is_pilot, status, file_path, caption, tier, is_zero_disk FROM jobs WHERE status NOT IN ('done', 'cancelled')", fetch="all")
+    recovered = 0
+    if rows:
+        for row in rows:
+            job = {
+                'job_id': row[0], 'playlist_id': row[1], 'chat_id': row[2], 'msg_chat_id': row[3],
+                'msg_id': row[4], 'album_id': row[5], 'album_name': row[6], 'query': row[7],
+                'idx': row[8], 'is_pilot': bool(row[9]), 'file_path': row[11], 'caption': row[12],
+                'tier': row[13] if len(row) > 13 else 1, 'is_zero_disk': bool(row[14])
+            }
+            status, file_path = row[10], row[11]
+
+            if status in ("downloaded", "uploading") and file_path and os.path.exists(file_path):
+                if await _validate_video_file(file_path):
+                    await update_job_status(job['job_id'], "downloaded")
+                    await upload_queue.put(job)
+                else:
+                    try: os.remove(file_path)
+                    except: pass
+                    job['file_path'] = None
+                    await update_job_status(job['job_id'], "queued", file_path="")
+                    await relay_queue.put(job)
+            else:
+                if file_path and os.path.exists(file_path):
+                    try: os.remove(file_path)
+                    except: pass
+                job['file_path'] = None
+                
+                if job['is_pilot'] or not job['playlist_id']:
+                    await update_job_status(job['job_id'], "queued", file_path="")
+                    await relay_queue.put(job)
+                else:
+                    pl_row = await get_playlist(job['playlist_id'])
+                    if pl_row and pl_row[5] in ("RUNNING", "PILOT_RUNNING"):
+                        enqueue_playlist_job(job['playlist_id'], job)
+            recovered += 1
+        console.print(f"[bold yellow]♻️ Recovered {recovered} jobs into Relay Gatekeeper.[/bold yellow]")
+
+    active_playlists = await db_execute("SELECT DISTINCT album_id FROM playlists WHERE status NOT IN ('KILLED','COMPLETED')", fetch="all")
+    for (album_id,) in (active_playlists or []):
+        if album_id: await refresh_vk_cache(album_id)
+
+    asyncio.create_task(connection_watchdog())
+    asyncio.create_task(dashboard_updater())
+    asyncio.create_task(scheduler_loop())
+    
+    # 🚀 Spin up the new Hybrid Engine Fleet
+    for i in range(MAX_RELAY_WORKERS): asyncio.create_task(relay_worker(i))
+    for i in range(DL_WORKERS): asyncio.create_task(download_worker(i))
+    for i in range(UP_WORKERS): asyncio.create_task(upload_worker(i))
+
+    dashboard_chat_id = await get_control("dashboard_chat_id")
+    if dashboard_chat_id:
+        try:
+            dash_msg = await bot_app.send_message(
+                chat_id=int(dashboard_chat_id),
+                text=UI_STRINGS["booting"],
+                parse_mode=ParseMode.MARKDOWN
+            )
+            try: await dash_msg.pin(both_sides=True)
+            except: pass
+            await set_control("dashboard_msg_id", dash_msg.id)
+        except Exception as e: pass
+
+    with Live(progress_ui, console=console, refresh_per_second=4):
+        console.print("[bold green]🚀 Master Engine Online. Bot menu ready![/bold green]")
+        await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
