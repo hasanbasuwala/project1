@@ -358,16 +358,19 @@ async def list_playlists(limit=15):
     )
 
 async def sync_vk_to_local_db():
-    console.print("[bold cyan]🔄 Syncing state from VK and cleaning duplicate/broken uploads...[/bold cyan]")
+    console.print("[bold cyan]🔄 Syncing state from VK and analyzing for broken/duplicate uploads...[/bold cyan]")
     synced_count = 0
-    deleted_duplicates_count = 0
-    deleted_broken_count = 0
     seen_msg_ids = {} 
+    pending_purges = [] # NEW: Collect deletions here instead of executing them
 
     try:
         albums_resp = await asyncio.to_thread(vk.video.getAlbums, owner_id=my_vk_id, count=100)
         albums = albums_resp.get('items', [])
         album_ids = [alb['id'] for alb in albums if alb.get('id')]
+        
+        # Map IDs to names for the UI
+        album_map = {alb['id']: alb.get('title', 'Unknown Playlist') for alb in albums if alb.get('id')}
+        album_map[None] = "Uncategorized/Main"
         
         if None not in album_ids and 0 not in album_ids:
             album_ids.append(None)
@@ -375,6 +378,8 @@ async def sync_vk_to_local_db():
         for album_id in album_ids:
             offset = 0
             count = 200
+            album_name = album_map.get(album_id, "Unknown Playlist")
+            
             while True:
                 try:
                     kwargs = {'owner_id': my_vk_id, 'count': count, 'offset': offset}
@@ -394,13 +399,15 @@ async def sync_vk_to_local_db():
                     duration = v.get('duration', 0)
                     is_processing = v.get('processing', 0)
 
+                    # Mark broken videos for purging
                     if duration == 0 and not is_processing:
-                        try:
-                            await asyncio.to_thread(vk.video.delete, owner_id=my_vk_id, video_id=video_id)
-                            deleted_broken_count += 1
-                            console.print(f"[bold red]🗑️ Purged broken/unavailable VK video: {title} (ID: {video_id})[/bold red]")
-                        except Exception:
-                            pass
+                        pending_purges.append({
+                            'video_id': video_id, 
+                            'owner_id': my_vk_id, 
+                            'title': title, 
+                            'album_name': album_name, 
+                            'reason': 'Broken/Processing Failed'
+                        })
                         continue
 
                     match = re.search(r'\[TG_(\d+)\]', title)
@@ -409,20 +416,22 @@ async def sync_vk_to_local_db():
                         
                         if msg_id in seen_msg_ids:
                             if seen_msg_ids[msg_id] != video_id:
-                                try:
-                                    await asyncio.to_thread(vk.video.delete, owner_id=my_vk_id, video_id=video_id)
-                                    deleted_duplicates_count += 1
-                                    console.print(f"[bold yellow]🗑️ Purged duplicate VK video ID {video_id} (TG_{msg_id})[/bold yellow]")
-                                except Exception:
-                                    pass
+                                # Mark duplicate videos for purging
+                                pending_purges.append({
+                                    'video_id': video_id, 
+                                    'owner_id': my_vk_id, 
+                                    'title': title, 
+                                    'album_name': album_name, 
+                                    'reason': f'Duplicate of TG_{msg_id}'
+                                })
                             continue
                         
                         seen_msg_ids[msg_id] = video_id
                         job_id = f"vk_recovered_{msg_id}"
                         
                         await db_execute(
-                            """INSERT INTO jobs (job_id, chat_id, msg_chat_id, msg_id, album_id, album_name, query, idx, status, updated_at, tier)
-                               VALUES (?,0,0,?,?,?,'vk_sync',1,'done',?,1)
+                            """INSERT INTO jobs (job_id, chat_id, msg_chat_id, msg_id, album_id, album_name, query, idx, status, updated_at, tier, is_zero_disk)
+                               VALUES (?,0,0,?,?,?,'vk_sync',1,'done',?,1,0)
                                ON CONFLICT(job_id) DO UPDATE SET status='done'""",
                             (job_id, msg_id, album_id if album_id else 0, title.split(' - ')[0], time.time())
                         )
@@ -436,11 +445,11 @@ async def sync_vk_to_local_db():
             placeholders = ','.join('?' for _ in seen_msg_ids.keys())
             await db_execute(f"UPDATE monitored_messages SET is_queued=1 WHERE msg_id IN ({placeholders})", tuple(seen_msg_ids.keys()))
 
-        console.print(f"[bold green]✅ VK Sync Complete: {synced_count} indexed, {deleted_duplicates_count} dupes purged, {deleted_broken_count} broken videos purged.[/bold green]")
-        return synced_count, deleted_duplicates_count, deleted_broken_count
+        console.print(f"[bold green]✅ VK Sync Complete: {synced_count} indexed, {len(pending_purges)} flagged for purge.[/bold green]")
+        return synced_count, pending_purges
     except Exception as e:
         console.print(f"[bold red]⚠️ VK Sync failed on boot: {e}[/bold red]")
-        return 0, 0, 0
+        return 0, []
         
 # ============================================================
 # CHAPTER 3: TELEGRAM FORUM ROUTING & DEDUPLICATION ENGINE
