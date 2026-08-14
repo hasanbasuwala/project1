@@ -1400,3 +1400,426 @@ async def async_fast_download(client, message, file_path, progress_callback, job
 
     return file_path
     
+# ============================================================
+# CHAPTER 6: SCHEDULER, JOB BOOKKEEPING & WORKER LOOPS
+# ============================================================
+
+# --- 6A. JOB BOOKKEEPING ---
+
+async def on_job_finished(job):
+    playlist_id = job.get('playlist_id')
+    await delete_job_row(job['job_id'])
+    if not playlist_id:
+        return
+
+    if job.get('is_pilot'):
+        await bump_playlist(playlist_id, completed_delta=1)
+        await set_playlist_status(playlist_id, "WAITING_CONFIRMATION")
+        return
+
+    await bump_playlist(playlist_id, completed_delta=1)
+    row = await get_playlist(playlist_id)
+    if row:
+        _, _, _, _, _, status, total, completed, failed, skipped = row
+        if status not in ("KILLED", "COMPLETED") and (completed + failed + skipped) >= total:
+            await set_playlist_status(playlist_id, "COMPLETED")
+
+async def on_job_permanently_failed(job, reason):
+    playlist_id = job.get('playlist_id')
+    display_name = f"{job.get('query')} (Pt.{job.get('idx')})"
+    vk_reupload_attempts.pop(job['job_id'], None)
+    await delete_job_row(job['job_id'])
+
+    if playlist_id:
+        await bump_playlist(playlist_id, failed_delta=1)
+        row = await get_playlist(playlist_id)
+        if row:
+            _, _, _, _, _, status, total, completed, failed, skipped = row
+            if status not in ("KILLED", "COMPLETED") and (completed + failed + skipped) >= total:
+                await set_playlist_status(playlist_id, "COMPLETED")
+
+    dashboard_chat_id = await get_control("dashboard_chat_id")
+    if dashboard_chat_id:
+        try:
+            await bot_app.send_message(
+                chat_id=int(dashboard_chat_id),
+                text=f"⚠️ **Upload Failed Permanently**\n\nVideo: **{display_name}**\nReason: {reason}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception:
+            pass
+
+async def continue_playlist(playlist_id):
+    rows = await db_execute(
+        "SELECT job_id, chat_id, msg_chat_id, msg_id, album_id, album_name, query, idx, caption, tier FROM jobs WHERE playlist_id=? AND status='waiting'",
+        (playlist_id,), fetch="all"
+    )
+    for r in rows:
+        job = {
+            'job_id': r[0], 'playlist_id': playlist_id, 'chat_id': r[1], 'msg_chat_id': r[2],
+            'msg_id': r[3], 'album_id': r[4], 'album_name': r[5], 'query': r[6], 'idx': r[7],
+            'caption': r[8], 'file_path': None, 'is_pilot': False, 'tier': r[9] if len(r) > 9 else 1
+        }
+        await update_job_status(job['job_id'], "queued")
+        enqueue_playlist_job(playlist_id, job)
+    await set_playlist_status(playlist_id, "RUNNING")
+
+async def kill_playlist(playlist_id):
+    await set_playlist_status(playlist_id, "KILLED")
+    rows = await db_execute("SELECT job_id, file_path FROM jobs WHERE playlist_id=? AND status NOT IN ('done')", (playlist_id,), fetch="all")
+    for job_id, file_path in rows:
+        cancelled_jobs.add(job_id)
+        if file_path and os.path.exists(file_path):
+            try: os.remove(file_path)
+            except: pass
+    await db_execute("DELETE FROM jobs WHERE playlist_id=? AND status='waiting'", (playlist_id,))
+    playlist_queues.pop(playlist_id, None)
+    try: playlist_order.remove(playlist_id)
+    except ValueError: pass
+
+
+# --- 6B. SCHEDULER LOOP ---
+
+async def scheduler_loop():
+    """
+    Feeds jobs from playlists into the unified Relay Queue (Zero-Disk First).
+    """
+    while True:
+        await asyncio.sleep(0.5)
+        if engine_state != ENGINE_RUNNING: continue
+        
+        # We target a specific inflight amount across all active queues
+        inflight = relay_queue.qsize() + download_queue_t1.qsize() + download_queue_t2.qsize()
+        if inflight >= (MAX_RELAY_WORKERS + DL_WORKERS) * 2:
+            continue
+
+        attempts = len(playlist_order)
+        pushed = False
+        for _ in range(attempts):
+            if not playlist_order: break
+            pid = playlist_order[0]
+            playlist_order.rotate(-1)
+            q = playlist_queues.get(pid)
+            if not q:
+                try: playlist_order.remove(pid)
+                except ValueError: pass
+                continue
+
+            job = q.popleft()
+            if not q:
+                try: playlist_order.remove(pid)
+                except ValueError: pass
+
+            if job['job_id'] in cancelled_jobs:
+                continue
+
+            await update_job_status(job['job_id'], "queued")
+            await relay_queue.put(job) # ALL jobs start in the Relay Queue!
+            pushed = True
+            break
+
+        if pushed: continue
+
+
+# --- 6C. THE SMART RELAY WORKER (ZERO-DISK GATEKEEPER) ---
+
+async def relay_worker(worker_id):
+    while True:
+        await pause_event.wait()
+        job = await relay_queue.get()
+        job_id = job['job_id']
+        job_id_context.set(job_id) # For the sync queue reader
+        
+        up_key = f"{job_id}_RELAY"
+        display_name = f"{job['query']} (Pt.{job['idx']})"
+        rich_task = None
+        
+        try:
+            if job_id in cancelled_jobs: continue
+            await pause_event.wait()
+            
+            # 1. Fetch Message
+            msg = None
+            for attempt in range(5):
+                try:
+                    msg = await user_app.get_messages(job['msg_chat_id'], job['msg_id'])
+                    break
+                except Exception as e:
+                    await asyncio.sleep(3)
+
+            if not msg or not (msg.video or msg.document):
+                await on_job_permanently_failed(job, "Could not fetch media from Telegram.")
+                continue
+
+            # 2. PRE-FLIGHT GATEKEEPER
+            console.print(f"[cyan]🔎 Inspecting {display_name} for Zero-Disk compatibility...[/cyan]")
+            is_safe = await inspect_media_for_routing(user_app, msg, job_id)
+            
+            if not is_safe:
+                # ⬇️ ROUTE TO DISK FALLBACK ⬇️
+                job['is_zero_disk'] = 0
+                target_q = download_queue_t2 if job.get('tier', 1) == 2 else download_queue_t1
+                await target_q.put(job)
+                continue
+                
+            # 🚀 PROCEED WITH ZERO-DISK RELAY 🚀
+            job['is_zero_disk'] = 1
+            file_size = msg.video.file_size if msg.video else msg.document.file_size
+            title = display_title(job['album_name'], job['idx'], job.get('caption', ''), job['msg_id'])
+            
+            album_id = job.get('album_id')
+            if not album_id or album_id <= 0:
+                album_id = await get_or_create_vk_album(job.get('album_name'))
+                job['album_id'] = album_id
+
+            active_jobs[up_key] = {"name": display_name, "action": "🚀 RELAY", "progress": 0, "speed": "0 MB/s", "eta": "Calc...", "start_time": time.time(), "job_id": job_id}
+            rich_task = progress_ui.add_task(f"[cyan]🚀 RELAY {display_name}", total=100, name=display_name)
+            await update_job_status(job_id, "relaying")
+
+            def relay_progress(current, total):
+                if job_id in cancelled_jobs: raise Exception("ForceAbort")
+                update_metrics(up_key, rich_task, "🚀 RELAY", current, total)
+
+            # 3. Create VK Session
+            upload_info = None
+            for attempt in range(5):
+                try:
+                    upload_info = await asyncio.to_thread(vk.video.save, name=title, description=job.get('caption', ''), album_id=album_id)
+                    break
+                except Exception as e:
+                    await asyncio.sleep(4)
+
+            if not upload_info:
+                raise Exception("VKVideoSaveFailed")
+
+            mem_queue = asyncio.Queue(maxsize=QUEUE_MAX_CHUNKS)
+            loop = asyncio.get_running_loop()
+            
+            # Start streaming
+            producer_task = asyncio.create_task(telegram_producer(user_app, msg, mem_queue, file_size, job_id))
+            
+            upload_succeeded = False
+            try:
+                await asyncio.to_thread(sync_vk_upload_consumer, upload_info['upload_url'], mem_queue, loop, file_size, relay_progress)
+                
+                video_id = upload_info.get('video_id')
+                owner_id = upload_info.get('owner_id', my_vk_id)
+                
+                if video_id is None:
+                    upload_succeeded = True
+                else:
+                    if await verify_vk_video_ready(owner_id, video_id):
+                        upload_succeeded = True
+                    else:
+                        console.print(f"[bold red]⚠️ VK reports '{display_name}' unavailable after Zero-Disk Relay.[/bold red]")
+                        try: await asyncio.to_thread(vk.video.delete, owner_id=owner_id, video_id=video_id)
+                        except: pass
+            except Exception as e:
+                if str(e) != "ForceAbort":
+                    console.print(f"[bold red]❌ Relay failed for {display_name}: {e}[/bold red]")
+            finally:
+                if not producer_task.done():
+                    producer_task.cancel()
+
+            if upload_succeeded:
+                vk_video_title_cache.setdefault(album_id, set()).add(title)
+                await update_job_status(job_id, "done") 
+                await db_execute("UPDATE monitored_messages SET is_queued=1 WHERE chat_id=? AND msg_id=?", (job['msg_chat_id'], job['msg_id']))
+                await on_job_finished(job)
+            else:
+                # If Zero-Disk failed mid-stream, route to Disk Fallback to try recovering
+                console.print(f"[yellow]⚠️ Zero-Disk stream failed for {display_name}. Falling back to disk...[/yellow]")
+                job['is_zero_disk'] = 0
+                await update_job_status(job_id, "queued")
+                target_q = download_queue_t2 if job.get('tier', 1) == 2 else download_queue_t1
+                await target_q.put(job)
+                
+        except Exception as e:
+            if str(e) == "ForceAbort":
+                console.print(f"[bold yellow]💀 Aborted RELAY: {display_name}[/bold yellow]")
+            else:
+                console.print(f"[bold red]Fatal Relay Worker error: {e}[/bold red]")
+        finally:
+            if rich_task is not None: progress_ui.remove_task(rich_task)
+            active_jobs.pop(up_key, None)
+            relay_queue.task_done()
+
+
+# --- 6D. DISK FALLBACK WORKERS ---
+
+async def download_worker(worker_id):
+    while True:
+        await pause_event.wait()
+        try:
+            job = download_queue_t1.get_nowait()
+            active_q = download_queue_t1
+        except asyncio.QueueEmpty:
+            try:
+                job = download_queue_t2.get_nowait()
+                active_q = download_queue_t2
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(1)
+                continue
+
+        rich_task = None
+        job_id = job['job_id']
+        dl_key = f"{job_id}_DL"
+        delete_file_on_exit = False
+        file_path = None
+        display_name = f"{job['query']} (Pt.{job['idx']})"
+
+        try:
+            if job_id in cancelled_jobs: continue
+            await pause_event.wait()
+            while free_space_gb() < MIN_FREE_GB: await asyncio.sleep(5)
+
+            active_jobs[dl_key] = {"name": display_name, "action": "📥 DL", "progress": 0, "speed": "0 MB/s", "eta": "Calc...", "start_time": time.time(), "job_id": job_id}
+            rich_task = progress_ui.add_task(f"[magenta]📥 DL (Fallback) {display_name}", total=100, name=display_name)
+            await update_job_status(job_id, "downloading")
+
+            def dl_progress(current, total):
+                update_metrics(dl_key, rich_task, "📥 DL", current, total)
+
+            msg = await user_app.get_messages(job['msg_chat_id'], job['msg_id'])
+            target_file_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp4")
+
+            file_path = await async_fast_download(user_app, msg, target_file_path, dl_progress, job_id)
+
+            if file_path and os.path.exists(file_path):
+                job['file_path'] = file_path
+                await update_job_status(job_id, "downloaded", file_path=file_path)
+                await upload_queue.put(job)
+            else:
+                await update_job_status(job_id, "waiting")
+
+        except Exception as e:
+            if str(e) == "ForceAbort":
+                delete_file_on_exit = True
+            else:
+                console.print(f"[bold red]DL failed {display_name}: {e}[/bold red]")
+                await update_job_status(job_id, "waiting")
+        finally:
+            if delete_file_on_exit and file_path and os.path.exists(file_path):
+                try: os.remove(file_path)
+                except: pass
+            if rich_task is not None: progress_ui.remove_task(rich_task)
+            active_jobs.pop(dl_key, None)
+            active_q.task_done()
+
+async def upload_worker(worker_id):
+    while True:
+        await pause_event.wait()
+        job = await upload_queue.get()
+        job_id = job['job_id']
+        up_key = f"{job_id}_UP"
+        file_path = job.get('file_path')
+        display_name = f"{job['query']} (Pt.{job['idx']})"
+        rich_task = None
+        delete_file_on_exit = False
+
+        try:
+            if job_id in cancelled_jobs:
+                delete_file_on_exit = True
+                continue
+
+            if not file_path or not os.path.exists(file_path):
+                await update_job_status(job_id, "waiting", file_path=None)
+                target_q = download_queue_t2 if job.get('tier', 1) == 2 else download_queue_t1
+                await target_q.put(job)
+                continue
+
+            if not await _validate_video_file(file_path) or not await _deep_validate_video_file(file_path):
+                console.print(f"[bold red]⚠️ Corrupt file detected before upload, requeueing for redownload: {file_path}[/bold red]")
+                try: os.remove(file_path)
+                except: pass
+                job['file_path'] = None
+                await update_job_status(job_id, "waiting", file_path="")
+                target_q = download_queue_t2 if job.get('tier', 1) == 2 else download_queue_t1
+                await target_q.put(job)
+                continue
+
+            try:
+                file_path = await _ensure_h264_aac(file_path)
+                job['file_path'] = file_path 
+            except Exception as e:
+                console.print(f"[bold red]❌ Transcoding failed for {display_name}: {e}[/bold red]")
+                try: os.remove(file_path)
+                except: pass
+                job['file_path'] = None
+                await update_job_status(job_id, "waiting", file_path="")
+                await download_queue_t2.put(job) 
+                continue
+
+            album_id = job.get('album_id')
+            if not album_id or album_id <= 0:
+                album_id = await get_or_create_vk_album(job.get('album_name'))
+                job['album_id'] = album_id
+
+            active_jobs[up_key] = {"name": display_name, "action": "📤 UP", "progress": 0, "speed": "0 MB/s", "eta": "Calc...", "start_time": time.time(), "job_id": job_id}
+            rich_task = progress_ui.add_task(f"[magenta]📤 UP (Fallback) {display_name}", total=100, name=display_name)
+            await update_job_status(job_id, "uploading")
+
+            title = display_title(job['album_name'], job['idx'], job.get('caption', ''), job['msg_id'])
+
+            def up_progress(current, total):
+                if job_id in cancelled_jobs: raise Exception("ForceAbort")
+                update_metrics(up_key, rich_task, "📤 UP", current, total)
+
+            upload_succeeded = False
+            for save_attempt in range(3):
+                upload_info = None
+                for attempt in range(5):
+                    try:
+                        upload_info = await asyncio.to_thread(vk.video.save, name=title, description=job.get('caption', ''), album_id=album_id)
+                        break
+                    except Exception:
+                        await asyncio.sleep(4)
+
+                if not upload_info:
+                    raise Exception("VKVideoSaveFailed")
+
+                await asyncio.to_thread(_sync_vk_fallback_upload, upload_info['upload_url'], file_path, up_progress, job_id)
+
+                video_id = upload_info.get('video_id')
+                owner_id = upload_info.get('owner_id', my_vk_id)
+
+                if video_id is None:
+                    upload_succeeded = True
+                    break
+
+                if await verify_vk_video_ready(owner_id, video_id):
+                    upload_succeeded = True
+                    break
+
+                try: await asyncio.to_thread(vk.video.delete, owner_id=owner_id, video_id=video_id)
+                except Exception: pass
+
+            if not upload_succeeded:
+                vk_reupload_attempts[job_id] = vk_reupload_attempts.get(job_id, 0) + 1
+                await update_job_status(job_id, "failed_vk_verify")
+                await on_job_permanently_failed(job, "VK repeatedly failed to process this video after upload.")
+                delete_file_on_exit = True
+                continue
+
+            vk_video_title_cache.setdefault(album_id, set()).add(title)
+            await update_job_status(job_id, "done") 
+            delete_file_on_exit = True
+            await db_execute("UPDATE monitored_messages SET is_queued=1 WHERE chat_id=? AND msg_id=?", (job['msg_chat_id'], job['msg_id']))
+            await on_job_finished(job)
+
+        except Exception as e:
+            if str(e) == "ForceAbort":
+                delete_file_on_exit = True
+            else:
+                console.print(f"[bold red]UP failed {display_name}: {e}[/bold red]")
+                await update_job_status(job_id, "downloaded")
+                await upload_queue.put(job)
+                await asyncio.sleep(3)
+        finally:
+            if delete_file_on_exit and file_path and os.path.exists(file_path):
+                try: os.remove(file_path)
+                except: pass
+            if rich_task is not None: progress_ui.remove_task(rich_task)
+            active_jobs.pop(up_key, None)
+            upload_queue.task_done()
+            
