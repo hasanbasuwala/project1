@@ -3241,6 +3241,13 @@ async def worker_pipeline(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.
     async def dl_worker(pool: WorkerPool):
         while True:
             jid = await dl_q.get()
+            
+            # 🚦 TRAFFIC LIGHT (Backpressure)
+            # If Prepare or Upload queues have items waiting, pause this downloader.
+            # This prevents raw video files from piling up on your hard drive!
+            while (enc_q.qsize() >= max(1, enc_pool.target)) or (up_q.qsize() >= max(1, up_pool.target)):
+                await asyncio.sleep(3)
+
             try:
                 jobs = await db.get_active_jobs()
                 j_data = next((j for j in jobs if j['id'] == jid), None)
