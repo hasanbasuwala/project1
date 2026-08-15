@@ -2072,6 +2072,31 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
             if row: kb.append(row)
             kb.append([InlineKeyboardButton(TXT.BTN_REFRESH, callback_data="cmd|wait|refresh")])
         return "\n".join(lines), InlineKeyboardMarkup(kb)
+        
+    async def render_processed_status(db: JobScheduler):
+        jobs = await db.get_active_jobs()
+        # Grab jobs that are fully downloaded or encoded, but aren't actively processing
+        proc_jobs = [j for j in jobs if (j.get('stage') or "").lower() in ["downloaded", "encoded"]]
+        
+        lines = [TXT.CMD_PROC_TITLE, TXT.DIVIDER]
+        kb = []
+        if not proc_jobs:
+            lines.append(TXT.CMD_EMPTY)
+            kb.append([InlineKeyboardButton(TXT.BTN_REFRESH, callback_data="cmd|proc|refresh")])
+        else:
+            row = []
+            for i, j in enumerate(proc_jobs):
+                title = clean_title(j['title'])[:30]
+                stage = (j.get('stage') or "").upper()
+                lines.append(f"`{i+1}.` [{stage}] {title}")
+                # Creates buttons side-by-side like [ 📤 Push #1 ] [ 📤 Push #2 ]
+                row.append(InlineKeyboardButton(f"📤 Push #{i+1}", callback_data=f"cmd|upforce|{j['id']}"))
+                if len(row) == 2:
+                    kb.append(row)
+                    row = []
+            if row: kb.append(row)
+            kb.append([InlineKeyboardButton(TXT.BTN_REFRESH, callback_data="cmd|proc|refresh")])
+        return "\n".join(lines), InlineKeyboardMarkup(kb)
 
     @app.on_message(filters.command(["download"]) & filters.user(OWNER_ID))
     async def cmd_download(_, msg: Message):
@@ -2086,6 +2111,11 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
     @app.on_message(filters.command(["waiting"]) & filters.user(OWNER_ID))
     async def cmd_waiting(_, msg: Message):
         text, kb = await render_waiting_status(db)
+        await msg.reply(text, reply_markup=kb)
+        
+    @app.on_message(filters.command(["processed"]) & filters.user(OWNER_ID))
+    async def cmd_processed(_, msg: Message):
+        text, kb = await render_processed_status(db)
         await msg.reply(text, reply_markup=kb)
 
     # ──────────────────────────────────────────────
