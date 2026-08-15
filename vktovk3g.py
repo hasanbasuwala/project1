@@ -338,6 +338,8 @@ class TXT:
     CMD_EMPTY      = "└ None currently."
     BTN_REFRESH    = "🔄 Refresh"
     TOAST_FORCED   = "✅ Pushed to the front of the queue!"
+    CMD_PROC_TITLE  = "💾 **PROCESSED & WAITING UPLOAD**"
+    TOAST_UP_FORCED = "✅ Pushed to the active queue!"
 
 
 # ═══════════════════════════════════════════════════════════════════════
