@@ -1376,7 +1376,7 @@ class UploaderEngine:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# CH 08 — DASHBOARD RENDERER + WORKER PANEL RENDERER
+# CH 08 — DASHBOARD RENDERER + WORKER PANEL RENDERER + AUTOSCAN MENUS
 # ═══════════════════════════════════════════════════════════════════════
 async def safe_edit(app: Client, chat_id: int, msg_id: int, text: str, kb: InlineKeyboardMarkup | None = None):
     try: await app.edit_message_text(chat_id, msg_id, text, reply_markup=kb)
@@ -1459,9 +1459,7 @@ async def render_dashboard(db: JobScheduler, tab: str = "playlists", exp_pl: str
                             for j in job_list:
                                 jid, is_j_open, clean_t = j['id'], (exp_jid == j['id']), clean_title(j['title'])
                                 if is_j_open:
-                                    speed, eta, p = "—", "—", [x.strip() for x in (j.get('stage') or "").split("|")]
-                                    if len(p) >= 3: speed, eta = p[1], p[2]
-                                    elif len(p) == 2: speed = p[1]
+                                    speed, eta, p = [x.strip() for x in (j.get('stage') or "").split("|")] + ["—", "—"][:max(0, 2 - len((j.get('stage') or "").split("|")))]
                                     pct = float(j.get('pct', 0.0) or 0.0)
                                     kb.extend([
                                         [InlineKeyboardButton(f"{TXT.JOB_CARD_ID_LABEL}: {jid}", callback_data="noop")],
@@ -1485,7 +1483,7 @@ async def render_dashboard(db: JobScheduler, tab: str = "playlists", exp_pl: str
                     kb.append([InlineKeyboardButton(TXT.PL_PURGE_BTN, callback_data=f"kill|{pl['id']}")])
                     kb.append([InlineKeyboardButton("───────────────────", callback_data="noop")])
 
-    # ---- AUTOSCAN dedicated section — collapsed by default, tap to expand ----
+    # ---- AUTOSCAN side-by-side buttons ----
     ascan_tags = await db.get_autoscan_tags()
     ascan_comms = await db.get_autoscan_communities()
     ascan_enabled = (await db.get_autoscan_state('enabled', '0')) == '1'
@@ -1495,33 +1493,16 @@ async def render_dashboard(db: JobScheduler, tab: str = "playlists", exp_pl: str
 
     kb.append([InlineKeyboardButton("───────────────────", callback_data="noop")])
     kb.append([InlineKeyboardButton(
-        f"{'[-]' if _autoscan_panel_expanded else '[+]'} {TXT.ASCAN_PANEL_HDR} (🏷{len(ascan_tags)} 📡{len(ascan_comms)}) {TXT.ASCAN_PANEL_ON if ascan_enabled else TXT.ASCAN_PANEL_OFF}",
+        f"{'[-]' if _autoscan_panel_expanded else '[+]'} {TXT.ASCAN_PANEL_HDR} {TXT.ASCAN_PANEL_ON if ascan_enabled else TXT.ASCAN_PANEL_OFF}",
         callback_data="ascan_ui|toggle"
     )])
 
     if _autoscan_panel_expanded:
-        kb.append([InlineKeyboardButton(TXT.ASCAN_PANEL_TAGS_HDR, callback_data="noop")])
-        if not ascan_tags:
-            kb.append([InlineKeyboardButton(TXT.ASCAN_PANEL_EMPTY, callback_data="noop")])
-        else:
-            for t in ascan_tags[:10]:
-                kb.append([InlineKeyboardButton(f"      🏷 #{t['tag']}", callback_data="noop"), InlineKeyboardButton("❌", callback_data=f"ascan|rmtag|{t['id']}")])
-            if len(ascan_tags) > 10:
-                kb.append([InlineKeyboardButton(f"      …and {len(ascan_tags) - 10} more", callback_data="noop")])
-        kb.append([InlineKeyboardButton(TXT.ASCAN_PANEL_ADD_TAG_BTN, callback_data="ascan|addtag")])
-
-        kb.append([InlineKeyboardButton(TXT.ASCAN_PANEL_COMMS_HDR, callback_data="noop")])
-        if not ascan_comms:
-            kb.append([InlineKeyboardButton(TXT.ASCAN_PANEL_EMPTY, callback_data="noop")])
-        else:
-            for c in ascan_comms[:10]:
-                label = (c.get('display_name') or c['url'])[:26]
-                status_dot = "🟢" if c.get('historical_done') else "🟡"
-                kb.append([InlineKeyboardButton(f"      📡 {status_dot} {label}", callback_data="noop"), InlineKeyboardButton("❌", callback_data=f"ascan|rmcomm|{c['id']}")])
-            if len(ascan_comms) > 10:
-                kb.append([InlineKeyboardButton(f"      …and {len(ascan_comms) - 10} more", callback_data="noop")])
-        kb.append([InlineKeyboardButton(TXT.ASCAN_PANEL_ADD_COMM_BTN, callback_data="ascan|addcomm")])
-
+        # Side-by-side menu buttons for Tags and Communities
+        kb.append([
+            InlineKeyboardButton(TXT.ASCAN_BTN_TAGS.format(n=len(ascan_tags)), callback_data="ascan_page|tags|0"),
+            InlineKeyboardButton(TXT.ASCAN_BTN_COMMS.format(n=len(ascan_comms)), callback_data="ascan_page|comms|0")
+        ])
         kb.append([
             InlineKeyboardButton(TXT.ASCAN_PANEL_TOGGLE_OFF_BTN if ascan_enabled else TXT.ASCAN_PANEL_TOGGLE_ON_BTN, callback_data="ascan|togglepause"),
             InlineKeyboardButton(TXT.ASCAN_PANEL_RESCAN_BTN, callback_data="ascan|rescan")
@@ -1533,13 +1514,93 @@ async def render_dashboard(db: JobScheduler, tab: str = "playlists", exp_pl: str
     return text, InlineKeyboardMarkup(kb)
 
 
+async def render_autoscan_tags(db: JobScheduler, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Renders a dedicated, paginated screen for Hashtags."""
+    tags = await db.get_autoscan_tags()
+    ITEMS_PER_PAGE = 10
+    total_pages = max(1, (len(tags) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+
+    start_idx = page * ITEMS_PER_PAGE
+    page_tags = tags[start_idx : start_idx + ITEMS_PER_PAGE]
+
+    text = f"{TXT.ASCAN_TAGS_TITLE.format(p=page+1, total=total_pages)}\n{TXT.DIVIDER}\n"
+    kb = []
+    
+    if not page_tags:
+        text += TXT.ASCAN_PANEL_EMPTY + "\n"
+    else:
+        for t in page_tags:
+            kb.append([
+                InlineKeyboardButton(f"🏷 #{t['tag']}", callback_data="noop"),
+                InlineKeyboardButton("❌", callback_data=f"ascan|rmtag|{t['id']}")
+            ])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(TXT.PAGE_PREV, callback_data=f"ascan_page|tags|{page-1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(TXT.PAGE_NEXT, callback_data=f"ascan_page|tags|{page+1}"))
+    if nav_row:
+        kb.append(nav_row)
+
+    kb.append([InlineKeyboardButton(TXT.ASCAN_PANEL_ADD_TAG_BTN, callback_data="ascan|addtag")])
+    kb.append([InlineKeyboardButton(TXT.ASCAN_BTN_BACK_DASH, callback_data="dash_view|main")])
+
+    return text, InlineKeyboardMarkup(kb)
+
+
+async def render_autoscan_comms(db: JobScheduler, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Renders a dedicated, paginated screen for Communities."""
+    comms = await db.get_autoscan_communities()
+    ITEMS_PER_PAGE = 10
+    total_pages = max(1, (len(comms) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+
+    start_idx = page * ITEMS_PER_PAGE
+    page_comms = comms[start_idx : start_idx + ITEMS_PER_PAGE]
+
+    text = f"{TXT.ASCAN_COMMS_TITLE.format(p=page+1, total=total_pages)}\n{TXT.DIVIDER}\n"
+    kb = []
+
+    if not page_comms:
+        text += TXT.ASCAN_PANEL_EMPTY + "\n"
+    else:
+        for c in page_comms:
+            label = (c.get('display_name') or c['url'])[:26]
+            status_dot = "🟢" if c.get('historical_done') else "🟡"
+            kb.append([
+                InlineKeyboardButton(f"📡 {status_dot} {label}", callback_data="noop"),
+                InlineKeyboardButton("❌", callback_data=f"ascan|rmcomm|{c['id']}")
+            ])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(TXT.PAGE_PREV, callback_data=f"ascan_page|comms|{page-1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(TXT.PAGE_NEXT, callback_data=f"ascan_page|comms|{page+1}"))
+    if nav_row:
+        kb.append(nav_row)
+
+    kb.append([InlineKeyboardButton(TXT.ASCAN_PANEL_ADD_COMM_BTN, callback_data="ascan|addcomm")])
+    kb.append([InlineKeyboardButton(TXT.ASCAN_BTN_BACK_DASH, callback_data="dash_view|main")])
+
+    return text, InlineKeyboardMarkup(kb)
+
+
 async def refresh_dashboard(app: Client, db: JobScheduler):
-    """Re-renders and pushes the live dashboard message, if one is open. Shared
-    by the router (after any state-changing action) and by the Autoscan engine
-    (after a background poll finds something new)."""
+    """Re-renders the correct view (Main Dash, Tags Page, or Comms Page) based on current state."""
     global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid
+    global _dash_view_mode, _dash_ascan_page
+    
     if _dash_msg_id and _dash_chat_id:
-        text, kb = await render_dashboard(db, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid)
+        if _dash_view_mode == "ascan_tags":
+            text, kb = await render_autoscan_tags(db, _dash_ascan_page)
+        elif _dash_view_mode == "ascan_comms":
+            text, kb = await render_autoscan_comms(db, _dash_ascan_page)
+        else:
+            text, kb = await render_dashboard(db, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid)
+            
         await safe_edit(app, _dash_chat_id, _dash_msg_id, text, kb)
 
 
