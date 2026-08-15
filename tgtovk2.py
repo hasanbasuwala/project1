@@ -2352,7 +2352,6 @@ async def reset_cmd(client, message):
     ]])
     await message.reply_text("⚠️ **This will permanently delete ALL jobs, playlists, monitors, topic mappings, transfer history, and downloaded files, and reset the engine to a clean slate.**\n\nAre you sure?", reply_markup=confirm_kbd, parse_mode=ParseMode.MARKDOWN)
 
-@bot_app.on_message(filters.private & filters.text & ~filters.command(["start", "help", "refresh", "monitor", "monitoralways", "monitorselected", "transfer", "copy", "autotransfer", "reset", "setmasterforum"]))
 # ==========================================
 # DIRECT MEDIA UPLOAD HANDLER (DRAG & DROP)
 # ==========================================
@@ -2422,6 +2421,7 @@ async def direct_media_receiver(client, message):
         # Single video handling
         await process_direct_media(chat_id, [message])
 
+@bot_app.on_message(filters.private & filters.text & ~filters.command(["start", "help", "refresh", "monitor", "monitoralways", "monitorselected", "transfer", "copy", "autotransfer", "reset", "setmasterforum"]))
 async def handle_user_input(client, message):
     chat_id = message.chat.id
     state = user_states.get(chat_id, {})
