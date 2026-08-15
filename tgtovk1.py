@@ -1502,7 +1502,6 @@ async def scheduler_loop():
         await asyncio.sleep(0.5)
         if engine_state != ENGINE_RUNNING: continue
         
-        # We target a specific inflight amount across all active queues
         inflight = relay_queue.qsize() + download_queue_t1.qsize() + download_queue_t2.qsize()
         if inflight >= (MAX_RELAY_WORKERS + DL_WORKERS) * 2:
             continue
@@ -1528,7 +1527,7 @@ async def scheduler_loop():
                 continue
 
             await update_job_status(job['job_id'], "queued")
-            await relay_queue.put(job) # ALL jobs start in the Relay Queue!
+            await relay_queue.put(job) 
             pushed = True
             break
 
@@ -1542,7 +1541,7 @@ async def relay_worker(worker_id):
         await pause_event.wait()
         job = await relay_queue.get()
         job_id = job['job_id']
-        job_id_context.set(job_id) # For the sync queue reader
+        job_id_context.set(job_id) 
         
         up_key = f"{job_id}_RELAY"
         display_name = f"{job['query']} (Pt.{job['idx']})"
@@ -1653,6 +1652,7 @@ async def relay_worker(worker_id):
                 console.print(f"[bold yellow]💀 Aborted RELAY: {display_name}[/bold yellow]")
             else:
                 console.print(f"[bold red]Fatal Relay Worker error: {e}[/bold red]")
+                await tg_log(f"Relay Engine crashed on: **{display_name}**", e)
         finally:
             if rich_task is not None: progress_ui.remove_task(rich_task)
             active_jobs.pop(up_key, None)
@@ -1711,6 +1711,7 @@ async def download_worker(worker_id):
                 delete_file_on_exit = True
             else:
                 console.print(f"[bold red]DL failed {display_name}: {e}[/bold red]")
+                await tg_log(f"Disk Downloader failed on: **{display_name}**", e)
                 await update_job_status(job_id, "waiting")
         finally:
             if delete_file_on_exit and file_path and os.path.exists(file_path):
@@ -1826,6 +1827,7 @@ async def upload_worker(worker_id):
                 delete_file_on_exit = True
             else:
                 console.print(f"[bold red]UP failed {display_name}: {e}[/bold red]")
+                await tg_log(f"Disk Uploader failed on: **{display_name}**\nRequeueing for DL.", e)
                 await update_job_status(job_id, "downloaded")
                 await upload_queue.put(job)
                 await asyncio.sleep(3)
