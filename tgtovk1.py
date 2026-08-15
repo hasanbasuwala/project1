@@ -2164,6 +2164,38 @@ async def tg_log(context_msg, exc=None):
     except Exception:
         pass
 
+# --- URL PARSER & FETCHER HELPER ---
+def extract_tg_links(text):
+    """Parses both private (c/chat_id/msg_id) and public (username/msg_id) links."""
+    pattern = r"t\.me/(?:c/(\d+)/(\d+)|([a-zA-Z0-9_]+)/(\d+))"
+    matches = re.findall(pattern, text)
+    links = []
+    for m in matches:
+        if m[0] and m[1]: # Private link
+            links.append((int("-100" + m[0]), int(m[1])))
+        elif m[2] and m[3]: # Public link
+            links.append((m[2], int(m[3])))
+    return links
+
+async def fetch_linked_media(client, links):
+    """Fetches media from links and safely expands Media Groups."""
+    valid_msgs = []
+    processed_groups = set()
+    for chat_id, msg_id in links:
+        try:
+            msg = await client.get_messages(chat_id, msg_id)
+            if not msg: continue
+            if msg.media_group_id:
+                if msg.media_group_id in processed_groups: continue
+                processed_groups.add(msg.media_group_id)
+                group = await client.get_media_group(chat_id, msg_id)
+                valid_msgs.extend([m for m in sorted(group, key=lambda x: x.id) if m.video or m.document])
+            elif msg.video or msg.document:
+                valid_msgs.append(msg)
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Failed to fetch link {chat_id}/{msg_id}: {e}[/yellow]")
+    return valid_msgs
+
 
 @bot_app.on_message(filters.command("start"))
 async def start_cmd(client, message):
@@ -2324,10 +2356,86 @@ async def reset_cmd(client, message):
 async def handle_user_input(client, message):
     chat_id = message.chat.id
     state = user_states.get(chat_id, {})
+    text = message.text or ""
 
+    # ==========================================
+    # 1. LINK IMPORT LOGIC (VK ROUTE)
+    # ==========================================
+    if state.get('awaiting_vk_playlist_for_links'):
+        playlist_name = text.strip()
+        msgs = state.get('linked_msgs', [])
+        user_states.pop(chat_id, None)
+        
+        status_msg = await message.reply_text(f"⚙️ Setting up VK Playlist: {playlist_name}...")
+        album_id = await get_or_create_vk_album(playlist_name)
+        
+        if not album_id:
+            return await status_msg.edit_text("❌ Failed to resolve or create the VK playlist.")
+            
+        playlist_id = await create_playlist(chat_id, "Link Import", playlist_name, album_id, len(msgs))
+        
+        for i, msg in enumerate(msgs, 1):
+            caption = msg.caption or "Imported from Link"
+            # Ensure unique job ID for manual link imports
+            job_id = f"link_{msg.chat.id}_{msg.id}_{int(time.time())}_{i}"
+            job = {
+                'job_id': job_id, 'playlist_id': playlist_id, 'chat_id': chat_id,
+                'msg_chat_id': msg.chat.id, 'msg_id': msg.id, 'album_id': album_id,
+                'album_name': playlist_name, 'query': "Link Import", 'idx': i,
+                'is_pilot': False, 'status': 'queued', 'file_path': None, 'caption': caption, 'tier': 1
+            }
+            await save_job(job)
+            await relay_queue.put(job)
+        
+        await set_playlist_status(playlist_id, "RUNNING")
+        await status_msg.edit_text(f"✅ Successfully queued **{len(msgs)} videos** to VK playlist: **{playlist_name}**!")
+        await render_dashboard()
+        return
+
+    # ==========================================
+    # 2. LINK IMPORT LOGIC (TG ROUTE)
+    # ==========================================
+    if state.get('awaiting_tg_dest_for_links'):
+        dest_raw = text.strip()
+        msgs = state.get('linked_msgs', [])
+        user_states.pop(chat_id, None)
+        
+        status_msg = await message.reply_text(f"⚙️ Resolving destination {dest_raw}...")
+        try:
+            if dest_raw.lstrip("-").isdigit():
+                dest_chat = await user_app.get_chat(int(dest_raw))
+            else:
+                dest_chat = await user_app.get_chat(dest_raw)
+            dest_id = dest_chat.id
+        except Exception as e:
+            return await status_msg.edit_text(f"❌ Could not resolve destination: {e}")
+            
+        await status_msg.edit_text(f"📋 Copying messages to **{dest_chat.title or dest_id}**...")
+        
+        processed_groups = set()
+        copied = 0
+        for msg in msgs:
+            try:
+                if msg.media_group_id:
+                    if msg.media_group_id in processed_groups: continue
+                    processed_groups.add(msg.media_group_id)
+                    await user_app.copy_media_group(dest_id, msg.chat.id, msg.id)
+                else:
+                    await user_app.copy_message(dest_id, msg.chat.id, msg.id)
+                copied += 1
+                await asyncio.sleep(1.5) # Stagger to avoid TG flood limits
+            except Exception as e:
+                console.print(f"[yellow]⚠️ Failed to copy msg {msg.id}: {e}[/yellow]")
+        
+        await status_msg.edit_text(f"✅ Finished copying media to **{dest_chat.title or dest_id}**.")
+        return
+
+    # ==========================================
+    # 3. EXISTING STATE HANDLERS
+    # ==========================================
     if state.get('awaiting_custom_tags'):
         state['awaiting_custom_tags'] = False
-        custom_tags = [x.strip().lower().replace("#", "") for x in message.text.split(",") if x.strip()]
+        custom_tags = [x.strip().lower().replace("#", "") for x in text.split(",") if x.strip()]
         state['custom_tags'] = custom_tags
         
         if state['cmd_type'] == "autotransfer":
@@ -2344,7 +2452,7 @@ async def handle_user_input(client, message):
 
     if state.get('awaiting_monitor_input'):
         user_states.pop(chat_id, None)
-        raw_inputs = message.text.split(",")
+        raw_inputs = text.split(",")
         status_msg = await message.reply_text("⚙️ Launching background history scanners...")
         success_count = 0
         for target in raw_inputs:
@@ -2356,7 +2464,7 @@ async def handle_user_input(client, message):
 
     if state.get('awaiting_tag_search'):
         user_states.pop(chat_id, None)
-        query_tag = message.text.strip().lower()
+        query_tag = text.strip().lower()
         if not query_tag.startswith("#"): query_tag = f"#{query_tag}"
         exists = await db_execute("SELECT COUNT(*) FROM monitored_messages WHERE tag=?", (query_tag,), fetch="one")
         if not exists or exists[0] == 0:
@@ -2366,13 +2474,36 @@ async def handle_user_input(client, message):
         await render_dashboard()
         return
 
+    # ==========================================
+    # 4. LINK DETECTION INTERCEPTOR
+    # ==========================================
+    if "t.me/" in text and not state.get('awaiting_group'):
+        links = extract_tg_links(text)
+        if links:
+            status_msg = await message.reply_text("🔍 Fetching media from links...\n_(If you posted a link to a large album, this might take a moment)_", parse_mode=ParseMode.MARKDOWN)
+            msgs = await fetch_linked_media(user_app, links)
+            
+            if not msgs:
+                return await status_msg.edit_text("❌ No valid videos or documents found in those links.")
+            
+            user_states[chat_id] = {'linked_msgs': msgs}
+            
+            kbd = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📥 Download to VK", callback_data="link_action_vk")],
+                [InlineKeyboardButton("📋 Copy to TG Group", callback_data="link_action_tg")]
+            ])
+            return await status_msg.edit_text(f"✅ Successfully found **{len(msgs)}** videos attached to your links.\n\nWhere do you want to send them?", reply_markup=kbd)
+
+    # ==========================================
+    # 5. DEFAULT BEHAVIOR (VK SEARCH)
+    # ==========================================
     if not state.get('awaiting_group'):
-        search_query = message.text.strip()
+        search_query = text.strip()
         search_query = search_query.lower() if search_query.startswith("#") else f"#{search_query.lower()}"
         user_states[chat_id] = {'query': search_query, 'awaiting_group': True}
         return await message.reply_text(UI_STRINGS["vk_search"].format(query=search_query), parse_mode=ParseMode.MARKDOWN)
 
-    try: target_group_id = int(message.text.strip())
+    try: target_group_id = int(text.strip())
     except ValueError: return await message.reply_text("⚠️ Invalid numeric ID.")
 
     status_msg = await message.reply_text(UI_STRINGS["scanning_group"])
@@ -2413,6 +2544,7 @@ async def handle_user_input(client, message):
     ])
     
     await status_msg.edit_text(UI_STRINGS["found_preview"].format(query=state['query'], new=len(new_msgs), skipped=skipped_count), parse_mode=ParseMode.MARKDOWN, reply_markup=kbd)
+
 
 @user_app.on_message(filters.video | filters.document)
 async def live_monitor_handler(client, message):
@@ -2455,6 +2587,22 @@ async def handle_buttons(client, callback):
             return await callback.answer()
 
         elif data == "noop": return await callback.answer()
+        
+        # --- LINK ACTION HANDLERS ---
+        elif data == "link_action_vk":
+            state = user_states.get(chat_id)
+            if not state or 'linked_msgs' not in state: return await callback.answer("Session expired", show_alert=True)
+            state['awaiting_vk_playlist_for_links'] = True
+            await callback.message.edit_text("🎵 **Send the name of the VK Playlist** where these videos should be uploaded.", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        elif data == "link_action_tg":
+            state = user_states.get(chat_id)
+            if not state or 'linked_msgs' not in state: return await callback.answer("Session expired", show_alert=True)
+            state['awaiting_tg_dest_for_links'] = True
+            await callback.message.edit_text("📋 **Send the Destination TG Group ID or Username**.", parse_mode=ParseMode.MARKDOWN)
+            return
+        # ---------------------------
 
         elif data.startswith("plcontinue_"):
             try: await callback.answer("▶️ Continuing playlist...")
