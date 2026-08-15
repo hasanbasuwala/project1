@@ -2005,12 +2005,86 @@ async def autoscan_engine_loop(db: JobScheduler, app: Client):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# CH 11 — ROUTER: COMMAND HANDLERS & CALLBACK HANDLERS
+# CH 11 — ROUTER: COMbMAND HANDLERS & CALLBACK HANDLERS
 # ═══════════════════════════════════════════════════════════════════════
 def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.Queue, up_q: asyncio.Queue, dl_pool: "WorkerPool", enc_pool: "WorkerPool", up_pool: "WorkerPool"):
 
     async def refresh_dashboard_if_open():
         await refresh_dashboard(app, db)
+        
+    # ──────────────────────────────────────────────
+    # Status Renderers & Commands (/download, /upload, /waiting)
+    # ──────────────────────────────────────────────
+    async def render_download_status(db: JobScheduler):
+        jobs = await db.get_active_jobs()
+        dl_jobs = [j for j in jobs if (j.get('stage') or "").lower().startswith(('queued', 'download'))]
+        lines = [TXT.CMD_DL_TITLE, TXT.DIVIDER]
+        if not dl_jobs:
+            lines.append(TXT.CMD_EMPTY)
+        else:
+            for j in dl_jobs:
+                title = clean_title(j['title'])[:30]
+                pct = float(j.get('pct') or 0.0)
+                stage_parts = (j.get('stage') or "").split('|')
+                speed = stage_parts[1].strip() if len(stage_parts) > 1 else "~"
+                eta = stage_parts[2].strip() if len(stage_parts) > 2 else "~"
+                lines.append(f"📥 **{title}**\n└ `[{make_bar(pct, 10)}] {pct:.1f}% | ⚡ {speed} | ⏳ {eta}`\n")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(TXT.BTN_REFRESH, callback_data="cmd|dl|refresh")]])
+        return "\n".join(lines), kb
+
+    async def render_upload_status(db: JobScheduler):
+        jobs = await db.get_active_jobs()
+        up_jobs = [j for j in jobs if (j.get('stage') or "").lower().startswith(('encod', 'upload'))]
+        lines = [TXT.CMD_UP_TITLE, TXT.DIVIDER]
+        if not up_jobs:
+            lines.append(TXT.CMD_EMPTY)
+        else:
+            for j in up_jobs:
+                title = clean_title(j['title'])[:30]
+                pct = float(j.get('pct') or 0.0)
+                stage_parts = (j.get('stage') or "").split('|')
+                stage_name = stage_parts[0].strip().upper()
+                speed = stage_parts[1].strip() if len(stage_parts) > 1 else "~"
+                progress = stage_parts[2].strip() if len(stage_parts) > 2 else "~"
+                lines.append(f"📤 **{title}**\n└ `[{make_bar(pct, 10)}] {pct:.1f}% | {stage_name} | ⚡ {speed} | 📊 {progress}`\n")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(TXT.BTN_REFRESH, callback_data="cmd|up|refresh")]])
+        return "\n".join(lines), kb
+
+    async def render_waiting_status(db: JobScheduler):
+        items = await db.get_global_pending_items(limit=10)
+        lines = [TXT.CMD_WAIT_TITLE.format(n=len(items)), TXT.DIVIDER]
+        kb = []
+        if not items:
+            lines.append(TXT.CMD_EMPTY)
+            kb.append([InlineKeyboardButton(TXT.BTN_REFRESH, callback_data="cmd|wait|refresh")])
+        else:
+            row = []
+            for i, item in enumerate(items):
+                title = clean_title(item['title'])[:35]
+                lines.append(f"`{i+1}.` {title}")
+                # Creates buttons side-by-side like [ ▶️ Start #1 ] [ ▶️ Start #2 ]
+                row.append(InlineKeyboardButton(f"▶️ Start #{i+1}", callback_data=f"cmd|force|{item['id']}"))
+                if len(row) == 2:
+                    kb.append(row)
+                    row = []
+            if row: kb.append(row)
+            kb.append([InlineKeyboardButton(TXT.BTN_REFRESH, callback_data="cmd|wait|refresh")])
+        return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+    @app.on_message(filters.command(["download"]) & filters.user(OWNER_ID))
+    async def cmd_download(_, msg: Message):
+        text, kb = await render_download_status(db)
+        await msg.reply(text, reply_markup=kb)
+
+    @app.on_message(filters.command(["upload"]) & filters.user(OWNER_ID))
+    async def cmd_upload(_, msg: Message):
+        text, kb = await render_upload_status(db)
+        await msg.reply(text, reply_markup=kb)
+
+    @app.on_message(filters.command(["waiting"]) & filters.user(OWNER_ID))
+    async def cmd_waiting(_, msg: Message):
+        text, kb = await render_waiting_status(db)
+        await msg.reply(text, reply_markup=kb)
 
     # ──────────────────────────────────────────────
     # 11.0 — Autoscan wizard/quick-add text interceptor.
