@@ -874,10 +874,6 @@ class JobScheduler:
             self.conn.commit()
 
     async def get_pending_items(self, pl_id: str, limit: int = 2) -> list[dict]:
-        # ORDER BY rowid guarantees we always claim items in the exact
-        # order they were inserted — critical for oldest-first queuing
-        # (see CH 04 helper `oldest_first` / call sites in CH 11), since
-        # VK's own list endpoints return newest-first by default.
         async with self.lock:
             return [dict(r) for r in self.conn.execute('SELECT * FROM playlist_items WHERE playlist_id = ? AND status = "pending" ORDER BY rowid ASC LIMIT ?', (pl_id, limit)).fetchall()]
 
@@ -885,6 +881,22 @@ class JobScheduler:
         async with self.lock:
             row = self.conn.execute('SELECT COUNT(*) FROM playlist_items WHERE playlist_id = ? AND status = "pending"', (pl_id,)).fetchone()
             return row[0] if row else 0
+
+    async def get_global_pending_items(self, limit: int = 10) -> list[dict]:
+        """Fetches the next N pending items across ALL active playlists."""
+        async with self.lock:
+            return [dict(r) for r in self.conn.execute(
+                '''SELECT pi.* FROM playlist_items pi
+                   JOIN playlists p ON pi.playlist_id = p.id
+                   WHERE pi.status = "pending" AND p.status = "active"
+                   ORDER BY pi.rowid ASC LIMIT ?''', (limit,)
+            ).fetchall()]
+
+    async def get_item(self, item_id: str) -> dict:
+        """Fetches a single playlist item by its ID."""
+        async with self.lock:
+            row = self.conn.execute('SELECT * FROM playlist_items WHERE id = ?', (item_id,)).fetchone()
+            return dict(row) if row else {}
 
     async def update_item_status(self, item_id: str, status: str):
         async with self.lock:
