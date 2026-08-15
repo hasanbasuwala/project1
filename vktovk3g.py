@@ -322,6 +322,15 @@ class TXT:
     TERM_QUEUES   = "QUEUES | DL: {dl} | PREP: {enc} | UP: {up}"
     TERM_IDLE     = "System Idle. Awaiting playlist vectors."
 
+    # ---- Autoscan Pagination & Menus ----
+    ASCAN_BTN_TAGS           = "🏷 Hashtags ({n})"
+    ASCAN_BTN_COMMS          = "📡 Communities ({n})"
+    ASCAN_BTN_BACK_DASH      = "🔙 Back to Dashboard"
+    ASCAN_TAGS_TITLE         = "🏷 **TRACKED HASHTAGS** (Page {p}/{total})"
+    ASCAN_COMMS_TITLE        = "📡 **TRACKED COMMUNITIES** (Page {p}/{total})"
+    PAGE_PREV                = "◀ Prev"
+    PAGE_NEXT                = "Next ▶"
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # CH 01 — LOGGING SETUP
