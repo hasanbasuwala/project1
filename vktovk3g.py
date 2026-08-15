@@ -2650,7 +2650,11 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
     @app.on_message(filters.command(["vk_dash"]) & filters.user(OWNER_ID))
     async def cmd_dash(_, msg: Message):
         global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid
-        global _stack_msg_id, _stack_chat_id
+        global _stack_msg_id, _stack_chat_id, _dash_view_mode, _dash_ascan_page
+        
+        # Reset view state to root
+        _dash_view_mode = "main"
+        _dash_ascan_page = 0
         
         # 1. Spawn the Active Jobs (Stack) card first
         jobs = await db.get_active_jobs()
