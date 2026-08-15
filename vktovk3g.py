@@ -330,6 +330,14 @@ class TXT:
     ASCAN_COMMS_TITLE        = "📡 **TRACKED COMMUNITIES** (Page {p}/{total})"
     PAGE_PREV                = "◀ Prev"
     PAGE_NEXT                = "Next ▶"
+    
+        # ---- Status Commands (/download, /upload, /waiting) ----
+    CMD_DL_TITLE   = "📥 **CURRENT DOWNLOADS**"
+    CMD_UP_TITLE   = "📤 **CURRENT UPLOADS** (Including Preparation)"
+    CMD_WAIT_TITLE = "⏳ **WAITING QUEUE** (Top {n})"
+    CMD_EMPTY      = "└ None currently."
+    BTN_REFRESH    = "🔄 Refresh"
+    TOAST_FORCED   = "✅ Pushed to the front of the queue!"
 
 
 # ═══════════════════════════════════════════════════════════════════════
