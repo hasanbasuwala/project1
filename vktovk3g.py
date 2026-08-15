@@ -2806,6 +2806,43 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
         global _dash_view_mode, _dash_ascan_page
         if cb.data == "noop": return await cb.answer()
 
+        # --- Status Commands Callbacks (/download, /upload, /waiting) ---
+        if cb.data.startswith("cmd|"):
+            parts = cb.data.split("|")
+            action = parts[1]
+            
+            if action == "dl":
+                text, kb = await render_download_status(db)
+                await safe_edit(app, cb.message.chat.id, cb.message.id, text, kb)
+                return await cb.answer()
+                
+            elif action == "up":
+                text, kb = await render_upload_status(db)
+                await safe_edit(app, cb.message.chat.id, cb.message.id, text, kb)
+                return await cb.answer()
+                
+            elif action == "wait":
+                text, kb = await render_waiting_status(db)
+                await safe_edit(app, cb.message.chat.id, cb.message.id, text, kb)
+                return await cb.answer()
+                
+            elif action == "force":
+                item_id = parts[2]
+                item = await db.get_item(item_id)
+                if item and item['status'] == 'pending':
+                    pl = await db.get_playlist(item['playlist_id'])
+                    chat_id = pl['chat_id'] if pl else cb.message.chat.id
+                    # Manually pull this item into a job and feed it to the download queue
+                    await db.claim_item_as_job(item, chat_id)
+                    await dl_q.put(item['id'])
+                    await cb.answer(TXT.TOAST_FORCED, show_alert=True)
+                    # Refresh the waiting UI
+                    text, kb = await render_waiting_status(db)
+                    await safe_edit(app, cb.message.chat.id, cb.message.id, text, kb)
+                else:
+                    await cb.answer("Item is no longer waiting.", show_alert=True)
+                return
+
         # --- Dashboard View Router (Back Buttons) ---
         if cb.data.startswith("dash_view|"):
             _, target_view = cb.data.split("|")
