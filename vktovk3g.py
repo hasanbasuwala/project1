@@ -2709,7 +2709,24 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
     @app.on_callback_query()
     async def handle_callbacks(_, cb: CallbackQuery):
         global _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid
+        global _dash_view_mode, _dash_ascan_page
         if cb.data == "noop": return await cb.answer()
+
+        # --- Dashboard View Router (Back Buttons) ---
+        if cb.data.startswith("dash_view|"):
+            _, target_view = cb.data.split("|")
+            _dash_view_mode = target_view
+            _dash_ascan_page = 0
+            await cb.answer()
+            return await refresh_dashboard_if_open()
+
+        # --- Autoscan Pagination Router ---
+        if cb.data.startswith("ascan_page|"):
+            _, target_view, page_str = cb.data.split("|")
+            _dash_view_mode = f"ascan_{target_view}"
+            _dash_ascan_page = int(page_str)
+            await cb.answer()
+            return await refresh_dashboard_if_open()
 
         # --- Autoscan setup wizard callbacks ---
         if cb.data.startswith("ascanwiz|"):
@@ -2752,10 +2769,9 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
             global _autoscan_panel_expanded
             _autoscan_panel_expanded = not _autoscan_panel_expanded
             await cb.answer()
-            text, kb = await render_dashboard(db, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid)
-            return await safe_edit(app, cb.message.chat.id, cb.message.id, text, kb)
+            return await refresh_dashboard_if_open()
 
-        # --- Autoscan dashboard panel callbacks ---
+        # --- Autoscan dashboard panel actions ---
         if cb.data.startswith("ascan|"):
             parts = cb.data.split("|")
             action = parts[1]
@@ -2775,6 +2791,7 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                 row = next((t for t in rows if t['id'] == tag_id), None)
                 await db.remove_autoscan_tag(tag_id)
                 await cb.answer(TXT.ASCAN_TAG_REMOVED.format(tag=row['tag'] if row else ""))
+                return await refresh_dashboard_if_open()
 
             elif action == "rmcomm":
                 comm_id = int(parts[2])
@@ -2782,19 +2799,19 @@ def setup_router(app: Client, db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyn
                 row = next((c for c in rows if c['id'] == comm_id), None)
                 await db.remove_autoscan_community(comm_id)
                 await cb.answer(TXT.ASCAN_COMM_REMOVED.format(name=(row.get('display_name') or row.get('url')) if row else ""))
+                return await refresh_dashboard_if_open()
 
             elif action == "togglepause":
                 enabled_now = (await db.get_autoscan_state('enabled', '0')) == '1'
                 await db.set_autoscan_state('enabled', '0' if enabled_now else '1')
                 await cb.answer(TXT.ASCAN_PANEL_TOGGLE_OFF_BTN if enabled_now else TXT.ASCAN_PANEL_TOGGLE_ON_BTN)
+                return await refresh_dashboard_if_open()
 
             elif action == "rescan":
                 await db.mark_all_communities_need_rescan()
                 await cb.answer(TXT.ASCAN_RESCAN_STARTED, show_alert=True)
                 asyncio.create_task(autoscan_cycle(db, app))
-
-            text, kb = await render_dashboard(db, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid)
-            return await safe_edit(app, chat_id, cb.message.id, text, kb)
+                return await refresh_dashboard_if_open()
 
         # --- Scan Callbacks ---
         if cb.data.startswith("scan|"):
