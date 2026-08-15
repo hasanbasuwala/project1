@@ -2367,16 +2367,26 @@ async def process_direct_media(chat_id, msgs):
     status_msg = await bot_app.send_message(chat_id, "🔄 Caching media securely...")
     
     try:
+        # Safely resolve Master Forum ID (handles both -100 IDs and @usernames)
+        if str(master_forum_id).lstrip("-").isdigit():
+            forum_dest = int(master_forum_id)
+        else:
+            forum_dest = str(master_forum_id)
+
         # 1. Forward to Master Forum (Server-side copy, zero download time)
         if len(msgs) > 1:
-            fwd_msgs = await bot_app.copy_media_group(int(master_forum_id), chat_id, msgs[0].id)
+            fwd_msgs = await bot_app.copy_media_group(forum_dest, chat_id, msgs[0].id)
         else:
-            fwd_msg = await bot_app.copy_message(int(master_forum_id), chat_id, msgs[0].id)
+            fwd_msg = await bot_app.copy_message(forum_dest, chat_id, msgs[0].id)
             fwd_msgs = [fwd_msg]
             
         # 2. Generate permanent link from the Master Forum
-        clean_forum_id = str(master_forum_id).replace("-100", "")
-        perm_link = f"https://t.me/c/{clean_forum_id}/{fwd_msgs[0].id}"
+        if isinstance(forum_dest, str) and forum_dest.startswith("@"):
+            clean_username = forum_dest.replace("@", "")
+            perm_link = f"https://t.me/{clean_username}/{fwd_msgs[0].id}"
+        else:
+            clean_forum_id = str(forum_dest).replace("-100", "")
+            perm_link = f"https://t.me/c/{clean_forum_id}/{fwd_msgs[0].id}"
         
         # 3. Delete original messages from the Bot chat to keep it clean
         for m in msgs:
