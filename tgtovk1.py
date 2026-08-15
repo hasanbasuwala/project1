@@ -1152,6 +1152,9 @@ async def _ensure_h264_aac(file_path):
 # CHAPTER 5: TRANSFER ENGINES (ZERO-DISK & DISK FALLBACK)
 # ============================================================
 
+import contextvars
+job_id_context = contextvars.ContextVar('job_id', default='')
+
 # --- 5A. ZERO-DISK ENGINE ---
 
 class QueueStreamReader:
@@ -1197,10 +1200,6 @@ class QueueStreamReader:
         return self.total_size
 
 
-import contextvars
-job_id_context = contextvars.ContextVar('job_id', default='')
-
-
 async def telegram_producer(client: Client, message, queue: asyncio.Queue, file_size: int, job_id: str):
     """
     Smart zero-disk streaming. Safely disconnects from Telegram if RAM fills up 
@@ -1218,18 +1217,24 @@ async def telegram_producer(client: Client, message, queue: asyncio.Queue, file_
             continue
 
         try:
-            async for chunk in client.stream_media(message, offset=chunks_yielded):
+            chunk_data = None
+            async for chunk in client.stream_media(message, limit=1, offset=chunks_yielded):
+                chunk_data = chunk
+                break 
+
+            if chunk_data is not None:
                 if job_id in cancelled_jobs:
                     break
-                    
-                await queue.put(chunk)
+                await queue.put(chunk_data)
                 chunks_yielded += 1
                 
-                if queue.qsize() >= QUEUE_MAX_CHUNKS:
-                    break 
-                    
         except Exception as e:
             await asyncio.sleep(2)
+            # If persistent network failures happen, log to TG and exit
+            if chunks_yielded == 0: 
+                console.print(f"[red]❌ [TG Producer] Fatal error: {e}[/red]")
+                await tg_log(f"Zero-Disk Stream interrupted permanently.", e)
+                break
 
     await queue.put(None)
 
