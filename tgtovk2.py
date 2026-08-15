@@ -2353,6 +2353,75 @@ async def reset_cmd(client, message):
     await message.reply_text("⚠️ **This will permanently delete ALL jobs, playlists, monitors, topic mappings, transfer history, and downloaded files, and reset the engine to a clean slate.**\n\nAre you sure?", reply_markup=confirm_kbd, parse_mode=ParseMode.MARKDOWN)
 
 @bot_app.on_message(filters.private & filters.text & ~filters.command(["start", "help", "refresh", "monitor", "monitoralways", "monitorselected", "transfer", "copy", "autotransfer", "reset", "setmasterforum"]))
+# ==========================================
+# DIRECT MEDIA UPLOAD HANDLER (DRAG & DROP)
+# ==========================================
+direct_media_cache = {}
+
+async def process_direct_media(chat_id, msgs):
+    master_forum_id = await get_control("master_forum_id")
+    if not master_forum_id:
+        await bot_app.send_message(chat_id, "⚠️ **Master Forum not set.**\nPlease set it using `/setmasterforum <chat_id>` first so I can safely cache this media before deleting your message.")
+        return
+        
+    status_msg = await bot_app.send_message(chat_id, "🔄 Caching media securely...")
+    
+    try:
+        # 1. Forward to Master Forum (Server-side copy, zero download time)
+        if len(msgs) > 1:
+            fwd_msgs = await bot_app.copy_media_group(int(master_forum_id), chat_id, msgs[0].id)
+        else:
+            fwd_msg = await bot_app.copy_message(int(master_forum_id), chat_id, msgs[0].id)
+            fwd_msgs = [fwd_msg]
+            
+        # 2. Generate permanent link from the Master Forum
+        clean_forum_id = str(master_forum_id).replace("-100", "")
+        perm_link = f"https://t.me/c/{clean_forum_id}/{fwd_msgs[0].id}"
+        
+        # 3. Delete original messages from the Bot chat to keep it clean
+        for m in msgs:
+            try: await m.delete()
+            except Exception: pass
+            
+        # 4. Trigger the exact same UI as the Link Import feature
+        user_states[chat_id] = {'linked_msgs': fwd_msgs}
+        
+        kbd = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📥 Download to VK", callback_data="link_action_vk")],
+            [InlineKeyboardButton("📋 Copy to TG Group", callback_data="link_action_tg")]
+        ])
+        
+        album_text = f" (Album: {len(msgs)} files)" if len(msgs) > 1 else ""
+        
+        await status_msg.edit_text(
+            f"✅ **Media Cached & Link Generated!**{album_text}\n\n"
+            f"🔗 **Permanent Link:** {perm_link}\n\n"
+            f"Where do you want to send this?", 
+            reply_markup=kbd,
+            disable_web_page_preview=True
+        )
+        
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Failed to process media: {e}")
+
+@bot_app.on_message(filters.private & (filters.video | filters.document) & ~filters.command(["start", "refresh", "monitor", "monitoralways", "monitorselected", "transfer", "copy", "autotransfer", "reset", "setmasterforum"]))
+async def direct_media_receiver(client, message):
+    chat_id = message.chat.id
+    
+    # Catch and group media albums together so we don't spam 10 links for 10 videos
+    if message.media_group_id:
+        if message.media_group_id not in direct_media_cache:
+            direct_media_cache[message.media_group_id] = []
+        direct_media_cache[message.media_group_id].append(message)
+        
+        if len(direct_media_cache[message.media_group_id]) == 1:
+            await asyncio.sleep(2.5) # Wait for all parts of the album to arrive from Telegram
+            msgs = sorted(direct_media_cache.pop(message.media_group_id), key=lambda x: x.id)
+            await process_direct_media(chat_id, msgs)
+    else:
+        # Single video handling
+        await process_direct_media(chat_id, [message])
+
 async def handle_user_input(client, message):
     chat_id = message.chat.id
     state = user_states.get(chat_id, {})
