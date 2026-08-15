@@ -3124,7 +3124,7 @@ async def worker_pipeline(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.
 # CH 13 — BOOTSTRAP: DASHBOARD REFRESHER, CRASH REPORT, MAIN()
 # ═══════════════════════════════════════════════════════════════════════
 async def dashboard_refresher(app: Client, db: JobScheduler):
-    global _dash_msg_id, _dash_chat_id, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid, _stack_msg_id, _stack_chat_id
+    global _stack_msg_id, _stack_chat_id, _dash_msg_id, _dash_chat_id
     last_state_hash = {}
 
     while True:
@@ -3155,9 +3155,10 @@ async def dashboard_refresher(app: Client, db: JobScheduler):
                     if k != "playlists" and k not in current_hash: del last_state_hash[k]
                 for k, v in current_hash.items(): last_state_hash[k] = v
 
+            # Calling refresh_dashboard natively respects whatever page the user is currently looking at
             if _dash_msg_id and _dash_chat_id and needs_update:
-                text, kb = await render_dashboard(db, _dash_tab, _expanded_pl, _expanded_bucket, _expanded_jid)
-                await safe_edit(app, _dash_chat_id, _dash_msg_id, text, kb)
+                await refresh_dashboard(app, db)
+                
         except Exception: pass
 
 
