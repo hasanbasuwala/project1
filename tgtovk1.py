@@ -2503,10 +2503,20 @@ async def handle_user_input(client, message):
         user_states[chat_id] = {'query': search_query, 'awaiting_group': True}
         return await message.reply_text(UI_STRINGS["vk_search"].format(query=search_query), parse_mode=ParseMode.MARKDOWN)
 
-    try: target_group_id = int(text.strip())
-    except ValueError: return await message.reply_text("⚠️ Invalid numeric ID.")
-
+    target_raw = text.strip()
     status_msg = await message.reply_text(UI_STRINGS["scanning_group"])
+    
+    # ⬇️ NEW RESOLVER LOGIC ⬇️
+    try:
+        if target_raw.lstrip("-").isdigit():
+            target_group_id = int(target_raw)
+        else:
+            chat_obj = await user_app.get_chat(target_raw)
+            target_group_id = chat_obj.id
+    except Exception as e:
+        user_states.pop(chat_id, None)
+        return await status_msg.edit_text(f"❌ Could not resolve group '{target_raw}': `{e}`")
+
     raw_found, processed_groups = [], set()
 
     try:
