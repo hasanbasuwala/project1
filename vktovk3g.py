@@ -413,6 +413,17 @@ _autoscan_wizard_sessions = {}  # /autoscan setup wizard: chat_id -> {'stage','t
 _autoscan_pending = {}          # dashboard quick add: chat_id -> 'add_tag' | 'add_comm' (plain string, single-shot)
 _autoscan_panel_expanded = False  # collapsed by default — dashboard shows summary only until tapped
 
+# --- In-Memory Session State ---
+_scan_sessions = {}          # /scan community scan
+_hashtag_scan_pending = {}   # Chat ID -> List of pending tags waiting for a URL
+_hashtag_scan_results = {}   # Bot Message ID -> Session data for concurrent scanning
+_deepscan_sessions = {}      # /deepscan #Tag all-communities search
+_autoscan_wizard_sessions = {}  # /autoscan setup wizard: chat_id -> {'stage','tags','comms','setup_msg_id'}
+_autoscan_pending = {}          # dashboard quick add: chat_id -> 'add_tag' | 'add_comm' (plain string, single-shot)
+_autoscan_panel_expanded = False  # collapsed by default — dashboard shows summary only until tapped
+
+_dash_view_mode = "main"     # Tracks the active screen: "main", "ascan_tags", "ascan_comms"
+_dash_ascan_page = 0         # Tracks the current page index for the Autoscan menus
 
 # ═══════════════════════════════════════════════════════════════════════
 # CH 03 — SMALL UTILITY FUNCTIONS
