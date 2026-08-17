@@ -405,28 +405,35 @@ class VKPlaylistManager:
             db.log_trace(jid, TXT.VK_PLAYLIST_FAILED.format(err=str(e)[:200]))
             return None
 
-      async def upload_video(self, file_path: Path, title: str, description: str, album_ids: list[int] | None, jid: str, db: JobScheduler) -> dict:
-        """Bypasses vk_api.VkUpload to manually orchestrate the upload sequence..."""
+    async def upload_video(self, file_path: Path, title: str, description: str, album_ids: list[int] | None, jid: str, db: JobScheduler) -> dict:
+        """Bypasses vk_api.VkUpload to manually orchestrate the upload sequence, 
+        preventing Error 10 caused by hardcoded wrapper parameters."""
         if not self._session:
             raise RuntimeError("VK upload unavailable: vk_api not installed or VK_TOKEN missing.")
 
         def _do_upload():
-            import requests
+            import requests  # Using requests off-thread to mimic standard behavior safely
 
-            # 1. Sanitize metadata...
+            # 1. Sanitize metadata and request the upload URL directly
             kwargs = {}
             clean_title = (title or "").strip()
-            if clean_title: kwargs['name'] = clean_title[:200]
+            if clean_title:
+                kwargs['name'] = clean_title[:200]
+            
             clean_desc = (description or "").strip()
-            if clean_desc: kwargs['description'] = clean_desc
+            if clean_desc:
+                kwargs['description'] = clean_desc
 
             try:
+                # Ask VK for the upload server
                 save_resp = self._vk.video.save(**kwargs)
             except vk_api.exceptions.ApiError as e:
                 if e.code == 10:
                     db.log_trace(jid, "[VK] API Error 10 on metadata. Retrying with bare-minimum payload...")
+                    # Fallback: VK sometimes silently rejects names/descriptions. Send an empty request.
                     save_resp = self._vk.video.save() 
-                else: raise e
+                else:
+                    raise e
 
             upload_url = save_resp.get('upload_url')
             vid_id = save_resp.get('video_id')
@@ -435,11 +442,12 @@ class VKPlaylistManager:
             if not upload_url:
                 raise RuntimeError(f"Failed to retrieve upload URL from VK. Response: {save_resp}")
 
-            # 2. Push the payload...
+            # 2. Push the payload using standard requests
             db.log_trace(jid, "[VK] Upload URL acquired. Streaming payload to VK servers...")
             with open(file_path, 'rb') as f:
                 upload_result = requests.post(upload_url, files={'video_file': f}).json()
 
+            # VK returns size or video_hash on success
             if 'video_hash' not in upload_result and 'size' not in upload_result:
                 raise RuntimeError(f"VK File stream rejected: {upload_result}")
 
@@ -461,7 +469,6 @@ class VKPlaylistManager:
         result = await asyncio.to_thread(_do_upload)
         db.log_trace(jid, TXT.VK_UPLOAD_DONE.format(result="Success"))
         return result
-
 # ═══════════════════════════════════════════════════════════════════════
 # CHAPTER 6 — DOWNLOADER ENGINE
 # (Kept intentionally as-is — this is the debugged multi-pass extraction
