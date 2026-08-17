@@ -1671,7 +1671,7 @@ class UploaderEngine:
         )
         return TXT.route_label('telegram')
 
-async def _upload_to_vk(self, job_data: dict, target_file: Path) -> str:
+    async def _upload_to_vk(self, job_data: dict, target_file: Path) -> str:
         jid = job_data['id']
         raw_playlists = job_data.get('playlist_name')
         caption = job_data.get('caption') or ""
