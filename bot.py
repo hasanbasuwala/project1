@@ -730,7 +730,7 @@ class DownloaderEngine:
         from playwright.async_api import async_playwright
         from playwright_stealth import Stealth
 
-        path_to_extension = "/home/ubuntu/bot/uBOL-home-main/chromium"
+        path_to_extension = "/home/ubuntu/stealth_mainframe/ublock/uBlock0.chromium"
         user_data_dir = f"/tmp/pw_data_{jid}"
 
         extracted_payload = {"url": None, "headers": {}, "cookie_str": "", "raw_cookies": [], "browser_downloaded": False}
