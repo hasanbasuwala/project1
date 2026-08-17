@@ -406,13 +406,13 @@ class VKPlaylistManager:
             return None
 
     async def upload_video(self, file_path: Path, title: str, description: str, album_ids: list[int] | None, jid: str, db: JobScheduler) -> dict:
-        """Bypasses vk_api.VkUpload to manually orchestrate the upload sequence, 
-        preventing Error 10 caused by hardcoded wrapper parameters."""
+        """Bypasses vk_api.VkUpload to manually orchestrate the upload sequence..."""
         if not self._session:
             raise RuntimeError("VK upload unavailable: vk_api not installed or VK_TOKEN missing.")
 
         def _do_upload():
-            import requests  # Using requests off-thread to mimic standard behavior safely
+            import requests
+            import time # Added for the processing delay
 
             # 1. Sanitize metadata and request the upload URL directly
             kwargs = {}
@@ -424,13 +424,16 @@ class VKPlaylistManager:
             if clean_desc:
                 kwargs['description'] = clean_desc
 
+            # NATIVE FIX: Tell VK to put it in the first playlist automatically!
+            if album_ids and len(album_ids) > 0:
+                kwargs['album_id'] = album_ids[0]
+
             try:
                 # Ask VK for the upload server
                 save_resp = self._vk.video.save(**kwargs)
             except vk_api.exceptions.ApiError as e:
                 if e.code == 10:
                     db.log_trace(jid, "[VK] API Error 10 on metadata. Retrying with bare-minimum payload...")
-                    # Fallback: VK sometimes silently rejects names/descriptions. Send an empty request.
                     save_resp = self._vk.video.save() 
                 else:
                     raise e
@@ -447,13 +450,16 @@ class VKPlaylistManager:
             with open(file_path, 'rb') as f:
                 upload_result = requests.post(upload_url, files={'video_file': f}).json()
 
-            # VK returns size or video_hash on success
             if 'video_hash' not in upload_result and 'size' not in upload_result:
                 raise RuntimeError(f"VK File stream rejected: {upload_result}")
 
-            # 3. Post-upload Album Assignment (MODIFIED FOR MULTIPLE PLAYLISTS)
-            if album_ids and vid_id and own_id:
-                for a_id in album_ids:
+            # 3. Post-upload Album Assignment (For ANY EXTRA playlists)
+            if album_ids and len(album_ids) > 1 and vid_id and own_id:
+                db.log_trace(jid, "[VK] Waiting 3 seconds for VK to process before assigning extra playlists...")
+                time.sleep(3) # Give VK a moment to finalize the video
+                
+                # Loop through any remaining albums
+                for a_id in album_ids[1:]:
                     try:
                         self._vk.video.addToAlbum(
                             owner_id=own_id,
@@ -461,7 +467,7 @@ class VKPlaylistManager:
                             album_id=a_id
                         )
                     except Exception as e:
-                        db.log_trace(jid, f"[VK] Album assignment warning for album {a_id}: {e}")
+                        db.log_trace(jid, f"[VK] Album assignment warning for extra album {a_id}: {e}")
 
             return save_resp
 
@@ -469,6 +475,7 @@ class VKPlaylistManager:
         result = await asyncio.to_thread(_do_upload)
         db.log_trace(jid, TXT.VK_UPLOAD_DONE.format(result="Success"))
         return result
+        
 # ═══════════════════════════════════════════════════════════════════════
 # CHAPTER 6 — DOWNLOADER ENGINE
 # (Kept intentionally as-is — this is the debugged multi-pass extraction
