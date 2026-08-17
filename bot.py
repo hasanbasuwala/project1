@@ -329,26 +329,20 @@ class LinkClassifier:
         return "GENERIC_FALLBACK"
 
 def parse_link_message(text: str, url: str) -> dict:
-    """
-    Parses a pasted-link message of the form:
-        <url> #PlaylistName optional caption text goes here
-    into {title, playlist_name, caption}.
-
-    - `#PlaylistName` (first hashtag found) becomes the VK playlist name.
-      The literal '#' is stripped before it's ever used to create/match a
-      playlist. Matching against existing playlists is case-insensitive.
-    - Everything after the tag becomes the caption/description.
-    - Everything before the tag (with the url removed) becomes the title.
-    - If there's no hashtag at all, title = leftover text (or the url itself),
-      playlist_name = None, caption = "".
-    """
     remainder = text.replace(url, "").strip()
-    tag_match = re.search(r"#(\S+)", remainder)
+    tags = re.findall(r"#(\S+)", remainder)
 
-    if tag_match:
-        playlist_name = tag_match.group(1).lstrip('#').strip()
-        title = remainder[:tag_match.start()].strip()
-        caption = remainder[tag_match.end():].strip()
+    if tags:
+        # Combine all found tags into a comma-separated string
+        playlist_name = ",".join(tags)
+        
+        # Title is everything before the FIRST tag
+        first_tag_match = re.search(r"#\S+", remainder)
+        title = remainder[:first_tag_match.start()].strip()
+        
+        # Caption is everything after the LAST tag
+        last_tag_match = list(re.finditer(r"#\S+", remainder))[-1]
+        caption = remainder[last_tag_match.end():].strip()
     else:
         playlist_name = None
         title = remainder
@@ -358,7 +352,7 @@ def parse_link_message(text: str, url: str) -> dict:
         title = playlist_name or url[:40]
 
     return {"title": title, "playlist_name": playlist_name, "caption": caption}
-
+  
 # ═══════════════════════════════════════════════════════════════════════
 # CHAPTER 5 — VK PLAYLIST & UPLOAD MANAGER (NEW)
 # Playlists are created under the VK_TOKEN owner's own account (no group_id).
@@ -411,35 +405,28 @@ class VKPlaylistManager:
             db.log_trace(jid, TXT.VK_PLAYLIST_FAILED.format(err=str(e)[:200]))
             return None
 
-    async def upload_video(self, file_path: Path, title: str, description: str, album_id: int | None, jid: str, db: JobScheduler) -> dict:
-        """Bypasses vk_api.VkUpload to manually orchestrate the upload sequence, 
-        preventing Error 10 caused by hardcoded wrapper parameters."""
+async def upload_video(self, file_path: Path, title: str, description: str, album_ids: list[int] | None, jid: str, db: JobScheduler) -> dict:
+        """Bypasses vk_api.VkUpload to manually orchestrate the upload sequence..."""
         if not self._session:
             raise RuntimeError("VK upload unavailable: vk_api not installed or VK_TOKEN missing.")
 
         def _do_upload():
-            import requests  # Using requests off-thread to mimic standard behavior safely
+            import requests
 
-            # 1. Sanitize metadata and request the upload URL directly
+            # 1. Sanitize metadata...
             kwargs = {}
             clean_title = (title or "").strip()
-            if clean_title:
-                kwargs['name'] = clean_title[:200]
-            
+            if clean_title: kwargs['name'] = clean_title[:200]
             clean_desc = (description or "").strip()
-            if clean_desc:
-                kwargs['description'] = clean_desc
+            if clean_desc: kwargs['description'] = clean_desc
 
             try:
-                # Ask VK for the upload server
                 save_resp = self._vk.video.save(**kwargs)
             except vk_api.exceptions.ApiError as e:
                 if e.code == 10:
                     db.log_trace(jid, "[VK] API Error 10 on metadata. Retrying with bare-minimum payload...")
-                    # Fallback: VK sometimes silently rejects names/descriptions. Send an empty request.
                     save_resp = self._vk.video.save() 
-                else:
-                    raise e
+                else: raise e
 
             upload_url = save_resp.get('upload_url')
             vid_id = save_resp.get('video_id')
@@ -448,25 +435,25 @@ class VKPlaylistManager:
             if not upload_url:
                 raise RuntimeError(f"Failed to retrieve upload URL from VK. Response: {save_resp}")
 
-            # 2. Push the payload using standard requests
+            # 2. Push the payload...
             db.log_trace(jid, "[VK] Upload URL acquired. Streaming payload to VK servers...")
             with open(file_path, 'rb') as f:
                 upload_result = requests.post(upload_url, files={'video_file': f}).json()
 
-            # VK returns size or video_hash on success
             if 'video_hash' not in upload_result and 'size' not in upload_result:
                 raise RuntimeError(f"VK File stream rejected: {upload_result}")
 
-            # 3. Post-upload Album Assignment
-            if album_id and vid_id and own_id:
-                try:
-                    self._vk.video.addToAlbum(
-                        owner_id=own_id,
-                        video_id=vid_id,
-                        album_id=album_id
-                    )
-                except Exception as e:
-                    db.log_trace(jid, f"[VK] Album assignment warning (video uploaded, but not moved): {e}")
+            # 3. Post-upload Album Assignment (MODIFIED FOR MULTIPLE PLAYLISTS)
+            if album_ids and vid_id and own_id:
+                for a_id in album_ids:
+                    try:
+                        self._vk.video.addToAlbum(
+                            owner_id=own_id,
+                            video_id=vid_id,
+                            album_id=a_id
+                        )
+                    except Exception as e:
+                        db.log_trace(jid, f"[VK] Album assignment warning for album {a_id}: {e}")
 
             return save_resp
 
@@ -1684,28 +1671,44 @@ class UploaderEngine:
         )
         return TXT.route_label('telegram')
 
-    async def _upload_to_vk(self, job_data: dict, target_file: Path) -> str:
+async def _upload_to_vk(self, job_data: dict, target_file: Path) -> str:
         jid = job_data['id']
-        playlist_name = job_data.get('playlist_name') or job_data.get('title')
+        raw_playlists = job_data.get('playlist_name')
         caption = job_data.get('caption') or ""
 
-        await self.db.update_job(jid, stage="uploading | vk | resolving playlist", pct=5.0)
-        album_id = await self.vk.resolve_playlist(playlist_name, jid, self.db)
+        await self.db.update_job(jid, stage="uploading | vk | resolving playlist(s)", pct=5.0)
 
-        # NOTE: no native progress stream from vk_api's simple uploader — see
-        # module docstring. We deliberately don't fake a percentage here.
+        album_ids = []
+        if raw_playlists:
+            # Split the comma-separated tags we generated in parse_link_message
+            playlist_names = [p.strip() for p in raw_playlists.split(",")]
+            for p_name in playlist_names:
+                a_id = await self.vk.resolve_playlist(p_name, jid, self.db)
+                if a_id:
+                    album_ids.append(a_id)
+        else:
+            # Fallback: if no tags were provided, use the title as a single playlist
+            fallback_title = job_data.get('title') or "Untitled"
+            a_id = await self.vk.resolve_playlist(fallback_title, jid, self.db)
+            if a_id:
+                album_ids.append(a_id)
+
         await self.db.update_job(jid, stage="uploading | vk | processing...", pct=10.0)
+        
         await self.vk.upload_video(
             file_path=target_file,
             title=job_data['title'],
             description=caption,
-            album_id=album_id,
+            album_ids=album_ids,  # Passing the list of IDs
             jid=jid,
             db=self.db,
         )
         await self.db.update_job(jid, stage="uploading | vk | done", pct=100.0)
-        return TXT.route_label('vk', playlist_name)
-
+        
+        # Display the joined list of playlists in the UI card
+        display_name = raw_playlists.replace(",", ", ") if raw_playlists else job_data.get('title')
+        return TXT.route_label('vk', display_name)
+  
 # ═══════════════════════════════════════════════════════════════════════
 # CHAPTER 9 — RECOVERY & CRASH COURIER
 # ═══════════════════════════════════════════════════════════════════════
