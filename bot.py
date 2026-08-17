@@ -405,7 +405,7 @@ class VKPlaylistManager:
             db.log_trace(jid, TXT.VK_PLAYLIST_FAILED.format(err=str(e)[:200]))
             return None
 
-async def upload_video(self, file_path: Path, title: str, description: str, album_ids: list[int] | None, jid: str, db: JobScheduler) -> dict:
+      async def upload_video(self, file_path: Path, title: str, description: str, album_ids: list[int] | None, jid: str, db: JobScheduler) -> dict:
         """Bypasses vk_api.VkUpload to manually orchestrate the upload sequence..."""
         if not self._session:
             raise RuntimeError("VK upload unavailable: vk_api not installed or VK_TOKEN missing.")
