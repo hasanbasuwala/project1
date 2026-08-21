@@ -486,6 +486,71 @@ class VKPlaylistManager:
 #  this without re-testing against VK CDN 403s / curl_cffi pinning.)
 # ═══════════════════════════════════════════════════════════════════════
 
+class PlaywrightBrowserManager:
+    def __init__(self, ublock_path: str, user_agent: str, max_concurrent: int = 3):
+        self.ublock_path = ublock_path
+        self.user_agent = user_agent
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        
+        self._pw = None
+        self._context: BrowserContext | None = None
+        self._lock = asyncio.Lock()
+        self._job_count = 0
+        self._max_jobs_before_recycle = 50
+
+    async def get_context(self) -> BrowserContext:
+        async with self._lock:
+            if self._context is None or self._job_count >= self._max_jobs_before_recycle:
+                await self._init_browser()
+            return self._context
+
+    async def _init_browser(self):
+        if self._context:
+            try: await self._context.close()
+            except Exception: pass
+        if self._pw:
+            try: await self._pw.stop()
+            except Exception: pass
+
+        self._pw = await async_playwright().start()
+        self._context = await self._pw.chromium.launch_persistent_context(
+            user_data_dir="/tmp/pw_persistent_session",
+            headless=True,
+            channel="chromium",
+            user_agent=self.user_agent,
+            viewport={"width": 1920, "height": 1080},
+            locale="en-US",
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-site-isolation-trials",
+                "--disable-web-security",
+                "--ignore-certificate-errors",
+                f"--disable-extensions-except={self.ublock_path}",
+                f"--load-extension={self.ublock_path}"
+            ]
+        )
+        self._job_count = 0
+
+    async def extract_url(self, url: str, jid: str, db, custom_handler) -> dict:
+        async with self.semaphore:
+            ctx = await self.get_context()
+            page = await ctx.new_page()
+            await Stealth().apply_stealth_async(page)
+            
+            try:
+                self._job_count += 1
+                # Pass both page and context to your handler
+                return await custom_handler(page, ctx, url, jid, db)
+            finally:
+                await page.close()
+
+    async def shutdown(self):
+        async with self._lock:
+            if self._context: await self._context.close()
+            if self._pw: await self._pw.stop()
+
 class DownloaderEngine:
     def __init__(self, scheduler: JobScheduler, app: Client):
         self.db = scheduler
