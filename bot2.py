@@ -2827,40 +2827,53 @@ async def main():
     app = Client("stealth_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
     db = JobScheduler(DB_PATH)
     vk_manager = VKPlaylistManager(VK_TOKEN)
-    pipeline = PipelineManager(app, db, vk_manager)
+    
+    # Initialize the new persistent browser manager
+    browser_manager = PlaywrightBrowserManager(
+        ublock_path="/home/ubuntu/stealth_mainframe/ublock/uBlock0.chromium",
+        user_agent=USER_AGENT,
+        max_concurrent=3 
+    )
+    
+    # Pass to the pipeline
+    pipeline = PipelineManager(app, db, vk_manager, browser_manager)
     dispatcher = TelegramDispatcher(app)
 
     ui_accumulator = UIAccumulator(db, dispatcher, pipeline)
 
     setup_router(app, db, pipeline, vk_manager)
 
-    async with app:
-        recovering_batch_jids = await RecoveryManager.scan_and_requeue(db, pipeline.dl_q, pipeline.enc_q, pipeline.up_q, app)
-        pipeline.start_workers()
+    try:
+        async with app:
+            recovering_batch_jids = await RecoveryManager.scan_and_requeue(db, pipeline.dl_q, pipeline.enc_q, pipeline.up_q, app)
+            pipeline.start_workers()
 
-        asyncio.create_task(dispatcher.sender_loop())
-        asyncio.create_task(ui_accumulator.run_loop())
-        asyncio.create_task(terminal_loop(db, pipeline))
+            asyncio.create_task(dispatcher.sender_loop())
+            asyncio.create_task(ui_accumulator.run_loop())
+            asyncio.create_task(terminal_loop(db, pipeline))
 
-        asyncio.create_task(_batch_runner(db, pipeline, app))
-        if recovering_batch_jids:
-            asyncio.create_task(_resume_interrupted_batches(db, pipeline, recovering_batch_jids))
+            asyncio.create_task(_batch_runner(db, pipeline, app))
+            if recovering_batch_jids:
+                asyncio.create_task(_resume_interrupted_batches(db, pipeline, recovering_batch_jids))
 
-        if OWNER_ID:
-            m = await app.send_message(OWNER_ID, "🟢 Mainframe Systems Online.")
+            if OWNER_ID:
+                m = await app.send_message(OWNER_ID, "🟢 Mainframe Systems Online (Persistent DOM Active).")
 
-            try:
-                await app.unpin_all_chat_messages(m.chat.id)
-                await m.pin(disable_notification=True, both_sides=True)
-            except Exception:
-                pass
+                try:
+                    await app.unpin_all_chat_messages(m.chat.id)
+                    await m.pin(disable_notification=True, both_sides=True)
+                except Exception:
+                    pass
 
-            global _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab
-            _dashboard_msg_id, _dashboard_chat_id = m.id, m.chat.id
-            text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
-            await dispatcher.safe_edit_queued(_dashboard_chat_id, _dashboard_msg_id, text, kb)
+                global _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab
+                _dashboard_msg_id, _dashboard_chat_id = m.id, m.chat.id
+                text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
+                await dispatcher.safe_edit_queued(_dashboard_chat_id, _dashboard_msg_id, text, kb)
 
-        while True: await asyncio.sleep(3600)
+            while True: await asyncio.sleep(3600)
+    finally:
+        # Gracefully kill the background Chromium process if the bot stops
+        await browser_manager.shutdown()
 
 if __name__ == "__main__":
     try: loop.run_until_complete(main())
