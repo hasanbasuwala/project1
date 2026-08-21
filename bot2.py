@@ -997,26 +997,47 @@ class DownloaderEngine:
         # Delegate execution to the global browser manager
         return await self.browser_manager.extract_url(url, jid, self.db, _tab_handler)
 
-    async def _try_browser_native_download(self, context, jid: str, dl_dir: Path, media_url: str, headers: dict, cookie_str: str) -> bool:
+    async def _try_browser_native_download(self, context, page, jid: str, dl_dir: Path, media_url: str, headers: dict, cookie_str: str) -> bool:
         out_file = dl_dir / f"{jid}.mp4"
         req_headers = {k: v for k, v in headers.items() if k.lower() not in ("host", "content-length")}
 
         try:
             self.db.log_trace(jid, "PASS 7.5: Attempting in-browser native fetch via Playwright request context...")
             resp = await context.request.get(media_url, headers=req_headers, timeout=30000)
-
-            if not resp.ok:
+            
+            body = None
+            if resp.status == 403:
+                self.db.log_trace(jid, "PASS 7.5: Context fetch 403. Falling back to in-tab DOM fetch...")
+                try:
+                    body_b64 = await page.evaluate('''async (url) => {
+                        const res = await fetch(url);
+                        if (!res.ok) throw new Error("HTTP " + res.status);
+                        const buf = await res.arrayBuffer();
+                        let binary = '';
+                        const bytes = new Uint8Array(buf);
+                        for (let i = 0; i < bytes.byteLength; i++) {
+                            binary += String.fromCharCode(bytes[i]);
+                        }
+                        return btoa(binary);
+                    }''', media_url)
+                    import base64
+                    body = base64.b64decode(body_b64)
+                    content_type = "" 
+                except Exception as e:
+                    self.db.log_trace(jid, f"PASS 7.5 FAILED: In-tab DOM fetch failed: {e}")
+                    return False
+            elif not resp.ok:
                 self.db.log_trace(jid, f"PASS 7.5 FAILED: In-browser fetch returned HTTP {resp.status}")
                 return False
-
-            body = await resp.body()
-            content_type = (resp.headers.get("content-type") or "").lower()
+            else:
+                body = await resp.body()
+                content_type = (resp.headers.get("content-type") or "").lower()
 
             is_m3u8 = ".m3u8" in media_url.lower() or "mpegurl" in content_type or body[:7] == b"#EXTM3U"
 
             if is_m3u8:
                 manifest_text = body.decode("utf-8", errors="ignore")
-                return await self._download_hls_via_browser(context, jid, dl_dir, media_url, manifest_text, req_headers, out_file)
+                return await self._download_hls_via_browser(context, page, jid, dl_dir, media_url, manifest_text, req_headers, out_file)
 
             if len(body) < 100000:
                 self.db.log_trace(jid, f"PASS 7.5 FAILED: In-browser fetch returned suspiciously small payload ({len(body)} bytes).")
@@ -1031,7 +1052,7 @@ class DownloaderEngine:
             self.db.log_trace(jid, f"PASS 7.5 FAILED: In-browser fetch error: {e}")
             return False
 
-    async def _download_hls_via_browser(self, context, jid: str, dl_dir: Path, manifest_url: str, manifest_text: str, headers: dict, out_file: Path) -> bool:
+    async def _download_hls_via_browser(self, context, page, jid: str, dl_dir: Path, manifest_url: str, manifest_text: str, headers: dict, out_file: Path) -> bool:
         lines = manifest_text.splitlines()
 
         if any(l.startswith("#EXT-X-STREAM-INF") for l in lines):
@@ -1062,7 +1083,7 @@ class DownloaderEngine:
                 self.db.log_trace(jid, f"PASS 7.5 FAILED: Variant playlist fetch error: {e}")
                 return False
 
-            return await self._download_hls_via_browser(context, jid, dl_dir, variant_url, variant_text, headers, out_file)
+            return await self._download_hls_via_browser(context, page, jid, dl_dir, variant_url, variant_text, headers, out_file)
 
         segment_uris = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
         if not segment_uris:
@@ -1079,20 +1100,31 @@ class DownloaderEngine:
         for idx, seg_uri in enumerate(segment_uris):
             seg_url = urlparse.urljoin(manifest_url, seg_uri)
             seg_path = seg_dir / f"seg_{idx:05d}.ts"
-            try:
-                resp = await context.request.get(seg_url, headers=headers, timeout=30000)
-                if not resp.ok:
-                    self.db.log_trace(jid, f"PASS 7.5 FAILED: Segment {idx} fetch returned HTTP {resp.status}")
-                    shutil.rmtree(seg_dir, ignore_errors=True)
-                    return False
-                seg_bytes = await resp.body()
-                with open(seg_path, "wb") as f:
-                    f.write(seg_bytes)
-                seg_paths.append(seg_path)
-            except Exception as e:
-                self.db.log_trace(jid, f"PASS 7.5 FAILED: Segment {idx} fetch error: {e}")
+            
+            # --- NEW RETRY & PACING LOGIC ---
+            success = False
+            for attempt in range(3):
+                try:
+                    resp = await context.request.get(seg_url, headers=headers, timeout=30000)
+                    if resp.ok:
+                        seg_bytes = await resp.body()
+                        with open(seg_path, "wb") as f:
+                            f.write(seg_bytes)
+                        seg_paths.append(seg_path)
+                        success = True
+                        break
+                    elif resp.status == 403:
+                        await asyncio.sleep(2 * (attempt + 1))
+                except Exception as e:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+            
+            if not success:
+                self.db.log_trace(jid, f"PASS 7.5 FAILED: Segment {idx} fetch failed after 3 retries.")
                 shutil.rmtree(seg_dir, ignore_errors=True)
                 return False
+
+            await asyncio.sleep(0.05) # Prevent CDN burst detection
+            # --------------------------------
 
             if idx % 25 == 0 or idx == len(segment_uris) - 1:
                 pct = ((idx + 1) / len(segment_uris)) * 100
@@ -1106,12 +1138,7 @@ class DownloaderEngine:
 
         self.db.log_trace(jid, "PASS 7.5: All segments downloaded. Remuxing via ffmpeg concat...")
 
-        cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", str(concat_list_path),
-            "-c", "copy", "-bsf:a", "aac_adtstoasc",
-            str(out_file)
-        ]
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list_path), "-c", "copy", "-bsf:a", "aac_adtstoasc", str(out_file)]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         _, stderr = await proc.communicate()
 
