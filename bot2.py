@@ -77,6 +77,8 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 from pyrogram.errors import FloodWait, MessageNotModified
 from logging.handlers import RotatingFileHandler
 import config
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright_stealth import Stealth
 
 # ═══════════════════════════════════════════════════════════════════════
 # CHAPTER 1 — GLOBAL CONFIG / CONSTANTS
