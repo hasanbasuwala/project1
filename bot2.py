@@ -796,57 +796,30 @@ class DownloaderEngine:
         return False
 
     async def _run_playwright_extraction(self, url: str, jid: str, dl_dir: Path) -> dict:
-        from playwright.async_api import async_playwright
-        from playwright_stealth import Stealth
+        # Define the logic that runs INSIDE the isolated tab
+        async def _tab_handler(page: Page, context: BrowserContext, target_url: str, job_id: str, db_ref) -> dict:
+            extracted_payload = {"url": None, "headers": {}, "cookie_str": "", "raw_cookies": [], "browser_downloaded": False}
+            found_urls = []
+            capture_headers = {}
 
-        path_to_extension = "/home/ubuntu/stealth_mainframe/ublock/uBlock0.chromium"
-        user_data_dir = f"/tmp/pw_data_{jid}"
-
-        extracted_payload = {"url": None, "headers": {}, "cookie_str": "", "raw_cookies": [], "browser_downloaded": False}
-        found_urls = []
-        capture_headers = {}
-
-        auth_state_path = Path("vk_state.json")
-        storage_state = str(auth_state_path) if auth_state_path.exists() else None
-
-        async with async_playwright() as p:
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir,
-                headless=True,
-                channel="chromium",
-                user_agent=USER_AGENT,
-                viewport={"width": 1920, "height": 1080},
-                locale="en-US",
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-site-isolation-trials",
-                    "--disable-web-security",
-                    "--ignore-certificate-errors",
-                    f"--disable-extensions-except={path_to_extension}",
-                    f"--load-extension={path_to_extension}"
-                ]
-            )
-
-            if any(d in url.lower() for d in ["vk.com", "vk.ru", "vkvideo.ru"]) and VK_COOKIES:
+            if any(d in target_url.lower() for d in ["vk.com", "vk.ru", "vkvideo.ru"]) and VK_COOKIES:
                 pw_cookies = []
                 for item in VK_COOKIES.strip().split(';'):
                     if '=' in item:
                         k, v = item.strip().split('=', 1)
-                        pw_cookies.append({"name": k, "value": v, "domain": ".vk.com", "path": "/"})
-                        pw_cookies.append({"name": k, "value": v, "domain": ".vk.ru", "path": "/"})
-                        pw_cookies.append({"name": k, "value": v, "domain": ".vkvideo.ru", "path": "/"})
+                        pw_cookies.extend([
+                            {"name": k, "value": v, "domain": ".vk.com", "path": "/"},
+                            {"name": k, "value": v, "domain": ".vk.ru", "path": "/"},
+                            {"name": k, "value": v, "domain": ".vkvideo.ru", "path": "/"}
+                        ])
                 if pw_cookies:
                     try:
                         await context.add_cookies(pw_cookies)
-                        self.db.log_trace(jid, "Injected VIP session cookies directly into Playwright browser context.")
+                        db_ref.log_trace(job_id, "Injected VIP session cookies directly into Playwright browser context.")
                     except Exception as e:
-                        self.db.log_trace(jid, f"Failed to inject cookies into Playwright: {e}")
+                        db_ref.log_trace(job_id, f"Failed to inject cookies into Playwright: {e}")
 
-            page = context.pages[0]
-            await Stealth().apply_stealth_async(page)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(1000)
 
             async def handle_response(response):
                 try:
@@ -861,27 +834,22 @@ class DownloaderEngine:
                     vtype = "mp4"
 
                     if "mpegurl" in content_type or "application/x-mpegurl" in content_type or ".m3u8" in url_lower:
-                        is_media = True
-                        vtype = "m3u8"
+                        is_media, vtype = True, "m3u8"
                     elif "video/" in content_type or ".mp4" in url_lower or ".ts" in url_lower:
-                        is_media = True
-                        vtype = "mp4"
+                        is_media, vtype = True, "mp4"
                     elif "application/octet-stream" in content_type and req.resource_type in ["media", "xhr", "fetch"]:
-                        is_media = True
-                        vtype = "mp4"
+                        is_media, vtype = True, "mp4"
 
                     if is_media:
                         found_urls.append({"type": vtype, "url": req.url})
                         headers = await req.all_headers()
                         capture_headers.update(headers)
-                except Exception:
-                    pass
+                except Exception: pass
 
             page.on("response", handle_response)
 
             async def handle_route(route):
-                if route.request.resource_type == "image":
-                    await route.abort()
+                if route.request.resource_type == "image": await route.abort()
                 else:
                     try: await route.continue_()
                     except Exception: pass
@@ -889,22 +857,22 @@ class DownloaderEngine:
             await page.route("**/*", handle_route)
 
             try:
-                self.db.log_trace(jid, "Navigating to main target URL...")
-                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                db_ref.log_trace(job_id, "Navigating to main target URL...")
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
                 await page.wait_for_timeout(8000)
 
-                if "vk.com" in url or "vkvideo.ru" in url:
+                # VK Auth Block
+                if "vk.com" in target_url or "vkvideo.ru" in target_url:
                     try:
                         sign_in_btn = page.locator("text='Sign in', text='Войти'")
                         if await sign_in_btn.count() > 0 and await sign_in_btn.first.is_visible():
-                            self.db.log_trace(jid, "Guest wall detected. Clicking Sign In to spawn auth form...")
+                            db_ref.log_trace(job_id, "Guest wall detected. Clicking Sign In to spawn auth form...")
                             await sign_in_btn.first.click()
                             await page.wait_for_timeout(3500)
 
                         login_input = page.locator("input[name='login']")
                         if await login_input.count() > 0 and await login_input.first.is_visible():
-                            self.db.log_trace(jid, "VK Auth Form detected. Injecting Playwright credentials...")
-
+                            db_ref.log_trace(job_id, "VK Auth Form detected. Injecting Playwright credentials...")
                             if VK_USERNAME:
                                 await login_input.first.fill(VK_USERNAME)
                                 await page.keyboard.press("Enter")
@@ -916,80 +884,40 @@ class DownloaderEngine:
                                 await page.keyboard.press("Enter")
                                 await page.wait_for_timeout(6000)
 
-                            self.db.log_trace(jid, "Playwright auth sequence executed. Reloading target wall...")
-                            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                            db_ref.log_trace(job_id, "Playwright auth sequence executed. Reloading target wall...")
+                            await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
                             await page.wait_for_timeout(8000)
                     except Exception as e:
-                        self.db.log_trace(jid, f"VK Auth automation bypassed or failed: {e}")
+                        db_ref.log_trace(job_id, f"VK Auth automation bypassed or failed: {e}")
 
-                try:
-                    await page.screenshot(path=str(dl_dir / f"{jid}_01_initial_load.png"))
-                except Exception: pass
-
-                try:
-                    age_gate = await page.wait_for_selector("a.av_btn.av_go[rel='yes']", state="visible", timeout=10000)
-                    if age_gate:
-                        self.db.log_trace(jid, "Age-gate detected. Clicking 'Yes'...")
-                        await age_gate.click()
-                        await page.wait_for_timeout(2000)
-                except Exception:
-                    pass
-
-                try:
-                    await page.screenshot(path=str(dl_dir / f"{jid}_02_post_age_gate.png"))
-                except Exception: pass
-
+                # RAM Ripper Simulation
                 try:
                     fake_player = await page.wait_for_selector("div.vi-on, div.play", state="visible", timeout=5000)
                     if fake_player:
-                        self.db.log_trace(jid, "Clicking fake player overlay to spawn iframe...")
                         await fake_player.click()
                         await page.wait_for_timeout(4000)
-                except Exception:
-                    self.db.log_trace(jid, "No fake player overlay found. Proceeding...")
-
-                try:
-                    await page.screenshot(path=str(dl_dir / f"{jid}_03_pre_click_bomb.png"))
                 except Exception: pass
 
                 try:
-                    self.db.log_trace(jid, f"Scanning main page and {len(page.frames)} child frames for video players...")
-                    jw_url = None
-
                     viewport = page.viewport_size
-                    cx = viewport['width'] / 2
-                    cy = viewport['height'] / 2
-
-                    click_targets = [
-                        (cx, cy),
-                        (cx, cy + 100),
-                        (50, viewport['height'] - 50)
-                    ]
-
-                    for x, y in click_targets:
+                    cx, cy = viewport['width'] / 2, viewport['height'] / 2
+                    for x, y in [(cx, cy), (cx, cy + 100), (50, viewport['height'] - 50)]:
                         await page.mouse.move(x, y)
                         await page.mouse.down()
                         await page.mouse.up()
                         await page.wait_for_timeout(800)
-
                     await page.wait_for_timeout(6000)
 
-                    try:
-                        await page.screenshot(path=str(dl_dir / f"{jid}_04_post_click_bomb.png"))
-                    except Exception: pass
-
-                    frames_to_search = [page.main_frame] + page.frames
-
-                    for frame in frames_to_search:
+                    jw_url = None
+                    for frame in [page.main_frame] + page.frames:
                         if "google" in frame.url or "blank" in frame.url or "magsrv" in frame.url: continue
-
                         try:
                             await frame.evaluate("document.querySelectorAll('.play-button, .vjs-big-play-button, video').forEach(b => b.click());")
                             await frame.evaluate("document.querySelectorAll('video').forEach(v => { v.muted = true; v.playbackRate = 16.0; });")
 
                             res = await frame.evaluate('''() => {
                                 try {
-                                    const isBad = (url) => url.match(/trailer|promo|ad|blank|teaser/i);
+                                    const isBad = (u) => u.match(/trailer|promo|ad|blank|teaser/i);
                                     if (typeof jwplayer === 'function') {
                                         let pl = jwplayer().getPlaylist();
                                         if (pl) {
@@ -1006,52 +934,40 @@ class DownloaderEngine:
                             if res:
                                 jw_url = res
                                 break
-                        except Exception:
-                            pass
+                        except Exception: pass
 
                     if jw_url:
-                        self.db.log_trace(jid, "RAM Ripper successful!")
+                        db_ref.log_trace(job_id, "RAM Ripper successful!")
                         extracted_payload["url"] = jw_url
 
                 except Exception as e:
-                    self.db.log_trace(jid, f"Simulation warning: {e}")
+                    db_ref.log_trace(job_id, f"Simulation warning: {e}")
 
                 if not extracted_payload.get("url"):
-                    self.db.log_trace(jid, "RAM Ripper missed. Checking Network Sniffer logs...")
                     m3u8s = [u["url"] for u in found_urls if u["type"] == "m3u8"]
-
                     if m3u8s:
                         extracted_payload["url"] = m3u8s[-1]
-                        self.db.log_trace(jid, "Sniffer successfully locked onto HLS Stream.")
+                        db_ref.log_trace(job_id, "Sniffer successfully locked onto HLS Stream.")
                     else:
                         mp4s = [u["url"] for u in found_urls if u["type"] == "mp4"]
                         if mp4s:
                             extracted_payload["url"] = mp4s[-1]
-                            self.db.log_trace(jid, "Sniffer successfully locked onto MP4 Stream.")
+                            db_ref.log_trace(job_id, "Sniffer successfully locked onto MP4 Stream.")
                         else:
-                            extracted_payload["url"] = url
+                            extracted_payload["url"] = target_url
 
             except Exception as e:
-                self.db.log_trace(jid, f"Playwright critical failure: {e}")
-                try:
-                    await page.screenshot(path=str(dl_dir / f"{jid}_crash_screenshot.png"))
-                    html_content = await page.content()
-                    with open(dl_dir / f"{jid}_crash_dump.html", "w", encoding="utf-8") as f:
-                        f.write(html_content)
-                    self.db.log_trace(jid, "Crash screenshot and HTML saved.")
-                except Exception:
-                    pass
+                db_ref.log_trace(job_id, f"Playwright critical failure: {e}")
 
+            # Assemble Headers
             extracted_payload["headers"] = {
-                "Referer": url,
-                "Origin": "/".join(url.split("/")[:3]),
+                "Referer": target_url,
+                "Origin": "/".join(target_url.split("/")[:3]),
                 "User-Agent": USER_AGENT,
                 "Accept": "*/*",
                 "Connection": "keep-alive"
             }
-
             bad_headers = ["host", "accept-encoding", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "user-agent", "accept", "referer", "origin"]
-
             for k, v in capture_headers.items():
                 if k.lower() not in bad_headers:
                     extracted_payload["headers"][k] = v
@@ -1066,23 +982,20 @@ class DownloaderEngine:
 
             if extracted_payload.get("url"):
                 try:
+                    # Pass the active tab ('page') to the download function
                     downloaded = await self._try_browser_native_download(
-                        context, jid, dl_dir, extracted_payload["url"],
+                        context, page, job_id, dl_dir, extracted_payload["url"],
                         extracted_payload["headers"], extracted_payload["cookie_str"]
                     )
                     extracted_payload["browser_downloaded"] = downloaded
                 except Exception as e:
-                    self.db.log_trace(jid, f"PASS 7.5 FAILED: Unexpected error during in-browser download attempt: {e}")
+                    db_ref.log_trace(job_id, f"PASS 7.5 FAILED: Unexpected error during in-browser download attempt: {e}")
                     extracted_payload["browser_downloaded"] = False
 
-            await context.close()
-            try:
-                if os.path.exists(user_data_dir):
-                    shutil.rmtree(user_data_dir, ignore_errors=True)
-            except Exception as e:
-                self.db.log_trace(jid, f"Disk cleanup warning: {e}")
-
             return extracted_payload
+
+        # Delegate execution to the global browser manager
+        return await self.browser_manager.extract_url(url, jid, self.db, _tab_handler)
 
     async def _try_browser_native_download(self, context, jid: str, dl_dir: Path, media_url: str, headers: dict, cookie_str: str) -> bool:
         out_file = dl_dir / f"{jid}.mp4"
