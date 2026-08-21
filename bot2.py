@@ -552,9 +552,10 @@ class PlaywrightBrowserManager:
             if self._pw: await self._pw.stop()
 
 class DownloaderEngine:
-    def __init__(self, scheduler: JobScheduler, app: Client):
+    def __init__(self, scheduler: JobScheduler, app: Client, browser_manager: PlaywrightBrowserManager):
         self.db = scheduler
         self.app = app
+        self.browser_manager = browser_manager
         self.procs = {}
 
     # ─── PAYLOAD CACHING HELPERS ───
