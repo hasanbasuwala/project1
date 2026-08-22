@@ -1056,6 +1056,7 @@ class DownloaderEngine:
     async def _download_hls_via_browser(self, context, page, jid: str, dl_dir: Path, manifest_url: str, manifest_text: str, headers: dict, out_file: Path) -> bool:
         lines = manifest_text.splitlines()
 
+        # --- 1. VARIANT PLAYLIST PARSING & FETCHING ---
         if any(l.startswith("#EXT-X-STREAM-INF") for l in lines):
             best_bw = -1
             variant_uri = None
@@ -1075,7 +1076,9 @@ class DownloaderEngine:
             variant_url = urlparse.urljoin(manifest_url, variant_uri)
             self.db.log_trace(jid, f"PASS 7.5: Fetching highest-bitrate variant ({best_bw} bps)...")
             
+            # 🚨 CRITICAL FIX: Use _safe_fetch here instead of context.request.get 🚨
             success, variant_body = await self._safe_fetch(context, page, variant_url, headers)
+            
             if not success:
                 self.db.log_trace(jid, "PASS 7.5 FAILED: Variant playlist fetch failed.")
                 return False
@@ -1083,6 +1086,7 @@ class DownloaderEngine:
             variant_text = variant_body.decode("utf-8", errors="ignore")
             return await self._download_hls_via_browser(context, page, jid, dl_dir, variant_url, variant_text, headers, out_file)
 
+        # --- 2. SEGMENT PARSING & FETCHING ---
         segment_uris = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
         if not segment_uris:
             self.db.log_trace(jid, "PASS 7.5 FAILED: Media playlist contained no segments.")
@@ -1101,6 +1105,7 @@ class DownloaderEngine:
             
             success = False
             for attempt in range(3):
+                # 🚨 CRITICAL FIX: Use _safe_fetch here for the actual video chunks 🚨
                 fetch_ok, seg_bytes = await self._safe_fetch(context, page, seg_url, headers)
                 if fetch_ok:
                     with open(seg_path, "wb") as f:
@@ -1123,6 +1128,7 @@ class DownloaderEngine:
                 global _live_ui_text
                 _live_ui_text[jid] = f"[browser-hls] segment {idx + 1}/{len(segment_uris)} ({pct:.1f}%)"
 
+        # --- 3. FFMPEG REMUXING ---
         with open(concat_list_path, "w", encoding="utf-8") as f:
             for p in seg_paths:
                 f.write(f"file '{p.name}'\n")
