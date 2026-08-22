@@ -1026,24 +1026,58 @@ class DownloaderEngine:
         except Exception:
             return False, b""
 
+    async def _safe_dom_fetch(self, page, url: str, jid: str) -> tuple[bool, bytes]:
+        """Executes a native fetch() inside the active Chromium tab, inheriting perfect TLS and Cookies."""
+        import asyncio
+        try:
+            body_b64 = await asyncio.wait_for(
+                page.evaluate('''async (url) => {
+                    const controller = new AbortController();
+                    const timeoutId = setTimeout(() => controller.abort(), 20000);
+                    try {
+                        const res = await fetch(url, { signal: controller.signal });
+                        clearTimeout(timeoutId);
+                        if (!res.ok) return null;
+                        
+                        const blob = await res.blob();
+                        return await new Promise((resolve, reject) => {
+                            const reader = new FileReader();
+                            reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                            reader.onerror = reject;
+                            reader.readAsDataURL(blob);
+                        });
+                    } catch (e) {
+                        clearTimeout(timeoutId);
+                        return null;
+                    }
+                }''', url),
+                timeout=25.0
+            )
+            
+            if not body_b64:
+                return False, b""
+                
+            import base64
+            return True, base64.b64decode(body_b64)
+        except Exception:
+            return False, b""
+
     async def _try_browser_native_download(self, context, page, jid: str, dl_dir: Path, media_url: str, headers: dict, cookie_str: str) -> bool:
         out_file = dl_dir / f"{jid}.mp4"
-        req_headers = {k: v for k, v in headers.items() if k.lower() not in ("host", "content-length")}
 
-        self.db.log_trace(jid, "PASS 7.5: Attempting in-browser native fetch...")
-        success, body = await self._safe_fetch(context, page, media_url, req_headers)
+        self.db.log_trace(jid, "PASS 7.5: Engaging Native DOM Fetcher (WAF Bypass)...")
+        success, body = await self._safe_dom_fetch(page, media_url, jid)
 
         if not success:
-            self.db.log_trace(jid, "PASS 7.5 FAILED: Initial fetch blocked across all vectors.")
+            self.db.log_trace(jid, "PASS 7.5 FAILED: DOM Fetch blocked or timed out on master manifest.")
             return False
 
         is_m3u8 = ".m3u8" in media_url.lower() or body[:7] == b"#EXTM3U"
 
         if is_m3u8:
             manifest_text = body.decode("utf-8", errors="ignore")
-            # 🚨 CRITICAL FIX: Pass cookie_str down to the HLS handler 🚨
             return await self._download_hls_via_browser(
-                context, page, jid, dl_dir, media_url, manifest_text, req_headers, cookie_str, out_file
+                page, jid, dl_dir, media_url, manifest_text, out_file
             )
 
         if len(body) < 100000:
@@ -1054,8 +1088,8 @@ class DownloaderEngine:
             f.write(body)
         self.db.log_trace(jid, f"PASS 7.5 SUCCESS: Direct media payload saved ({len(body)} bytes).")
         return True
-        
-    async def _download_hls_via_browser(self, context, page, jid: str, dl_dir: Path, manifest_url: str, manifest_text: str, headers: dict, cookie_str: str, out_file: Path) -> bool:
+
+    async def _download_hls_via_browser(self, page, jid: str, dl_dir: Path, manifest_url: str, manifest_text: str, out_file: Path) -> bool:
         lines = manifest_text.splitlines()
 
         # ─── 1. RESOLVE MASTER TO VARIANT ───
@@ -1064,6 +1098,7 @@ class DownloaderEngine:
             variant_uri = None
             for i, line in enumerate(lines):
                 if line.startswith("#EXT-X-STREAM-INF"):
+                    import re
                     bw_match = re.search(r"BANDWIDTH=(\d+)", line)
                     bw = int(bw_match.group(1)) if bw_match else 0
                     if i + 1 < len(lines) and not lines[i + 1].startswith("#"):
@@ -1075,100 +1110,80 @@ class DownloaderEngine:
                 self.db.log_trace(jid, "PASS 7.5 FAILED: Master playlist had no usable variant streams.")
                 return False
 
+            import urllib.parse as urlparse
             variant_url = urlparse.urljoin(manifest_url, variant_uri)
             self.db.log_trace(jid, f"PASS 7.5: Master resolved. Fetching variant manifest ({best_bw} bps)...")
             
-            success, variant_body = await self._safe_fetch(context, page, variant_url, headers)
+            success, variant_body = await self._safe_dom_fetch(page, variant_url, jid)
             if not success:
                 self.db.log_trace(jid, "PASS 7.5 FAILED: Variant playlist fetch failed.")
                 return False
                 
             variant_text = variant_body.decode("utf-8", errors="ignore")
-            # Recurse with the variant manifest (passing cookies down)
-            return await self._download_hls_via_browser(context, page, jid, dl_dir, variant_url, variant_text, headers, cookie_str, out_file)
+            return await self._download_hls_via_browser(page, jid, dl_dir, variant_url, variant_text, out_file)
 
-        # ─── 2. BUILD LOCAL MANIFEST FOR EXTERNAL HANDOFF ───
-        self.db.log_trace(jid, "PASS 7.5: Media playlist acquired. Building local absolute manifest...")
-        local_manifest_lines = []
-        
-        for line in lines:
-            line_stripped = line.strip()
-            if not line_stripped:
-                continue
-            if line_stripped.startswith("#"):
-                # CRITICAL FIX: Make AES decryption keys absolute!
-                if 'URI="' in line_stripped:
-                    # Do not import 're' here to avoid UnboundLocalError
-                    def repl(match):
-                        return f'URI="{urlparse.urljoin(manifest_url, match.group(1))}"'
-                    line_stripped = re.sub(r'URI="([^"]+)"', repl, line_stripped)
-                local_manifest_lines.append(line_stripped)
-            else:
-                abs_url = urlparse.urljoin(manifest_url, line_stripped)
-                local_manifest_lines.append(abs_url)
+        # ─── 2. SEGMENT PARSING & DOM FETCHING ───
+        segment_uris = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
+        if not segment_uris:
+            self.db.log_trace(jid, "PASS 7.5 FAILED: Media playlist contained no segments.")
+            return False
 
-        local_manifest_path = dl_dir / f"{jid}_local.m3u8"
-        with open(local_manifest_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(local_manifest_lines) + "\n")
+        seg_dir = dl_dir / f"{jid}_segments"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        concat_list_path = seg_dir / "concat.txt"
+        seg_paths = []
 
-        self.db.log_trace(jid, "PASS 7.5: Local manifest written. Handing off to N_m3u8DL-RE Engine...")
+        self.db.log_trace(jid, f"PASS 7.5: Downloading {len(segment_uris)} segments via DOM Fetcher...")
 
-        # ─── 3. EXECUTE EXTERNAL DOWNLOADER (N_m3u8DL-RE) ───
-        cmd = [
-            "N_m3u8DL-RE", str(local_manifest_path),
-            "--save-dir", str(dl_dir),
-            "--save-name", jid,
-            "--thread-count", "16", 
-            "--log-level", "INFO",
-            "--no-log"
-        ]
+        import urllib.parse as urlparse
+        import asyncio
+        import shutil
 
-        # Inject headers
-        for k, v in headers.items():
-            if k.lower() not in ["host", "content-length"]:
-                cmd.extend(["-H", f"{k}: {v}"])
-                
-        # CRITICAL FIX: Inject the missing cookies
-        if cookie_str:
-            cmd.extend(["-H", f"Cookie: {cookie_str}"])
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
-        )
-
-        try:
-            while True:
-                line = await proc.stdout.readline()
-                if not line:
+        for idx, seg_uri in enumerate(segment_uris):
+            seg_url = urlparse.urljoin(manifest_url, seg_uri)
+            seg_path = seg_dir / f"seg_{idx:05d}.ts"
+            
+            success = False
+            for attempt in range(4):
+                fetch_ok, seg_bytes = await self._safe_dom_fetch(page, seg_url, jid)
+                if fetch_ok and len(seg_bytes) > 1024:
+                    with open(seg_path, "wb") as f:
+                        f.write(seg_bytes)
+                    seg_paths.append(seg_path)
+                    success = True
                     break
-                line_str = line.decode('utf-8', errors='ignore').strip()
-                clean_str = re.sub(r"\x1b[^m]*m", "", line_str)
+                await asyncio.sleep(1.5 * (attempt + 1))
+            
+            if not success:
+                self.db.log_trace(jid, f"PASS 7.5 FAILED: Segment {idx} fetch failed after 4 retries.")
+                shutil.rmtree(seg_dir, ignore_errors=True)
+                return False
 
-                if "%" in clean_str or "Mbps" in clean_str:
-                    global _live_ui_text
-                    _live_ui_text[jid] = f"[N_m3u8DL-RE] {clean_str[:50]}"
-                    m_pct = re.search(r"(\d{1,3}\.\d{1,2})%", clean_str)
-                    if m_pct:
-                        try:
-                            val = float(m_pct.group(1))
-                            await self.db.update_job(jid, pct=val, stage="downloading | RE-Engine")
-                        except Exception: pass
-                elif "ERROR" in clean_str or "WARN" in clean_str:
-                    # Capture actual engine failures so we aren't flying blind
-                    self.db.log_trace(jid, f"[RE-Engine] {clean_str}")
-        except Exception as e:
-            self.db.log_trace(jid, f"N_m3u8DL-RE Output Reader Error: {e}")
+            if idx % 10 == 0 or idx == len(segment_uris) - 1:
+                pct = ((idx + 1) / len(segment_uris)) * 100
+                await self.db.update_job(jid, pct=pct, stage=f"downloading | dom-fetch | seg {idx + 1}/{len(segment_uris)}")
+                global _live_ui_text
+                _live_ui_text[jid] = f"[dom-fetch] segment {idx + 1}/{len(segment_uris)} ({pct:.1f}%)"
 
-        await proc.wait()
+        # ─── 3. FFMPEG REMUXING ───
+        with open(concat_list_path, "w", encoding="utf-8") as f:
+            for p in seg_paths:
+                f.write(f"file '{p.name}'\n")
 
-        # ─── 4. VERIFICATION ───
-        valid_files = [f for f in dl_dir.rglob(f"{jid}.*") if f.is_file() and f.suffix.lower() in [".mp4", ".ts", ".mkv"]]
-        
-        if proc.returncode == 0 and valid_files:
-            self.db.log_trace(jid, "PASS 7.5 SUCCESS: External CLI handoff complete.")
+        self.db.log_trace(jid, "PASS 7.5: All segments downloaded. Remuxing via ffmpeg concat...")
+
+        import subprocess
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list_path), "-c", "copy", "-bsf:a", "aac_adtstoasc", str(out_file)]
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        _, stderr = await proc.communicate()
+
+        shutil.rmtree(seg_dir, ignore_errors=True)
+
+        if proc.returncode == 0 and out_file.exists() and out_file.stat().st_size > 1024:
+            self.db.log_trace(jid, f"PASS 7.5 SUCCESS: HLS stream remuxed to {out_file.name}.")
             return True
-
-        self.db.log_trace(jid, f"PASS 7.5 FAILED: External engine exited with code {proc.returncode}.")
+        
+        self.db.log_trace(jid, f"PASS 7.5 FAILED: ffmpeg remux failed. {stderr.decode(errors='ignore')[:300]}")
         return False
 
     async def _run_nm3u8dlre_capture(self, url: str, jid: str, dl_dir: Path, headers: dict, cookie_str: str) -> bool:
