@@ -1056,7 +1056,7 @@ class DownloaderEngine:
     async def _download_hls_via_browser(self, context, page, jid: str, dl_dir: Path, manifest_url: str, manifest_text: str, headers: dict, out_file: Path) -> bool:
         lines = manifest_text.splitlines()
 
-        # --- 1. VARIANT PLAYLIST PARSING & FETCHING ---
+        # ─── 1. RESOLVE MASTER TO VARIANT ───
         if any(l.startswith("#EXT-X-STREAM-INF") for l in lines):
             best_bw = -1
             variant_uri = None
@@ -1074,78 +1074,88 @@ class DownloaderEngine:
                 return False
 
             variant_url = urlparse.urljoin(manifest_url, variant_uri)
-            self.db.log_trace(jid, f"PASS 7.5: Fetching highest-bitrate variant ({best_bw} bps)...")
+            self.db.log_trace(jid, f"PASS 7.5: Master resolved. Fetching variant manifest ({best_bw} bps)...")
             
-            # 🚨 CRITICAL FIX: Use _safe_fetch here instead of context.request.get 🚨
             success, variant_body = await self._safe_fetch(context, page, variant_url, headers)
-            
             if not success:
                 self.db.log_trace(jid, "PASS 7.5 FAILED: Variant playlist fetch failed.")
                 return False
                 
             variant_text = variant_body.decode("utf-8", errors="ignore")
+            # Recurse with the variant manifest
             return await self._download_hls_via_browser(context, page, jid, dl_dir, variant_url, variant_text, headers, out_file)
 
-        # --- 2. SEGMENT PARSING & FETCHING ---
-        segment_uris = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
-        if not segment_uris:
-            self.db.log_trace(jid, "PASS 7.5 FAILED: Media playlist contained no segments.")
-            return False
-
-        seg_dir = dl_dir / f"{jid}_segments"
-        seg_dir.mkdir(parents=True, exist_ok=True)
-        concat_list_path = seg_dir / "concat.txt"
-        seg_paths = []
-
-        self.db.log_trace(jid, f"PASS 7.5: Downloading {len(segment_uris)} segments...")
-
-        for idx, seg_uri in enumerate(segment_uris):
-            seg_url = urlparse.urljoin(manifest_url, seg_uri)
-            seg_path = seg_dir / f"seg_{idx:05d}.ts"
-            
-            success = False
-            for attempt in range(3):
-                # 🚨 CRITICAL FIX: Use _safe_fetch here for the actual video chunks 🚨
-                fetch_ok, seg_bytes = await self._safe_fetch(context, page, seg_url, headers)
-                if fetch_ok:
-                    with open(seg_path, "wb") as f:
-                        f.write(seg_bytes)
-                    seg_paths.append(seg_path)
-                    success = True
-                    break
-                await asyncio.sleep(1.5 * (attempt + 1))
-            
-            if not success:
-                self.db.log_trace(jid, f"PASS 7.5 FAILED: Segment {idx} fetch failed after retries.")
-                shutil.rmtree(seg_dir, ignore_errors=True)
-                return False
-
-            await asyncio.sleep(0.05) # Pacing to avoid CDN burst detection
-
-            if idx % 25 == 0 or idx == len(segment_uris) - 1:
-                pct = ((idx + 1) / len(segment_uris)) * 100
-                await self.db.update_job(jid, pct=pct, stage=f"downloading | browser-hls | seg {idx + 1}/{len(segment_uris)}")
-                global _live_ui_text
-                _live_ui_text[jid] = f"[browser-hls] segment {idx + 1}/{len(segment_uris)} ({pct:.1f}%)"
-
-        # --- 3. FFMPEG REMUXING ---
-        with open(concat_list_path, "w", encoding="utf-8") as f:
-            for p in seg_paths:
-                f.write(f"file '{p.name}'\n")
-
-        self.db.log_trace(jid, "PASS 7.5: All segments downloaded. Remuxing via ffmpeg concat...")
-
-        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list_path), "-c", "copy", "-bsf:a", "aac_adtstoasc", str(out_file)]
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        _, stderr = await proc.communicate()
-
-        shutil.rmtree(seg_dir, ignore_errors=True)
-
-        if proc.returncode == 0 and out_file.exists() and out_file.stat().st_size > 1024:
-            self.db.log_trace(jid, f"PASS 7.5 SUCCESS: HLS stream remuxed to {out_file.name}.")
-            return True
+        # ─── 2. BUILD LOCAL MANIFEST FOR EXTERNAL HANDOFF ───
+        self.db.log_trace(jid, "PASS 7.5: Media playlist acquired. Building local absolute manifest...")
+        local_manifest_lines = []
         
-        self.db.log_trace(jid, f"PASS 7.5 FAILED: ffmpeg remux failed. {stderr.decode(errors='ignore')[:300]}")
+        for line in lines:
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            if line_stripped.startswith("#"):
+                local_manifest_lines.append(line_stripped)
+            else:
+                # Convert relative segment URIs to absolute URLs
+                abs_url = urlparse.urljoin(manifest_url, line_stripped)
+                local_manifest_lines.append(abs_url)
+
+        local_manifest_path = dl_dir / f"{jid}_local.m3u8"
+        with open(local_manifest_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(local_manifest_lines) + "\n")
+
+        self.db.log_trace(jid, "PASS 7.5: Local manifest written. Handing off to N_m3u8DL-RE Engine...")
+
+        # ─── 3. EXECUTE EXTERNAL DOWNLOADER (N_m3u8DL-RE) ───
+        cmd = [
+            "N_m3u8DL-RE", str(local_manifest_path),
+            "--save-dir", str(dl_dir),
+            "--save-name", jid,
+            "--thread-count", "16", 
+            "--auto-subtitle-fix", "True",
+            "--log-level", "INFO"
+        ]
+
+        # Inject the Playwright headers so the external tool mimics the browser perfectly
+        for k, v in headers.items():
+            if k.lower() not in ["host", "content-length"]:
+                cmd.extend(["-H", f"{k}: {v}"])
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+
+        try:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                line_str = line.decode('utf-8', errors='ignore').strip()
+                clean_str = re.sub(r"\x1b[^m]*m", "", line_str)
+
+                # Capture standard CLI progress and pipe it directly to your Telegram UI
+                if "%" in clean_str or "Mbps" in clean_str:
+                    global _live_ui_text
+                    _live_ui_text[jid] = f"[N_m3u8DL-RE] {clean_str[:50]}"
+                    m_pct = re.search(r"(\d{1,3}\.\d{1,2})%", clean_str)
+                    if m_pct:
+                        try:
+                            val = float(m_pct.group(1))
+                            await self.db.update_job(jid, pct=val, stage="downloading | RE-Engine")
+                        except Exception: pass
+        except Exception as e:
+            self.db.log_trace(jid, f"N_m3u8DL-RE Output Reader Error: {e}")
+
+        await proc.wait()
+
+        # ─── 4. VERIFICATION ───
+        valid_files = [f for f in dl_dir.rglob(f"{jid}.*") if f.is_file() and f.suffix.lower() in [".mp4", ".ts", ".mkv"]]
+        
+        if proc.returncode == 0 and valid_files:
+            self.db.log_trace(jid, "PASS 7.5 SUCCESS: External CLI handoff complete.")
+            return True
+
+        self.db.log_trace(jid, f"PASS 7.5 FAILED: External engine exited with code {proc.returncode}.")
         return False
 
     async def _run_nm3u8dlre_capture(self, url: str, jid: str, dl_dir: Path, headers: dict, cookie_str: str) -> bool:
