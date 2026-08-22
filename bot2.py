@@ -1093,9 +1093,8 @@ class DownloaderEngine:
             if not line_stripped:
                 continue
             if line_stripped.startswith("#"):
-                # CRITICAL FIX: Make AES decryption keys absolute!
+                # CRITICAL FIX: Make AES decryption keys absolute (without re-importing 're')
                 if 'URI="' in line_stripped:
-                    import re
                     def repl(match):
                         return f'URI="{urlparse.urljoin(manifest_url, match.group(1))}"'
                     line_stripped = re.sub(r'URI="([^"]+)"', repl, line_stripped)
