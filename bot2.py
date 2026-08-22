@@ -1041,8 +1041,10 @@ class DownloaderEngine:
 
         if is_m3u8:
             manifest_text = body.decode("utf-8", errors="ignore")
-            # PASS THE COOKIE STRING DOWN TO THE HELPER
-            return await self._download_hls_via_browser(context, page, jid, dl_dir, media_url, manifest_text, req_headers, cookie_str, out_file)
+            # 🚨 CRITICAL FIX: Pass cookie_str down to the HLS handler 🚨
+            return await self._download_hls_via_browser(
+                context, page, jid, dl_dir, media_url, manifest_text, req_headers, cookie_str, out_file
+            )
 
         if len(body) < 100000:
             self.db.log_trace(jid, f"PASS 7.5 FAILED: In-browser fetch returned suspiciously small payload ({len(body)} bytes).")
@@ -1052,7 +1054,7 @@ class DownloaderEngine:
             f.write(body)
         self.db.log_trace(jid, f"PASS 7.5 SUCCESS: Direct media payload saved ({len(body)} bytes).")
         return True
-
+        
     async def _download_hls_via_browser(self, context, page, jid: str, dl_dir: Path, manifest_url: str, manifest_text: str, headers: dict, cookie_str: str, out_file: Path) -> bool:
         lines = manifest_text.splitlines()
 
@@ -1082,6 +1084,7 @@ class DownloaderEngine:
                 return False
                 
             variant_text = variant_body.decode("utf-8", errors="ignore")
+            # Recurse with the variant manifest (passing cookies down)
             return await self._download_hls_via_browser(context, page, jid, dl_dir, variant_url, variant_text, headers, cookie_str, out_file)
 
         # ─── 2. BUILD LOCAL MANIFEST FOR EXTERNAL HANDOFF ───
@@ -1093,8 +1096,9 @@ class DownloaderEngine:
             if not line_stripped:
                 continue
             if line_stripped.startswith("#"):
-                # CRITICAL FIX: Make AES decryption keys absolute (without re-importing 're')
+                # CRITICAL FIX: Make AES decryption keys absolute!
                 if 'URI="' in line_stripped:
+                    # Do not import 're' here to avoid UnboundLocalError
                     def repl(match):
                         return f'URI="{urlparse.urljoin(manifest_url, match.group(1))}"'
                     line_stripped = re.sub(r'URI="([^"]+)"', repl, line_stripped)
@@ -1118,10 +1122,12 @@ class DownloaderEngine:
             "--log-level", "INFO"
         ]
 
+        # Inject headers
         for k, v in headers.items():
             if k.lower() not in ["host", "content-length"]:
                 cmd.extend(["-H", f"{k}: {v}"])
                 
+        # CRITICAL FIX: Inject the missing cookies
         if cookie_str:
             cmd.extend(["-H", f"Cookie: {cookie_str}"])
 
@@ -1147,7 +1153,7 @@ class DownloaderEngine:
                             await self.db.update_job(jid, pct=val, stage="downloading | RE-Engine")
                         except Exception: pass
                 elif "ERROR" in clean_str or "WARN" in clean_str:
-                    # Capture actual engine failures
+                    # Capture actual engine failures so we aren't flying blind
                     self.db.log_trace(jid, f"[RE-Engine] {clean_str}")
         except Exception as e:
             self.db.log_trace(jid, f"N_m3u8DL-RE Output Reader Error: {e}")
