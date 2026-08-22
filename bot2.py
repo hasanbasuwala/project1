@@ -1119,7 +1119,8 @@ class DownloaderEngine:
             "--save-dir", str(dl_dir),
             "--save-name", jid,
             "--thread-count", "16", 
-            "--log-level", "INFO"
+            "--log-level", "INFO",
+            "--no-log"
         ]
 
         # Inject headers
