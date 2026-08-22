@@ -1037,12 +1037,12 @@ class DownloaderEngine:
             self.db.log_trace(jid, "PASS 7.5 FAILED: Initial fetch blocked across all vectors.")
             return False
 
-        # If it's a raw media file, content-type checking is bypassed here since we rely on file magic bytes
         is_m3u8 = ".m3u8" in media_url.lower() or body[:7] == b"#EXTM3U"
 
         if is_m3u8:
             manifest_text = body.decode("utf-8", errors="ignore")
-            return await self._download_hls_via_browser(context, page, jid, dl_dir, media_url, manifest_text, req_headers, out_file)
+            # PASS THE COOKIE STRING DOWN TO THE HELPER
+            return await self._download_hls_via_browser(context, page, jid, dl_dir, media_url, manifest_text, req_headers, cookie_str, out_file)
 
         if len(body) < 100000:
             self.db.log_trace(jid, f"PASS 7.5 FAILED: In-browser fetch returned suspiciously small payload ({len(body)} bytes).")
@@ -1053,7 +1053,7 @@ class DownloaderEngine:
         self.db.log_trace(jid, f"PASS 7.5 SUCCESS: Direct media payload saved ({len(body)} bytes).")
         return True
 
-    async def _download_hls_via_browser(self, context, page, jid: str, dl_dir: Path, manifest_url: str, manifest_text: str, headers: dict, out_file: Path) -> bool:
+    async def _download_hls_via_browser(self, context, page, jid: str, dl_dir: Path, manifest_url: str, manifest_text: str, headers: dict, cookie_str: str, out_file: Path) -> bool:
         lines = manifest_text.splitlines()
 
         # ─── 1. RESOLVE MASTER TO VARIANT ───
@@ -1082,8 +1082,8 @@ class DownloaderEngine:
                 return False
                 
             variant_text = variant_body.decode("utf-8", errors="ignore")
-            # Recurse with the variant manifest
-            return await self._download_hls_via_browser(context, page, jid, dl_dir, variant_url, variant_text, headers, out_file)
+            # Recurse with the variant manifest (passing cookies down)
+            return await self._download_hls_via_browser(context, page, jid, dl_dir, variant_url, variant_text, headers, cookie_str, out_file)
 
         # ─── 2. BUILD LOCAL MANIFEST FOR EXTERNAL HANDOFF ───
         self.db.log_trace(jid, "PASS 7.5: Media playlist acquired. Building local absolute manifest...")
@@ -1096,7 +1096,6 @@ class DownloaderEngine:
             if line_stripped.startswith("#"):
                 local_manifest_lines.append(line_stripped)
             else:
-                # Convert relative segment URIs to absolute URLs
                 abs_url = urlparse.urljoin(manifest_url, line_stripped)
                 local_manifest_lines.append(abs_url)
 
@@ -1116,10 +1115,14 @@ class DownloaderEngine:
             "--log-level", "INFO"
         ]
 
-        # Inject the Playwright headers so the external tool mimics the browser perfectly
+        # Inject headers
         for k, v in headers.items():
             if k.lower() not in ["host", "content-length"]:
                 cmd.extend(["-H", f"{k}: {v}"])
+                
+        # Inject the critically missing cookies
+        if cookie_str:
+            cmd.extend(["-H", f"Cookie: {cookie_str}"])
 
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
@@ -1133,7 +1136,6 @@ class DownloaderEngine:
                 line_str = line.decode('utf-8', errors='ignore').strip()
                 clean_str = re.sub(r"\x1b[^m]*m", "", line_str)
 
-                # Capture standard CLI progress and pipe it directly to your Telegram UI
                 if "%" in clean_str or "Mbps" in clean_str:
                     global _live_ui_text
                     _live_ui_text[jid] = f"[N_m3u8DL-RE] {clean_str[:50]}"
