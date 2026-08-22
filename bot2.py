@@ -1082,7 +1082,6 @@ class DownloaderEngine:
                 return False
                 
             variant_text = variant_body.decode("utf-8", errors="ignore")
-            # Recurse with the variant manifest (passing cookies down)
             return await self._download_hls_via_browser(context, page, jid, dl_dir, variant_url, variant_text, headers, cookie_str, out_file)
 
         # ─── 2. BUILD LOCAL MANIFEST FOR EXTERNAL HANDOFF ───
@@ -1094,6 +1093,12 @@ class DownloaderEngine:
             if not line_stripped:
                 continue
             if line_stripped.startswith("#"):
+                # CRITICAL FIX: Make AES decryption keys absolute!
+                if 'URI="' in line_stripped:
+                    import re
+                    def repl(match):
+                        return f'URI="{urlparse.urljoin(manifest_url, match.group(1))}"'
+                    line_stripped = re.sub(r'URI="([^"]+)"', repl, line_stripped)
                 local_manifest_lines.append(line_stripped)
             else:
                 abs_url = urlparse.urljoin(manifest_url, line_stripped)
@@ -1111,16 +1116,13 @@ class DownloaderEngine:
             "--save-dir", str(dl_dir),
             "--save-name", jid,
             "--thread-count", "16", 
-            "--auto-subtitle-fix", "True",
             "--log-level", "INFO"
         ]
 
-        # Inject headers
         for k, v in headers.items():
             if k.lower() not in ["host", "content-length"]:
                 cmd.extend(["-H", f"{k}: {v}"])
                 
-        # Inject the critically missing cookies
         if cookie_str:
             cmd.extend(["-H", f"Cookie: {cookie_str}"])
 
@@ -1145,6 +1147,9 @@ class DownloaderEngine:
                             val = float(m_pct.group(1))
                             await self.db.update_job(jid, pct=val, stage="downloading | RE-Engine")
                         except Exception: pass
+                elif "ERROR" in clean_str or "WARN" in clean_str:
+                    # Capture actual engine failures
+                    self.db.log_trace(jid, f"[RE-Engine] {clean_str}")
         except Exception as e:
             self.db.log_trace(jid, f"N_m3u8DL-RE Output Reader Error: {e}")
 
