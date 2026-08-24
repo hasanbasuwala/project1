@@ -996,7 +996,7 @@ class DownloaderEngine:
             extracted_payload["raw_cookies"] = cookies
             extracted_payload["cookie_str"] = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
 
-             if extracted_payload.get("url"):
+            if extracted_payload.get("url"):
                 try:
                     # Pass the active page object rather than context
                     downloaded = await self._try_browser_native_download(
