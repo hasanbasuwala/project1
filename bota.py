@@ -2857,34 +2857,36 @@ def _format_eta(s: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 async def terminal_loop(db: JobScheduler, pipeline: PipelineManager):
-    """
-    Rewritten continuous-scroll logger. 
-    Does not clear the screen, allowing standard logs to scroll naturally.
-    """
-    sys.stdout.write(f"{C_CYAN}{C_BOLD}=== STEALTH MAINFRAME [VERBOSE MODE] ==={C_RESET}\n")
-    
-    last_known_jobs = set()
-    
+    sys.stdout.write("\033[2J") # Wipe screen only ONCE at startup
     while True:
-        await asyncio.sleep(5) # Slowed down to 5 seconds to prevent spam
-        
+        await asyncio.sleep(1)
+        # \033[H moves cursor to top-left. \033[K clears the old text on that line.
+        sys.stdout.write("\033[H")
+        sys.stdout.write(f"{C_CYAN}{C_BOLD}=== STEALTH MAINFRAME [LIVE] ==={C_RESET}\033[K\n")
+        sys.stdout.write(f"QUEUES | DL: {pipeline.dl_q.qsize()} | ENC: {pipeline.enc_q.qsize()} | UP: {pipeline.up_q.qsize()}\033[K\n{'─' * 40}\033[K\n")
+
         jobs = await db.get_active_jobs()
-        current_job_ids = {j['id'] for j in jobs}
-        
-        # Only print a queue summary if there's active work or a change in jobs
-        if jobs or current_job_ids != last_known_jobs:
-            sys.stdout.write(f"\n{C_CYAN}[SYSTEM HEARTBEAT]{C_RESET} QUEUES | DL: {pipeline.dl_q.qsize()} | ENC: {pipeline.enc_q.qsize()} | UP: {pipeline.up_q.qsize()}\n")
-            
-            for j in jobs:
+        if not jobs:
+            sys.stdout.write(f"{C_GREEN}System Idle. Awaiting vectors.{C_RESET}\033[K\n")
+        else:
+            for j in jobs[:5]:
                 col = C_YELLOW if "download" in j['stage'] else C_CYAN if "enc" in j['stage'] else C_GREEN
-                sys.stdout.write(f" -> {C_BOLD}[{j['title'][:15]}]{C_RESET} {col}{j['stage']}{C_RESET} | {j['pct']:.1f}%\n")
-                
-                # Fetch and print the live UI text without screen-clearing
-                live_text = _live_ui_text.get(j['id'], "")
-                if live_text:
-                    sys.stdout.write(f"    📡 \033[36m{live_text[:100]}\033[0m\n")
-                    
-        last_known_jobs = current_job_ids
+                sys.stdout.write(f"{C_BOLD}[{j['title'][:15]}]{C_RESET} {col}{j['stage']}{C_RESET} | [{make_bar(j['pct'], 10)}] {j['pct']:.1f}%\033[K\n")
+
+                log_path = JOBS_DIR / f"JOB_{j['id']}" / "trace.log"
+                last_log = "Initializing..."
+                if log_path.exists():
+                    try:
+                        with open(log_path, "r", encoding="utf-8") as f:
+                            lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+                            if lines: last_log = re.sub(r"^\[.*?\]\s*", "", lines[-1])
+                    except Exception: pass
+                sys.stdout.write(f"  ├ 📄 \033[2m{last_log[:70]}\033[0m\033[K\n")
+
+                live_text = _live_ui_text.get(j['id'], "Awaiting data stream...")
+                sys.stdout.write(f"  └ 📡 \033[36m{live_text[:75]}\033[0m\033[K\n")
+
+        sys.stdout.write("\033[J") # Clear any ghost lines below the UI
         sys.stdout.flush()
 
 # ═══════════════════════════════════════════════════════════════════════
