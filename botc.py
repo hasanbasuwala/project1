@@ -490,6 +490,79 @@ class VKPlaylistManager:
 #  this without re-testing against VK CDN 403s / curl_cffi pinning.)
 # ═══════════════════════════════════════════════════════════════════════
 
+from aiohttp import web
+import base64
+import urllib.parse as urlparse
+
+class PlaywrightHLSProxy:
+    def __init__(self, page, initial_manifest_url):
+        self.page = page
+        self.base_url = initial_manifest_url
+        self.app = web.Application()
+        self.app.router.add_get('/manifest.m3u8', self.serve_manifest)
+        self.app.router.add_get('/segment', self.serve_segment)
+        self.runner = None
+        self.site = None
+
+    async def start(self) -> str:
+        self.runner = web.AppRunner(self.app)
+        await self.runner.setup()
+        self.site = web.TCPSite(self.runner, '127.0.0.1', 0) # 0 assigns a random free port
+        await self.site.start()
+        port = self.site._server.sockets[0].getsockname()[1]
+        return f"http://127.0.0.1:{port}/manifest.m3u8"
+
+    async def stop(self):
+        if self.runner:
+            await self.runner.cleanup()
+
+    async def serve_manifest(self, request):
+        target_url = request.query.get('url', self.base_url)
+        js = "async (u) => { const r = await fetch(u, {credentials: 'omit'}); return await r.text(); }"
+        
+        try:
+            manifest_text = await self.page.evaluate(js, target_url)
+        except Exception as e:
+            return web.Response(status=500, text=str(e))
+        
+        new_lines = []
+        for line in manifest_text.splitlines():
+            if line.startswith("#"):
+                new_lines.append(line)
+            elif line.strip():
+                abs_uri = urlparse.urljoin(target_url, line.strip())
+                encoded = urlparse.quote_plus(abs_uri)
+                if ".m3u8" in abs_uri:
+                    new_lines.append(f"/manifest.m3u8?url={encoded}")
+                else:
+                    new_lines.append(f"/segment?url={encoded}")
+        
+        return web.Response(text="\n".join(new_lines), content_type="application/vnd.apple.mpegurl")
+
+    async def serve_segment(self, request):
+        target_url = request.query.get('url')
+        if not target_url: return web.Response(status=400)
+            
+        js = """
+        async (u) => {
+            const r = await fetch(u, {credentials: 'omit'});
+            if (!r.ok) return null;
+            const buf = await r.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            let binary = '';
+            for (let i = 0; i < bytes.length; i += 8192) {
+                binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+            }
+            return btoa(binary);
+        }
+        """
+        try:
+            b64 = await self.page.evaluate(js, target_url)
+            if not b64: return web.Response(status=403)
+            return web.Response(body=base64.b64decode(b64), content_type="video/MP2T")
+        except Exception:
+            return web.Response(status=500)
+
 class DownloaderEngine:
     def __init__(self, scheduler: JobScheduler, app: Client):
         self.db = scheduler
@@ -1004,18 +1077,36 @@ class DownloaderEngine:
 
             if extracted_payload.get("url"):
                 try:
-                    # Un-choke the network pipeline before mass segment download
-                    try:
-                        await page.unroute("**/*")
-                    except Exception:
-                        pass
-                        
-                    downloaded = await self._try_browser_native_download(
-                        page, jid, dl_dir, extracted_payload["url"]
+                    self.db.log_trace(jid, "PASS 7.5: Booting Localhost Playwright Proxy...")
+                    proxy = PlaywrightHLSProxy(page, extracted_payload["url"])
+                    local_m3u8_url = await proxy.start()
+                    
+                    self.db.log_trace(jid, f"PASS 7.5: Proxy online at {local_m3u8_url}. Handing off to FFmpeg...")
+                    
+                    out_file = dl_dir / f"{jid}.mp4"
+                    cmd = [
+                        "ffmpeg", "-y", 
+                        "-i", local_m3u8_url, 
+                        "-c", "copy", "-bsf:a", "aac_adtstoasc", 
+                        str(out_file)
+                    ]
+                    
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
                     )
-                    extracted_payload["browser_downloaded"] = downloaded
+                    _, stderr = await proc.communicate()
+                    
+                    await proxy.stop()
+                    
+                    if proc.returncode == 0 and out_file.exists() and out_file.stat().st_size > 1024:
+                        self.db.log_trace(jid, "PASS 7.5 SUCCESS: FFmpeg stream capture complete.")
+                        extracted_payload["browser_downloaded"] = True
+                    else:
+                        self.db.log_trace(jid, f"PASS 7.5 FAILED: {stderr.decode(errors='ignore')[:300]}")
+                        extracted_payload["browser_downloaded"] = False
+
                 except Exception as e:
-                    self.db.log_trace(jid, f"PASS 7.5 FAILED: Unexpected error: {e}")
+                    self.db.log_trace(jid, f"PASS 7.5 CRITICAL PROXY ERROR: {e}")
                     extracted_payload["browser_downloaded"] = False
 
             await context.close()
