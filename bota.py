@@ -96,7 +96,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logging.getLogger().handlers[1].setLevel(logging.INFO) # Use logging.DEBUG for maximum verbosity
+logging.getLogger().handlers[1].setLevel(logging.DEBUG)
 log = logging.getLogger("stealth_bot")
 logging.getLogger("pyrogram").setLevel(logging.ERROR)
 
