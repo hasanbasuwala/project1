@@ -1100,28 +1100,43 @@ class DownloaderEngine:
                     proxy = PlaywrightHLSProxy(page, extracted_payload["url"])
                     local_m3u8_url = await proxy.start()
                     
-                    self.db.log_trace(jid, f"PASS 7.5: Proxy online at {local_m3u8_url}. Handing off to FFmpeg...")
+                    self.db.log_trace(jid, f"PASS 7.5: Proxy online. Handing off to N_m3u8DL-RE for multi-threaded capture...")
                     
                     out_file = dl_dir / f"{jid}.mp4"
+                    
+                    # ── Swap FFmpeg for multi-threaded N_m3u8DL-RE ──
                     cmd = [
-                        "ffmpeg", "-y", 
-                        "-i", local_m3u8_url, 
-                        "-c", "copy", "-bsf:a", "aac_adtstoasc", 
-                        str(out_file)
+                        "N_m3u8DL-RE", local_m3u8_url,
+                        "--save-dir", str(dl_dir),
+                        "--save-name", jid,
+                        "--thread-count", "16",
+                        "--auto-subtitle-fix", "True"
                     ]
                     
+                    # Increase buffer limit to 5MB to prevent the StreamReader from crashing on heavy ANSI output
                     proc = await asyncio.create_subprocess_exec(
-                        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+                        *cmd, 
+                        stdout=asyncio.subprocess.PIPE, 
+                        stderr=asyncio.subprocess.STDOUT,
+                        limit=1024 * 1024 * 5
                     )
-                    _, stderr = await proc.communicate()
                     
+                    # Read the output so it doesn't block the pipe
+                    while True:
+                        line = await proc.stdout.readline()
+                        if not line: break
+                    
+                    await proc.wait()
                     await proxy.stop()
                     
-                    if proc.returncode == 0 and out_file.exists() and out_file.stat().st_size > 1024:
-                        self.db.log_trace(jid, "PASS 7.5 SUCCESS: FFmpeg stream capture complete.")
+                    # Check if N_m3u8DL-RE successfully created the media file
+                    valid_files = [f for f in dl_dir.rglob(f"{jid}.*") if f.is_file() and f.suffix.lower() in [".mp4", ".ts", ".mkv"]]
+                    
+                    if proc.returncode == 0 and valid_files:
+                        self.db.log_trace(jid, "PASS 7.5 SUCCESS: N_m3u8DL-RE proxy stream capture complete.")
                         extracted_payload["browser_downloaded"] = True
                     else:
-                        self.db.log_trace(jid, f"PASS 7.5 FAILED: {stderr.decode(errors='ignore')[:300]}")
+                        self.db.log_trace(jid, "PASS 7.5 FAILED: N_m3u8DL-RE proxy capture failed or wrote no payload.")
                         extracted_payload["browser_downloaded"] = False
 
                 except Exception as e:
