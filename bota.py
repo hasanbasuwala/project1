@@ -996,15 +996,15 @@ class DownloaderEngine:
             extracted_payload["raw_cookies"] = cookies
             extracted_payload["cookie_str"] = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
 
-            if extracted_payload.get("url"):
+             if extracted_payload.get("url"):
                 try:
+                    # Pass the active page object rather than context
                     downloaded = await self._try_browser_native_download(
-                        context, jid, dl_dir, extracted_payload["url"],
-                        extracted_payload["headers"], extracted_payload["cookie_str"]
+                        page, jid, dl_dir, extracted_payload["url"]
                     )
                     extracted_payload["browser_downloaded"] = downloaded
                 except Exception as e:
-                    self.db.log_trace(jid, f"PASS 7.5 FAILED: Unexpected error during in-browser download attempt: {e}")
+                    self.db.log_trace(jid, f"PASS 7.5 FAILED: Unexpected error: {e}")
                     extracted_payload["browser_downloaded"] = False
 
             await context.close()
