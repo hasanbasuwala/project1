@@ -2906,6 +2906,7 @@ async def terminal_loop(db: JobScheduler, pipeline: PipelineManager):
 # ═══════════════════════════════════════════════════════════════════════
 
 async def main():
+    log.info("Booting Stealth Mainframe...")
     app = Client("stealth_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
     db = JobScheduler(DB_PATH)
     vk_manager = VKPlaylistManager(VK_TOKEN)
@@ -2917,30 +2918,24 @@ async def main():
     setup_router(app, db, pipeline, vk_manager)
 
     async with app:
+        log.info("Running recovery audits...")
         recovering_batch_jids = await RecoveryManager.scan_and_requeue(db, pipeline.dl_q, pipeline.enc_q, pipeline.up_q, app)
         pipeline.start_workers()
 
         asyncio.create_task(dispatcher.sender_loop())
         asyncio.create_task(ui_accumulator.run_loop())
-        #asyncio.create_task(terminal_loop(db, pipeline))
-
+        
         asyncio.create_task(_batch_runner(db, pipeline, app))
         if recovering_batch_jids:
             asyncio.create_task(_resume_interrupted_batches(db, pipeline, recovering_batch_jids))
 
-        if OWNER_ID:
-            m = await app.send_message(OWNER_ID, "🟢 Mainframe Systems Online.")
+        log.info("🟢 System Online. Listening for Telegram links...")
 
+        if OWNER_ID:
             try:
-                await app.unpin_all_chat_messages(m.chat.id)
-                await m.pin(disable_notification=True, both_sides=True)
+                await app.send_message(OWNER_ID, "🟢 Mainframe Systems Online. Terminal logging active.")
             except Exception:
                 pass
-
-            global _dashboard_msg_id, _dashboard_chat_id, _dashboard_tab
-            _dashboard_msg_id, _dashboard_chat_id = m.id, m.chat.id
-            text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
-            await dispatcher.safe_edit_queued(_dashboard_chat_id, _dashboard_msg_id, text, kb)
 
         while True: await asyncio.sleep(3600)
 
