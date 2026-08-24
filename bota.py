@@ -1126,42 +1126,73 @@ class DownloaderEngine:
 
         self.db.log_trace(jid, f"PASS 7.5: Downloading {len(segment_uris)} HLS segments in-DOM...")
 
-        # JS snippet to fetch binary data as base64 string
+        # JS snippet: Uses AbortController for strict timeouts and ArrayBuffer for safe extraction
         fetch_seg_b64_js = """
         async (segUrl) => {
-            const resp = await fetch(segUrl, { credentials: 'include' });
-            if (!resp.ok) return null;
-            const blob = await resp.blob();
-            return new Promise((resolve) => {
-                const reader = new FileReader();
-                reader.onloadend = () => resolve(reader.result.split(',')[1]);
-                reader.readAsDataURL(blob);
-            });
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 20000); // 20s hard timeout
+                
+                const resp = await fetch(segUrl, { 
+                    credentials: 'include', 
+                    signal: controller.signal 
+                });
+                
+                clearTimeout(timeoutId);
+                
+                if (!resp.ok) return { error: `HTTP ${resp.status}` };
+                
+                const buffer = await resp.arrayBuffer();
+                const bytes = new Uint8Array(buffer);
+                
+                // Chunked string conversion prevents "Maximum Call Stack Size Exceeded" crashes
+                let binary = '';
+                const chunkSize = 8192; 
+                for (let i = 0; i < bytes.length; i += chunkSize) {
+                    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+                }
+                
+                return { b64: btoa(binary) };
+            } catch (e) {
+                return { error: e.toString() }; // Gracefully bubble errors to Python
+            }
         }
         """
 
         import base64
+        import asyncio
+        
         for idx, seg_uri in enumerate(segment_uris):
             seg_url = urlparse.urljoin(manifest_url, seg_uri)
             seg_path = seg_dir / f"seg_{idx:05d}.ts"
 
             try:
-                b64_seg = await page.evaluate(fetch_seg_b64_js, seg_url)
-                if not b64_seg:
-                    self.db.log_trace(jid, f"PASS 7.5 FAILED: Segment {idx} rejected by CDN.")
+                # Python-side 25s timeout acts as an ultimate fail-safe against deadlocks
+                result = await asyncio.wait_for(
+                    page.evaluate(fetch_seg_b64_js, seg_url), 
+                    timeout=25.0
+                )
+
+                if result and result.get("b64"):
+                    with open(seg_path, "wb") as f:
+                        f.write(base64.b64decode(result["b64"]))
+                    seg_paths.append(seg_path)
+                else:
+                    err_msg = result.get("error", "Empty/Null response") if result else "No result returned"
+                    self.db.log_trace(jid, f"PASS 7.5 FAILED: Segment {idx} rejected by CDN. Error: {err_msg}")
                     shutil.rmtree(seg_dir, ignore_errors=True)
                     return False
 
-                with open(seg_path, "wb") as f:
-                    f.write(base64.b64decode(b64_seg))
-
-                seg_paths.append(seg_path)
-
+            except asyncio.TimeoutError:
+                self.db.log_trace(jid, f"PASS 7.5 FAILED: Segment {idx} timed out after 25 seconds.")
+                shutil.rmtree(seg_dir, ignore_errors=True)
+                return False
             except Exception as e:
-                self.db.log_trace(jid, f"PASS 7.5 FAILED: Segment {idx} fetch error: {e}")
+                self.db.log_trace(jid, f"PASS 7.5 FAILED: Segment {idx} critical fetch error: {e}")
                 shutil.rmtree(seg_dir, ignore_errors=True)
                 return False
 
+            # Update live UI every 10 segments or on the last segment
             if idx % 10 == 0 or idx == len(segment_uris) - 1:
                 pct = ((idx + 1) / len(segment_uris)) * 100
                 await self.db.update_job(jid, pct=pct, stage=f"downloading | in-DOM HLS | seg {idx + 1}/{len(segment_uris)}")
