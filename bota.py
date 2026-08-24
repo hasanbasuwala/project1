@@ -1126,12 +1126,12 @@ class DownloaderEngine:
 
         self.db.log_trace(jid, f"PASS 7.5: Downloading {len(segment_uris)} HLS segments in-DOM...")
 
-        # JS snippet: Uses AbortController for strict timeouts and ArrayBuffer for safe extraction
+        # JS snippet: Extended 45s internal timeout with aggressive error tracing
         fetch_seg_b64_js = """
         async (segUrl) => {
             try {
                 const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 20000); // 20s hard timeout
+                const timeoutId = setTimeout(() => controller.abort(), 45000); 
                 
                 const resp = await fetch(segUrl, { 
                     credentials: 'include', 
@@ -1140,12 +1140,15 @@ class DownloaderEngine:
                 
                 clearTimeout(timeoutId);
                 
-                if (!resp.ok) return { error: `HTTP ${resp.status}` };
+                if (!resp.ok) {
+                    return { error: `HTTP ${resp.status} ${resp.statusText}` };
+                }
                 
                 const buffer = await resp.arrayBuffer();
                 const bytes = new Uint8Array(buffer);
                 
-                // Chunked string conversion prevents "Maximum Call Stack Size Exceeded" crashes
+                if (bytes.length === 0) return { error: "Received 0 bytes from CDN" };
+                
                 let binary = '';
                 const chunkSize = 8192; 
                 for (let i = 0; i < bytes.length; i += chunkSize) {
@@ -1154,7 +1157,7 @@ class DownloaderEngine:
                 
                 return { b64: btoa(binary) };
             } catch (e) {
-                return { error: e.toString() }; // Gracefully bubble errors to Python
+                return { error: `JS Exception: ${e.message || e.toString()}` };
             }
         }
         """
@@ -1167,10 +1170,10 @@ class DownloaderEngine:
             seg_path = seg_dir / f"seg_{idx:05d}.ts"
 
             try:
-                # Python-side 25s timeout acts as an ultimate fail-safe against deadlocks
+                # Bumped to 60 seconds to ensure the JS timeout fires first
                 result = await asyncio.wait_for(
                     page.evaluate(fetch_seg_b64_js, seg_url), 
-                    timeout=25.0
+                    timeout=60.0
                 )
 
                 if result and result.get("b64"):
@@ -1180,11 +1183,14 @@ class DownloaderEngine:
                 else:
                     err_msg = result.get("error", "Empty/Null response") if result else "No result returned"
                     self.db.log_trace(jid, f"PASS 7.5 FAILED: Segment {idx} rejected by CDN. Error: {err_msg}")
+                    # Print directly to our new standard logger
+                    log.error(f"Segment {idx} failed: {err_msg}") 
                     shutil.rmtree(seg_dir, ignore_errors=True)
                     return False
 
             except asyncio.TimeoutError:
-                self.db.log_trace(jid, f"PASS 7.5 FAILED: Segment {idx} timed out after 25 seconds.")
+                self.db.log_trace(jid, f"PASS 7.5 FAILED: Segment {idx} hard-timed out after 60 seconds.")
+                log.error(f"Segment {idx} hard-timed out after 60 seconds.")
                 shutil.rmtree(seg_dir, ignore_errors=True)
                 return False
             except Exception as e:
