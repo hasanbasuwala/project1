@@ -310,8 +310,15 @@ class JobScheduler:
                 conn.execute('DELETE FROM jobs WHERE id = ?', (jid,))
 
     def log_trace(self, jid: str, msg: str):
-        with open(JOBS_DIR / f"JOB_{jid}" / "trace.log", "a", encoding="utf-8") as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+        # 1. Keep writing to the job's trace.log file
+        try:
+            with open(JOBS_DIR / f"JOB_{jid}" / "trace.log", "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+        except Exception:
+            pass
+        
+        # 2. ALSO push it to the standard Python logger so it prints in Termux
+        logging.getLogger("stealth_bot").info(f"[{jid}] {msg}")
 
 # ═══════════════════════════════════════════════════════════════════════
 # CHAPTER 4 — LINK CLASSIFIER + MESSAGE PARSING (url / #playlist / caption)
