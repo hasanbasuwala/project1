@@ -1004,7 +1004,12 @@ class DownloaderEngine:
 
             if extracted_payload.get("url"):
                 try:
-                    # Pass the active page object rather than context
+                    # Un-choke the network pipeline before mass segment download
+                    try:
+                        await page.unroute("**/*")
+                    except Exception:
+                        pass
+                        
                     downloaded = await self._try_browser_native_download(
                         page, jid, dl_dir, extracted_payload["url"]
                     )
