@@ -1137,19 +1137,36 @@ class DownloaderEngine:
 
         self.db.log_trace(jid, f"PASS 7.5: Downloading {len(segment_uris)} HLS segments in-DOM...")
 
-        # JS snippet: Extended 45s internal timeout with aggressive error tracing
+        # JS snippet: Un-hijacked fetch with CORS fallback
         fetch_seg_b64_js = """
         async (segUrl) => {
             try {
+                // 1. Recover native fetch (Bypasses site anti-bot overwrites)
+                let cleanFetch = window.fetch;
+                const iframe = document.createElement('iframe');
+                iframe.style.display = 'none';
+                document.body.appendChild(iframe);
+                if (iframe.contentWindow && iframe.contentWindow.fetch) {
+                    cleanFetch = iframe.contentWindow.fetch;
+                }
+
                 const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 45000); 
+                const timeoutId = setTimeout(() => controller.abort(), 35000); 
                 
-                const resp = await fetch(segUrl, { 
-                    credentials: 'include', 
-                    signal: controller.signal 
-                });
+                // 2. Fetch using 'omit' to prevent CORS preflight hangs
+                let resp;
+                try {
+                    resp = await cleanFetch(segUrl, { 
+                        credentials: 'omit', 
+                        signal: controller.signal 
+                    });
+                } catch (err) {
+                    // Fallback if standard fetch is blocked
+                    resp = await cleanFetch(segUrl, { signal: controller.signal });
+                }
                 
                 clearTimeout(timeoutId);
+                document.body.removeChild(iframe);
                 
                 if (!resp.ok) {
                     return { error: `HTTP ${resp.status} ${resp.statusText}` };
