@@ -543,6 +543,24 @@ class PlaywrightHLSProxy:
         target_url = request.query.get('url')
         if not target_url: return web.Response(status=400)
             
+        # ── FAST PATH: Direct fetch at full network speed ──
+        try:
+            from curl_cffi.requests import AsyncSession
+            async with AsyncSession(impersonate="chrome") as session:
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "*/*",
+                    "Connection": "keep-alive"
+                }
+                # Request the segment directly, bypassing Playwright's JS engine
+                resp = await session.get(target_url, headers=headers, timeout=30)
+                
+                if resp.status_code in [200, 206]:
+                    return web.Response(body=resp.content, content_type="video/MP2T")
+        except Exception:
+            pass # WAF blocked the fast path or it timed out; fall back to slow path
+            
+        # ── SLOW PATH: Playwright Base64 Bridge Fallback ──
         js = """
         async (u) => {
             const r = await fetch(u, {credentials: 'omit'});
@@ -559,6 +577,7 @@ class PlaywrightHLSProxy:
         try:
             b64 = await self.page.evaluate(js, target_url)
             if not b64: return web.Response(status=403)
+            import base64
             return web.Response(body=base64.b64decode(b64), content_type="video/MP2T")
         except Exception:
             return web.Response(status=500)
