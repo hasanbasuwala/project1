@@ -1272,8 +1272,12 @@ class DownloaderEngine:
 
         self.db.log_trace(jid, f"N_m3u8DL-RE command initialized with {len(headers)} headers.")
 
+        # Increase the asyncio StreamReader limit to 5MB to handle N_m3u8DL-RE's heavy ANSI output
         proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            *cmd, 
+            stdout=asyncio.subprocess.PIPE, 
+            stderr=asyncio.subprocess.STDOUT,
+            limit=1024 * 1024 * 5
         )
 
         try:
