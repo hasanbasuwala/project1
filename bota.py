@@ -1016,43 +1016,80 @@ class DownloaderEngine:
 
             return extracted_payload
 
-    async def _try_browser_native_download(self, context, jid: str, dl_dir: Path, media_url: str, headers: dict, cookie_str: str) -> bool:
+    async def _try_browser_native_download(self, page, jid: str, dl_dir: Path, media_url: str) -> bool:
+        """
+        Executes genuine in-DOM fetching via page.evaluate().
+        Inherits real Chrome TLS session, active cookies, and Origin/Referer bindings.
+        """
         out_file = dl_dir / f"{jid}.mp4"
-        req_headers = {k: v for k, v in headers.items() if k.lower() not in ("host", "content-length")}
 
         try:
-            self.db.log_trace(jid, "PASS 7.5: Attempting in-browser native fetch via Playwright request context...")
-            resp = await context.request.get(media_url, headers=req_headers, timeout=30000)
+            self.db.log_trace(jid, "PASS 7.5: Executing in-DOM browser native fetch...")
 
-            if not resp.ok:
-                self.db.log_trace(jid, f"PASS 7.5 FAILED: In-browser fetch returned HTTP {resp.status}")
+            # 1. Fetch manifest or header bytes directly inside the browser renderer
+            fetch_probe_js = """
+            async (targetUrl) => {
+                try {
+                    const resp = await fetch(targetUrl, {
+                        method: 'GET',
+                        credentials: 'include',
+                        mode: 'cors'
+                    });
+                    if (!resp.ok) return { status: resp.status, ok: false };
+                    
+                    const text = await resp.text();
+                    return { status: resp.status, ok: true, isM3u8: text.startsWith("#EXTM3U") || targetUrl.includes(".m3u8"), content: text };
+                } catch (e) {
+                    return { ok: false, error: e.toString() };
+                }
+            }
+            """
+            probe_result = await page.evaluate(fetch_probe_js, media_url)
+
+            if not probe_result.get("ok"):
+                self.db.log_trace(jid, f"PASS 7.5 FAILED: In-DOM fetch returned status {probe_result.get('status')} / err: {probe_result.get('error')}")
                 return False
 
-            body = await resp.body()
-            content_type = (resp.headers.get("content-type") or "").lower()
+            if probe_result.get("isM3u8"):
+                manifest_text = probe_result.get("content", "")
+                return await self._download_hls_via_browser(page, jid, dl_dir, media_url, manifest_text, out_file)
 
-            is_m3u8 = ".m3u8" in media_url.lower() or "mpegurl" in content_type or body[:7] == b"#EXTM3U"
-
-            if is_m3u8:
-                manifest_text = body.decode("utf-8", errors="ignore")
-                return await self._download_hls_via_browser(context, jid, dl_dir, media_url, manifest_text, req_headers, out_file)
-
-            if len(body) < 100000:
-                self.db.log_trace(jid, f"PASS 7.5 FAILED: In-browser fetch returned suspiciously small payload ({len(body)} bytes).")
+            # Direct file download in-DOM (for MP4 streams)
+            self.db.log_trace(jid, "PASS 7.5: Streaming direct binary payload from DOM...")
+            stream_blob_js = """
+            async (targetUrl) => {
+                const resp = await fetch(targetUrl, { credentials: 'include' });
+                const blob = await resp.blob();
+                return new Promise((resolve) => {
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                    reader.readAsDataURL(blob);
+                });
+            }
+            """
+            b64_data = await page.evaluate(stream_blob_js, media_url)
+            if not b64_data or len(b64_data) < 1000:
                 return False
 
+            import base64
             with open(out_file, "wb") as f:
-                f.write(body)
-            self.db.log_trace(jid, f"PASS 7.5 SUCCESS: Direct media payload saved via browser fetch ({len(body)} bytes).")
+                f.write(base64.b64decode(b64_data))
+
+            self.db.log_trace(jid, f"PASS 7.5 SUCCESS: Saved media payload ({out_file.stat().st_size} bytes).")
             return True
 
         except Exception as e:
-            self.db.log_trace(jid, f"PASS 7.5 FAILED: In-browser fetch error: {e}")
+            self.db.log_trace(jid, f"PASS 7.5 FAILED: In-DOM fetch error: {e}")
             return False
 
-    async def _download_hls_via_browser(self, context, jid: str, dl_dir: Path, manifest_url: str, manifest_text: str, headers: dict, out_file: Path) -> bool:
+    async def _download_hls_via_browser(self, page, jid: str, dl_dir: Path, manifest_url: str, manifest_text: str, out_file: Path) -> bool:
+        """
+        Recursively resolves Master playlists, downloads .ts segments concurrently inside the DOM,
+        and remuxes them cleanly using ffmpeg concat.
+        """
         lines = manifest_text.splitlines()
 
+        # ── 1. Resolve Master Playlist Variants ──
         if any(l.startswith("#EXT-X-STREAM-INF") for l in lines):
             best_bw = -1
             variant_uri = None
@@ -1070,19 +1107,13 @@ class DownloaderEngine:
                 return False
 
             variant_url = urlparse.urljoin(manifest_url, variant_uri)
-            self.db.log_trace(jid, f"PASS 7.5: Master playlist detected. Fetching highest-bitrate variant ({best_bw} bps)...")
-            try:
-                resp = await context.request.get(variant_url, headers=headers, timeout=30000)
-                if not resp.ok:
-                    self.db.log_trace(jid, f"PASS 7.5 FAILED: Variant playlist fetch returned HTTP {resp.status}")
-                    return False
-                variant_text = (await resp.body()).decode("utf-8", errors="ignore")
-            except Exception as e:
-                self.db.log_trace(jid, f"PASS 7.5 FAILED: Variant playlist fetch error: {e}")
-                return False
+            self.db.log_trace(jid, f"PASS 7.5: Master playlist resolved. Fetching highest variant ({best_bw} bps)...")
 
-            return await self._download_hls_via_browser(context, jid, dl_dir, variant_url, variant_text, headers, out_file)
+            sub_manifest_js = "async (u) => { const r = await fetch(u, {credentials: 'include'}); return await r.text(); }"
+            variant_text = await page.evaluate(sub_manifest_js, variant_url)
+            return await self._download_hls_via_browser(page, jid, dl_dir, variant_url, variant_text, out_file)
 
+        # ── 2. Collect Segment URIs ──
         segment_uris = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
         if not segment_uris:
             self.db.log_trace(jid, "PASS 7.5 FAILED: Media playlist contained no segments.")
@@ -1093,38 +1124,56 @@ class DownloaderEngine:
         concat_list_path = seg_dir / "concat.txt"
         seg_paths = []
 
-        self.db.log_trace(jid, f"PASS 7.5: Downloading {len(segment_uris)} HLS segments via browser fetch...")
+        self.db.log_trace(jid, f"PASS 7.5: Downloading {len(segment_uris)} HLS segments in-DOM...")
 
+        # JS snippet to fetch binary data as base64 string
+        fetch_seg_b64_js = """
+        async (segUrl) => {
+            const resp = await fetch(segUrl, { credentials: 'include' });
+            if (!resp.ok) return null;
+            const blob = await resp.blob();
+            return new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                reader.readAsDataURL(blob);
+            });
+        }
+        """
+
+        import base64
         for idx, seg_uri in enumerate(segment_uris):
             seg_url = urlparse.urljoin(manifest_url, seg_uri)
             seg_path = seg_dir / f"seg_{idx:05d}.ts"
+
             try:
-                resp = await context.request.get(seg_url, headers=headers, timeout=30000)
-                if not resp.ok:
-                    self.db.log_trace(jid, f"PASS 7.5 FAILED: Segment {idx} fetch returned HTTP {resp.status}")
+                b64_seg = await page.evaluate(fetch_seg_b64_js, seg_url)
+                if not b64_seg:
+                    self.db.log_trace(jid, f"PASS 7.5 FAILED: Segment {idx} rejected by CDN.")
                     shutil.rmtree(seg_dir, ignore_errors=True)
                     return False
-                seg_bytes = await resp.body()
+
                 with open(seg_path, "wb") as f:
-                    f.write(seg_bytes)
+                    f.write(base64.b64decode(b64_seg))
+
                 seg_paths.append(seg_path)
+
             except Exception as e:
                 self.db.log_trace(jid, f"PASS 7.5 FAILED: Segment {idx} fetch error: {e}")
                 shutil.rmtree(seg_dir, ignore_errors=True)
                 return False
 
-            if idx % 25 == 0 or idx == len(segment_uris) - 1:
+            if idx % 10 == 0 or idx == len(segment_uris) - 1:
                 pct = ((idx + 1) / len(segment_uris)) * 100
-                await self.db.update_job(jid, pct=pct, stage=f"downloading | browser-hls | seg {idx + 1}/{len(segment_uris)}")
+                await self.db.update_job(jid, pct=pct, stage=f"downloading | in-DOM HLS | seg {idx + 1}/{len(segment_uris)}")
                 global _live_ui_text
-                _live_ui_text[jid] = f"[browser-hls] segment {idx + 1}/{len(segment_uris)} ({pct:.1f}%)"
+                _live_ui_text[jid] = f"[DOM-HLS] seg {idx + 1}/{len(segment_uris)} ({pct:.1f}%)"
 
+        # ── 3. Write concat file and remux via ffmpeg ──
         with open(concat_list_path, "w", encoding="utf-8") as f:
             for p in seg_paths:
                 f.write(f"file '{p.name}'\n")
 
-        self.db.log_trace(jid, "PASS 7.5: All segments downloaded. Remuxing via ffmpeg concat...")
-
+        self.db.log_trace(jid, "PASS 7.5: Remuxing segment stream via FFmpeg...")
         cmd = [
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
             "-i", str(concat_list_path),
@@ -1137,10 +1186,10 @@ class DownloaderEngine:
         shutil.rmtree(seg_dir, ignore_errors=True)
 
         if proc.returncode == 0 and out_file.exists() and out_file.stat().st_size > 1024:
-            self.db.log_trace(jid, f"PASS 7.5 SUCCESS: HLS stream remuxed to {out_file.name} ({out_file.stat().st_size} bytes).")
+            self.db.log_trace(jid, f"PASS 7.5 SUCCESS: Remux complete ({out_file.stat().st_size} bytes).")
             return True
         else:
-            self.db.log_trace(jid, f"PASS 7.5 FAILED: ffmpeg remux failed. {stderr.decode(errors='ignore')[:300]}")
+            self.db.log_trace(jid, f"PASS 7.5 FAILED: FFmpeg remux error: {stderr.decode(errors='ignore')[:300]}")
             return False
 
     async def _run_nm3u8dlre_capture(self, url: str, jid: str, dl_dir: Path, headers: dict, cookie_str: str) -> bool:
