@@ -1137,48 +1137,37 @@ class DownloaderEngine:
 
         self.db.log_trace(jid, f"PASS 7.5: Downloading {len(segment_uris)} HLS segments in-DOM...")
 
-        # JS snippet: Un-hijacked fetch with CORS fallback and deferred iframe cleanup
+        # JS snippet: No-iframe fetch with CORS fallback
         fetch_seg_b64_js = """
         async (segUrl) => {
-            let iframe = null;
             try {
-                // 1. Recover native fetch
-                let cleanFetch = window.fetch;
-                iframe = document.createElement('iframe');
-                iframe.style.display = 'none';
-                document.body.appendChild(iframe);
-                if (iframe.contentWindow && iframe.contentWindow.fetch) {
-                    cleanFetch = iframe.contentWindow.fetch;
-                }
-
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 45000); 
                 
-                // 2. Fetch using 'omit' to prevent CORS preflight hangs
+                // 1. Fetch using 'omit' to prevent CORS preflight hangs
+                // 2. NO IFRAMES: Avoids the 'frame detached' crash caused by site security scripts
                 let resp;
                 try {
-                    resp = await cleanFetch(segUrl, { 
+                    resp = await fetch(segUrl, { 
                         credentials: 'omit', 
                         signal: controller.signal 
                     });
                 } catch (err) {
-                    // Fallback
-                    resp = await cleanFetch(segUrl, { signal: controller.signal });
+                    // Fallback if 'omit' is rejected
+                    resp = await fetch(segUrl, { signal: controller.signal });
                 }
                 
                 clearTimeout(timeoutId);
                 
                 if (!resp.ok) {
-                    if (iframe && iframe.parentNode) document.body.removeChild(iframe);
                     return { error: `HTTP ${resp.status} ${resp.statusText}` };
                 }
                 
-                // 3. READ THE BODY BEFORE DESTROYING THE IFRAME
+                // 3. Directly stream the payload in the main DOM context
                 const buffer = await resp.arrayBuffer();
                 const bytes = new Uint8Array(buffer);
                 
                 if (bytes.length === 0) {
-                    if (iframe && iframe.parentNode) document.body.removeChild(iframe);
                     return { error: "Received 0 bytes from CDN" };
                 }
                 
@@ -1188,12 +1177,8 @@ class DownloaderEngine:
                     binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
                 }
                 
-                // 4. Safely clean up the iframe now that we have the data
-                if (iframe && iframe.parentNode) document.body.removeChild(iframe);
-                
                 return { b64: btoa(binary) };
             } catch (e) {
-                if (iframe && iframe.parentNode) document.body.removeChild(iframe);
                 return { error: `JS Exception: ${e.message || e.toString()}` };
             }
         }
