@@ -3141,23 +3141,17 @@ class RSSFeeder:
         
         while True:
             history = self._load_history()
-            # If the history file is completely empty, trigger the backfill
             is_first_run = (len(history) == 0)
-            new_items_found = 0
             
             for base_url in self.target_urls:
-                # ── HISTORICAL BACKFILL LOGIC ──
                 if is_first_run:
                     logging.getLogger("stealth_bot").info(f"🕰️ First run detected! Backfilling {base_url} from Page 20 to 1...")
                     urls_to_scan = []
-                    # Generate pages 20 down to 2 using the site's native pagination parameter
                     for p in range(20, 1, -1):
                         separator = "&" if "?" in base_url else "?"
                         urls_to_scan.append(f"{base_url}{separator}from_videos={p}")
-                    # Add Page 1 at the very end
                     urls_to_scan.append(base_url)
                 else:
-                    # Normal polling cycle just checks the main page
                     urls_to_scan = [base_url]
                 
                 for url in urls_to_scan:
@@ -3165,23 +3159,26 @@ class RSSFeeder:
                     entries = await self._fetch_profile(url)
                     
                     if not entries:
-                        # Add a small delay if a page fails or is empty before hitting the next one
                         await asyncio.sleep(2)
                         continue
                         
-                    # Reverse to process oldest items on the current page first
                     for entry in reversed(entries):
                         link = entry['link']
                         title = entry['title']
                         
                         if link not in history:
-                            new_items_found += 1
-                            history.add(link)
+                            
+                            # ── 1. THE SPOON-FEEDER LOCK ──
+                            # Wait here until the mainframe has zero active jobs
+                            while True:
+                                active_jobs = await self.db.get_active_jobs()
+                                if len(active_jobs) == 0:
+                                    break # System is idle, break the loop and inject!
+                                await asyncio.sleep(5) # Check again in 5 seconds
                             
                             jid = str(uuid.uuid4())[:8]
                             playlists = self._parse_vk_playlists(title)
                             
-                            # Generate a UI Tracker in Telegram
                             tracker_text = f"`[ ⚡ ] ＲＳＳ ＴＡＳＫ :` `{title[:30]}...`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (VK)`"
                             try:
                                 tracker = await self.app.send_message(
@@ -3193,7 +3190,6 @@ class RSSFeeder:
                             except Exception:
                                 tracker_id = None
                             
-                            # Inject directly into the database and pipeline
                             await self.db.create_job({
                                 "id": jid, 
                                 "url": link, 
@@ -3210,11 +3206,11 @@ class RSSFeeder:
                             await self.pipeline.dl_q.put(jid)
                             logging.getLogger("stealth_bot").info(f"✨ RSS Injected: {title[:30]} -> Playlists: {playlists}")
                             
-                            # Give the pipeline a 2-second breather between mass injections
-                            await asyncio.sleep(2) 
-            
-            if new_items_found > 0:
-                self._save_history(history)
+                            # ── 2. INSTANT MEMORY SAVE ──
+                            # Save history immediately per-video. If the bot restarts during 
+                            # a long upload, it won't re-process this video.
+                            history.add(link)
+                            self._save_history(history)
             
             # Wait for the next poll cycle
             await asyncio.sleep(self.poll_interval)
