@@ -1787,6 +1787,45 @@ class EncoderEngine:
         except Exception as e:
             self.db.log_trace(jid, f"Validation critical failure during ffprobe execution: {e}")
             return False
+            
+    async def check_vk_compliance(self, file_path: Path, jid: str) -> bool:
+        self.db.log_trace(jid, "Analyzing internal codecs for VK standard compliance...")
+        try:
+            process = await asyncio.create_subprocess_exec(
+                'ffprobe', '-v', 'error',
+                '-show_entries', 'format=format_name:stream=codec_name,codec_type',
+                '-of', 'json',
+                str(file_path),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            stdout, _ = await process.communicate()
+            data = json.loads(stdout.decode())
+            
+            # 1. Check Container Format
+            format_name = data.get('format', {}).get('format_name', '')
+            if 'mp4' not in format_name.lower() and 'mov' not in format_name.lower():
+                return False
+                
+            has_valid_video = False
+            has_valid_audio = False
+            
+            # 2. Check Codecs
+            for stream in data.get('streams', []):
+                ctype = stream.get('codec_type')
+                cname = stream.get('codec_name', '').lower()
+                
+                if ctype == 'video' and cname in ['h264', 'hevc', 'av1', 'vp9']:
+                    has_valid_video = True
+                if ctype == 'audio' and cname in ['aac', 'opus', 'mp3']:
+                    has_valid_audio = True
+                    
+            if has_valid_video and has_valid_audio:
+                return True
+                
+            return False
+        except Exception as e:
+            self.db.log_trace(jid, f"VK Compliance check failed: {e}")
+            return False
 
     async def execute(self, job_data: dict):
         jid = job_data['id']
@@ -1805,9 +1844,24 @@ class EncoderEngine:
         if not is_valid:
             raise RuntimeError("Validation Gate Failed: The downloaded payload is not a valid media file. Discarding payload.")
 
-        self.db.log_trace(jid, "Entering FFmpeg Sandbox...")
+        # ── 1. Always extract a thumbnail ──
+        await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", str(dl_file), "-ss", "00:00:02", "-vframes", "1", str(thumb_file), 
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
 
-        await asyncio.create_subprocess_exec("ffmpeg", "-y", "-i", str(dl_file), "-ss", "00:00:02", "-vframes", "1", str(thumb_file), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # ── 2. Run the Fast-Track Compliance Check ──
+        is_vk_ready = await self.check_vk_compliance(dl_file, jid)
+        
+        if is_vk_ready:
+            self.db.log_trace(jid, "✅ Payload is already VK-compliant (Native MP4/H.264/AAC). Bypassing FFmpeg remux.")
+            
+            # Instantly move the file to the encoded directory to skip processing
+            shutil.move(str(dl_file), str(enc_file))
+            return
+
+        # ── 3. Fallback to FFmpeg Remuxing (Only for non-compliant files) ──
+        self.db.log_trace(jid, "Entering FFmpeg Sandbox to sanitize headers and encode AAC audio...")
 
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y", "-nostdin",
