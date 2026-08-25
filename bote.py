@@ -77,6 +77,8 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 from pyrogram.errors import FloodWait, MessageNotModified
 from logging.handlers import RotatingFileHandler
 import config
+from bs4 import BeautifulSoup
+from curl_cffi.requests import AsyncSession
 
 # ═══════════════════════════════════════════════════════════════════════
 # CHAPTER 1 — GLOBAL CONFIG / CONSTANTS
