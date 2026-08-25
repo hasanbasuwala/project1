@@ -3317,11 +3317,11 @@ class RSSFeeder:
         
         # Wait for all background tasks to run infinitely
         await asyncio.gather(*tasks)
-                    self._save_history(history)
-                    logging.getLogger("stealth_bot").info(f"✅ Historical Backfill locked in for {base_url}")
+        self._save_history(history)
+        logging.getLogger("stealth_bot").info(f"✅ Historical Backfill locked in for {base_url}")
             
             # Wait for the next poll cycle
-            await asyncio.sleep(self.poll_interval)
+        await asyncio.sleep(self.poll_interval)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CHAPTER 16 — BOOTSTRAP
