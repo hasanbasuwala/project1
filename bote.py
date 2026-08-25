@@ -3069,6 +3069,7 @@ async def main():
 
         asyncio.create_task(dispatcher.sender_loop())
         asyncio.create_task(ui_accumulator.run_loop())
+        asyncio.create_task(terminal_loop(db, pipeline)) # <--- ADD THIS LINE BACK
         
         asyncio.create_task(_batch_runner(db, pipeline, app))
         if recovering_batch_jids:
