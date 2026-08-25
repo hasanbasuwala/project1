@@ -128,7 +128,7 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 JOBS_DIR, DONE_DIR = BASE_DIR / "jobs", BASE_DIR / "completed"
 for d in (JOBS_DIR, DONE_DIR): d.mkdir(parents=True, exist_ok=True)
 
-MAX_DL_WORKERS, MAX_RETRIES = 20, 3
+MAX_DL_WORKERS, MAX_RETRIES = 3, 3
 
 # ──────────────────────────── BATCH CONFIGURATION ─────────────────────
 _batch_mode = False
