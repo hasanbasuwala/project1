@@ -3073,16 +3073,14 @@ async def terminal_loop(db: JobScheduler, pipeline: PipelineManager):
 # ═══════════════════════════════════════════════════════════════════════
 
 class RSSFeeder:
-    def __init__(self, db: JobScheduler, pipeline: PipelineManager, app: Client, owner_id: int):
+    def __init__(self, db: JobScheduler, pipeline: PipelineManager, app: Client, owner_id: int, target_urls: list):
         self.db = db
         self.pipeline = pipeline
         self.app = app
         self.owner_id = owner_id
         
-        # Add your target URLs here. You can add as many profiles as you want.
-        self.target_urls = [
-            "https://www.fpo.xxx/members/2442590/"
-        ]
+        # Now it pulls the list directly from what we pass into it
+        self.target_urls = target_urls
         self.history_file = BASE_DIR / "rss_history.txt"
         self.poll_interval = 1800  # Check every 30 minutes (1800 seconds)
 
