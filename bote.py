@@ -3208,6 +3208,9 @@ async def main():
     dispatcher = TelegramDispatcher(app)
 
     ui_accumulator = UIAccumulator(db, dispatcher, pipeline)
+    
+    # ── INITIALIZE RSS FEEDER ──
+    rss_engine = RSSFeeder(db, pipeline, app, OWNER_ID)
 
     setup_router(app, db, pipeline, vk_manager)
 
@@ -3218,6 +3221,11 @@ async def main():
 
         asyncio.create_task(dispatcher.sender_loop())
         asyncio.create_task(ui_accumulator.run_loop())
+        
+        # ── BOOT RSS ENGINE BACKGROUND LOOP ──
+        asyncio.create_task(rss_engine.run_loop())
+        
+        # ... Rest of your code (batch runner, terminal loop, etc.) ...
         asyncio.create_task(terminal_loop(db, pipeline)) # <--- ADD THIS LINE BACK
         
         asyncio.create_task(_batch_runner(db, pipeline, app))
