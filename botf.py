@@ -3201,7 +3201,7 @@ class RSSFeeder:
                 if is_first_run:
                     logging.getLogger("stealth_bot").info(f"🕰️ First run detected! Backfilling {base_url} from Page 20 to 1...")
                     urls_to_scan = []
-                    for p in range(20, 1, -1):
+                    for p in range(40, 1, -1):
                         separator = "&" if "?" in base_url else "?"
                         urls_to_scan.append(f"{base_url}{separator}from_videos={p}")
                     urls_to_scan.append(base_url)
@@ -3247,7 +3247,7 @@ class RSSFeeder:
                             await self.db.create_job({
                                 "id": jid, 
                                 "url": link, 
-                                "title": title[:30], 
+                                "title": title[:128], 
                                 "source": "RSS", 
                                 "quality": "auto",
                                 "strategy": LinkClassifier.classify(link), 
