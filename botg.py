@@ -3256,14 +3256,14 @@ class RSSFeeder:
                         
                         if link not in current_history:
                             
-                            # ── THE PER-URL LOCK ──
+                            # ── THE PER-URL LOCK (FIXED) ──
                             while True:
                                 active_jobs = await self.db.get_active_jobs()
-                                # Count only the jobs originating from THIS specific base_url
-                                my_jobs = [j for j in active_jobs if j.get('feed_source') == base_url]
+                                # Look specifically at the guaranteed 'source' column
+                                my_jobs = [j for j in active_jobs if j.get('source') == base_url]
                                 
                                 if len(my_jobs) == 0:
-                                    break # My lane is clear! Inject!
+                                    break # Lane is officially clear!
                                 await asyncio.sleep(5)
                             
                             jid = str(uuid.uuid4())[:8]
@@ -3284,8 +3284,7 @@ class RSSFeeder:
                                 "id": jid, 
                                 "url": link, 
                                 "title": title[:128], 
-                                "source": "RSS", 
-                                "feed_source": base_url, # Marks which lane this job belongs to
+                                "source": base_url, # <--- FIX: We store the lane ID here now
                                 "quality": "auto",
                                 "strategy": "GENERIC_FALLBACK",
                                 "chat_id": self.owner_id, 
