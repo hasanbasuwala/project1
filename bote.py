@@ -97,7 +97,7 @@ logging.basicConfig(
     ]
 )
 log = logging.getLogger("stealth_bot")
-logging.getLogger("pyrogram").setLevel(logging.ERROR)
+logging.getLogger().handlers[1].setLevel(logging.CRITICAL)
 
 API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID = config.API_ID, config.API_HASH, config.BOT_TOKEN, config.CHANNEL_ID
 OWNER_ID = int(config.OWNER_ID) if hasattr(config, "OWNER_ID") else 0
