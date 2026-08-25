@@ -3125,18 +3125,24 @@ async def terminal_loop(db: JobScheduler, pipeline: PipelineManager):
 # ═══════════════════════════════════════════════════════════════════════
 # CHAPTER 15.5 — AUTONOMOUS RSS ENGINE
 # ═══════════════════════════════════════════════════════════════════════
+from bs4 import BeautifulSoup
+from curl_cffi.requests import AsyncSession
+import re
+import uuid
+import asyncio
+import logging
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 class RSSFeeder:
-    def __init__(self, db: JobScheduler, pipeline: PipelineManager, app: Client, owner_id: int, target_urls: list):
+    def __init__(self, db, pipeline, app, owner_id: int, target_urls: list):
         self.db = db
         self.pipeline = pipeline
         self.app = app
         self.owner_id = owner_id
-        
-        # Now it pulls the list directly from what we pass into it
         self.target_urls = target_urls
         self.history_file = BASE_DIR / "rss_history.txt"
-        self.poll_interval = 1800  # Check every 30 minutes (1800 seconds)
+        self.poll_interval = 1800  
+        self.history_lock = asyncio.Lock() # Prevents file corruption when multiple URLs write at once
 
     def _load_history(self) -> set:
         if not self.history_file.exists():
@@ -3147,30 +3153,31 @@ class RSSFeeder:
     def _save_history(self, history_set: set):
         with open(self.history_file, "w", encoding="utf-8") as f:
             f.write("\n".join(history_set))
-
-    def _parse_vk_playlists(self, full_title: str) -> str:
-        """
-        Extracts actor names before the hyphen, splits by '&' or ',', 
-        and removes spaces to generate VK playlist tags.
-        Example: "Naomi Foxxx & Lola Valentine - Video" -> "NaomiFoxxx,LolaValentine"
-        """
-        if "-" not in full_title:
-            return "AutoRSS" # Fallback if no hyphen is present
             
-        names_part = full_title.split("-", 1)[0].strip()
-        
-        # Split by '&', 'and', or commas
-        raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', names_part, flags=re.IGNORECASE)
-        
-        # Strip spaces from each name and filter out empty strings
-        clean_names = [name.replace(" ", "") for name in raw_names if name.strip()]
-        
-        if not clean_names:
-            return "AutoRSS"
-            
-        return ",".join(clean_names)
+    async def _sync_history(self, item_to_add: str = None) -> set:
+        """Thread-safe function to read/write memory across concurrent URL tasks."""
+        async with self.history_lock:
+            history = self._load_history()
+            if item_to_add and item_to_add not in history:
+                history.add(item_to_add)
+                self._save_history(history)
+            return history
 
-    async def _fetch_profile(self, url: str) -> list:
+    def _parse_vk_playlists(self, title: str, models: list) -> str:
+        if models:
+            clean_names = [name.replace(" ", "") for name in models if name.strip()]
+            return ",".join(clean_names)
+            
+        if "-" in title:
+            names_part = title.split("-", 1)[0].strip()
+            raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', names_part, flags=re.IGNORECASE)
+            clean_names = [name.replace(" ", "") for name in raw_names if name.strip()]
+            if clean_names:
+                return ",".join(clean_names)
+                
+        return "AutoRSS"
+
+    async def _fetch_profile(self, url: str, domain: str) -> list:
         try:
             async with AsyncSession(impersonate="chrome") as session:
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -3179,42 +3186,61 @@ class RSSFeeder:
                 
                 soup = BeautifulSoup(resp.text, "html.parser")
                 entries = []
-                for a_tag in soup.select("#list_videos_uploaded_videos_items .item > a"):
-                    title = a_tag.get("title", "").strip()
-                    link = a_tag.get("href", "").strip()
-                    if title and link:
-                        entries.append({"title": title, "link": link})
+                
+                if domain == "freepornvideos":
+                    for item in soup.select("#list_videos_latest_videos_list_items .item"):
+                        a_tag = item.select_one("a.thumb_title")
+                        if not a_tag: continue
+                        
+                        title = a_tag.get("title", "").strip()
+                        link = a_tag.get("href", "").strip()
+                        models = [tag.text.strip() for tag in item.select(".models .thumb_model span")]
+                        
+                        if title and link:
+                            entries.append({"title": title, "link": link, "models": models})
+                            
+                elif domain == "fpo":
+                    for item in soup.select("#list_videos_uploaded_videos_items .item"):
+                        a_tag = item.select_one("a")
+                        if not a_tag: continue
+                        
+                        title = a_tag.get("title", "").strip()
+                        link = a_tag.get("href", "").strip()
+                        models = [] 
+                        
+                        if title and link:
+                            entries.append({"title": title, "link": link, "models": models})
+                            
                 return entries
         except Exception as e:
             logging.getLogger("stealth_bot").error(f"RSS Fetch Error for {url}: {e}")
             return []
 
-    async def run_loop(self):
-        logging.getLogger("stealth_bot").info("🛰️ Autonomous RSS Engine initialized.")
-        await asyncio.sleep(10) # Let the mainframe boot up fully first
-        
+    async def _monitor_feed(self, base_url: str):
+        """Dedicated background loop for a single URL lane."""
+        if "freepornvideos.xxx" in base_url:
+            domain = "freepornvideos"
+            page_builder = lambda b, p: f"{b.rstrip('/')}/{p}/"
+        else: 
+            domain = "fpo"
+            page_builder = lambda b, p: f"{b}{'&' if '?' in b else '?'}from_videos={p}"
+
         while True:
-            history = self._load_history()
-            
-            for base_url in self.target_urls:
-                # ── CRASH-PROOF BACKFILL CHECK ──
-                # Check for a specific marker rather than an empty file
+            try:
+                history = await self._sync_history()
                 marker = f"__BACKFILL_DONE__{base_url}"
                 needs_backfill = (marker not in history)
                 
                 if needs_backfill:
                     logging.getLogger("stealth_bot").info(f"🕰️ Backfill required for {base_url}. Scanning Pages 20 to 1...")
-                    urls_to_scan = []
-                    for p in range(40, 1, -1):
-                        separator = "&" if "?" in base_url else "?"
-                        urls_to_scan.append(f"{base_url}{separator}from_videos={p}")
+                    urls_to_scan = [page_builder(base_url, p) for p in range(40, 1, -1)]
                     urls_to_scan.append(base_url)
                 else:
                     urls_to_scan = [base_url]
                 
                 for url in urls_to_scan:
                     logging.getLogger("stealth_bot").info(f"📡 Scanning RSS target: {url}")
-                    entries = await self._fetch_profile(url)
+                    entries = await self._fetch_profile(url, domain)
                     
                     if not entries:
                         await asyncio.sleep(2)
@@ -3223,18 +3249,25 @@ class RSSFeeder:
                     for entry in reversed(entries):
                         link = entry['link']
                         title = entry['title']
+                        models = entry['models']
                         
-                        if link not in history:
+                        # Reload history instantly inside the loop to avoid double-queuing
+                        current_history = await self._sync_history()
+                        
+                        if link not in current_history:
                             
-                            # ── 1. THE SPOON-FEEDER LOCK ──
+                            # ── THE PER-URL LOCK ──
                             while True:
                                 active_jobs = await self.db.get_active_jobs()
-                                if len(active_jobs) == 0:
-                                    break
+                                # Count only the jobs originating from THIS specific base_url
+                                my_jobs = [j for j in active_jobs if j.get('feed_source') == base_url]
+                                
+                                if len(my_jobs) == 0:
+                                    break # My lane is clear! Inject!
                                 await asyncio.sleep(5)
                             
                             jid = str(uuid.uuid4())[:8]
-                            playlists = self._parse_vk_playlists(title)
+                            playlists = self._parse_vk_playlists(title, models)
                             
                             tracker_text = f"`[ ⚡ ] ＲＳＳ ＴＡＳＫ :` `{title[:30]}...`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (VK)`"
                             try:
@@ -3252,8 +3285,9 @@ class RSSFeeder:
                                 "url": link, 
                                 "title": title[:128], 
                                 "source": "RSS", 
+                                "feed_source": base_url, # Marks which lane this job belongs to
                                 "quality": "auto",
-                                "strategy": LinkClassifier.classify(link), 
+                                "strategy": "GENERIC_FALLBACK",
                                 "chat_id": self.owner_id, 
                                 "tracker_id": tracker_id,
                                 "destination": "vk", 
@@ -3261,16 +3295,28 @@ class RSSFeeder:
                                 "caption": title
                             })
                             await self.pipeline.dl_q.put(jid)
-                            logging.getLogger("stealth_bot").info(f"✨ RSS Injected: {title[:30]} -> Playlists: {playlists}")
+                            logging.getLogger("stealth_bot").info(f"✨ RSS Injected [{domain}]: {title[:30]}")
                             
-                            # ── 2. INSTANT MEMORY SAVE ──
-                            history.add(link)
-                            self._save_history(history)
+                            await self._sync_history(link)
                 
-                # ── 3. LOCK IN BACKFILL COMPLETION ──
-                # Once it successfully scans all pages down to 1 without crashing, place the marker.
                 if needs_backfill:
-                    history.add(marker)
+                    await self._sync_history(marker)
+                    logging.getLogger("stealth_bot").info(f"✅ Historical Backfill locked in for {base_url}")
+                    
+            except Exception as e:
+                logging.getLogger("stealth_bot").error(f"Error in {base_url} lane: {e}")
+                
+            await asyncio.sleep(self.poll_interval)
+
+    async def run_loop(self):
+        logging.getLogger("stealth_bot").info("🛰️ Autonomous RSS Engine initialized (Multi-Track).")
+        await asyncio.sleep(10) 
+        
+        # Launch an independent background task for EVERY URL in config.py
+        tasks = [asyncio.create_task(self._monitor_feed(url)) for url in self.target_urls]
+        
+        # Wait for all background tasks to run infinitely
+        await asyncio.gather(*tasks)                    history.add(marker)
                     self._save_history(history)
                     logging.getLogger("stealth_bot").info(f"✅ Historical Backfill locked in for {base_url}")
             
