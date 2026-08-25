@@ -3140,54 +3140,77 @@ class RSSFeeder:
         
         while True:
             history = self._load_history()
+            # If the history file is completely empty, trigger the backfill
+            is_first_run = (len(history) == 0)
             new_items_found = 0
             
-            for url in self.target_urls:
-                entries = await self._fetch_profile(url)
+            for base_url in self.target_urls:
+                # ── HISTORICAL BACKFILL LOGIC ──
+                if is_first_run:
+                    logging.getLogger("stealth_bot").info(f"🕰️ First run detected! Backfilling {base_url} from Page 20 to 1...")
+                    urls_to_scan = []
+                    # Generate pages 20 down to 2 using the site's native pagination parameter
+                    for p in range(20, 1, -1):
+                        separator = "&" if "?" in base_url else "?"
+                        urls_to_scan.append(f"{base_url}{separator}from_videos={p}")
+                    # Add Page 1 at the very end
+                    urls_to_scan.append(base_url)
+                else:
+                    # Normal polling cycle just checks the main page
+                    urls_to_scan = [base_url]
                 
-                # Reverse to process oldest items first
-                for entry in reversed(entries):
-                    link = entry['link']
-                    title = entry['title']
+                for url in urls_to_scan:
+                    logging.getLogger("stealth_bot").info(f"📡 Scanning RSS target: {url}")
+                    entries = await self._fetch_profile(url)
                     
-                    if link not in history:
-                        new_items_found += 1
-                        history.add(link)
+                    if not entries:
+                        # Add a small delay if a page fails or is empty before hitting the next one
+                        await asyncio.sleep(2)
+                        continue
                         
-                        jid = str(uuid.uuid4())[:8]
-                        playlists = self._parse_vk_playlists(title)
+                    # Reverse to process oldest items on the current page first
+                    for entry in reversed(entries):
+                        link = entry['link']
+                        title = entry['title']
                         
-                        # Generate a UI Tracker in Telegram
-                        tracker_text = f"`[ ⚡ ] ＲＳＳ ＴＡＳＫ :` `{title[:30]}...`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (VK)`"
-                        try:
-                            tracker = await self.app.send_message(
-                                self.owner_id,
-                                tracker_text,
-                                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
-                            )
-                            tracker_id = tracker.id
-                        except Exception:
-                            tracker_id = None
-                        
-                        # Inject directly into the database and pipeline
-                        await self.db.create_job({
-                            "id": jid, 
-                            "url": link, 
-                            "title": title[:30], # Short title for the dashboard 
-                            "source": "RSS", 
-                            "quality": "auto",
-                            "strategy": LinkClassifier.classify(link), 
-                            "chat_id": self.owner_id, 
-                            "tracker_id": tracker_id,
-                            "destination": "vk", 
-                            "playlist_name": playlists, # e.g. "JennaStarr" or "NaomiFoxxx,LolaValentine"
-                            "caption": title # Full original title as caption
-                        })
-                        await self.pipeline.dl_q.put(jid)
-                        logging.getLogger("stealth_bot").info(f"✨ RSS Injected: {title[:30]} -> Playlists: {playlists}")
-                        
-                        # Short delay between injecting jobs to prevent database locks
-                        await asyncio.sleep(2) 
+                        if link not in history:
+                            new_items_found += 1
+                            history.add(link)
+                            
+                            jid = str(uuid.uuid4())[:8]
+                            playlists = self._parse_vk_playlists(title)
+                            
+                            # Generate a UI Tracker in Telegram
+                            tracker_text = f"`[ ⚡ ] ＲＳＳ ＴＡＳＫ :` `{title[:30]}...`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (VK)`"
+                            try:
+                                tracker = await self.app.send_message(
+                                    self.owner_id,
+                                    tracker_text,
+                                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
+                                )
+                                tracker_id = tracker.id
+                            except Exception:
+                                tracker_id = None
+                            
+                            # Inject directly into the database and pipeline
+                            await self.db.create_job({
+                                "id": jid, 
+                                "url": link, 
+                                "title": title[:30], 
+                                "source": "RSS", 
+                                "quality": "auto",
+                                "strategy": LinkClassifier.classify(link), 
+                                "chat_id": self.owner_id, 
+                                "tracker_id": tracker_id,
+                                "destination": "vk", 
+                                "playlist_name": playlists,
+                                "caption": title
+                            })
+                            await self.pipeline.dl_q.put(jid)
+                            logging.getLogger("stealth_bot").info(f"✨ RSS Injected: {title[:30]} -> Playlists: {playlists}")
+                            
+                            # Give the pipeline a 2-second breather between mass injections
+                            await asyncio.sleep(2) 
             
             if new_items_found > 0:
                 self._save_history(history)
