@@ -3142,7 +3142,8 @@ class RSSFeeder:
         self.target_urls = target_urls
         self.history_file = BASE_DIR / "rss_history.txt"
         self.poll_interval = 1800  
-        self.history_lock = asyncio.Lock() # Prevents file corruption when multiple URLs write at once
+        # This single traffic light guarantees only one lane can inject at a time
+        self.global_feed_lock = asyncio.Lock() 
 
     def _load_history(self) -> set:
         if not self.history_file.exists():
@@ -3153,15 +3154,6 @@ class RSSFeeder:
     def _save_history(self, history_set: set):
         with open(self.history_file, "w", encoding="utf-8") as f:
             f.write("\n".join(history_set))
-            
-    async def _sync_history(self, item_to_add: str = None) -> set:
-        """Thread-safe function to read/write memory across concurrent URL tasks."""
-        async with self.history_lock:
-            history = self._load_history()
-            if item_to_add and item_to_add not in history:
-                history.add(item_to_add)
-                self._save_history(history)
-            return history
 
     def _parse_vk_playlists(self, title: str, models: list) -> str:
         if models:
@@ -3217,7 +3209,6 @@ class RSSFeeder:
             return []
 
     async def _monitor_feed(self, base_url: str):
-        """Dedicated background loop for a single URL lane."""
         if "freepornvideos.xxx" in base_url:
             domain = "freepornvideos"
             page_builder = lambda b, p: f"{b.rstrip('/')}/{p}/"
@@ -3227,13 +3218,13 @@ class RSSFeeder:
 
         while True:
             try:
-                history = await self._sync_history()
+                history = self._load_history()
                 marker = f"__BACKFILL_DONE__{base_url}"
                 needs_backfill = (marker not in history)
                 
                 if needs_backfill:
                     logging.getLogger("stealth_bot").info(f"🕰️ Backfill required for {base_url}. Scanning Pages 20 to 1...")
-                    urls_to_scan = [page_builder(base_url, p) for p in range(40, 1, -1)]
+                    urls_to_scan = [page_builder(base_url, p) for p in range(20, 1, -1)]
                     urls_to_scan.append(base_url)
                 else:
                     urls_to_scan = [base_url]
@@ -3251,55 +3242,70 @@ class RSSFeeder:
                         title = entry['title']
                         models = entry['models']
                         
-                        # Reload history instantly inside the loop to avoid double-queuing
-                        current_history = await self._sync_history()
-                        
-                        if link not in current_history:
+                        # Only proceed if we haven't seen this link
+                        if link not in self._load_history():
                             
-                            # ── THE PER-URL LOCK (FIXED) ──
-                            while True:
-                                active_jobs = await self.db.get_active_jobs()
-                                # Look specifically at the guaranteed 'source' column
-                                my_jobs = [j for j in active_jobs if j.get('source') == base_url]
+                            # ── STRICT GLOBAL TRAFFIC LIGHT ──
+                            async with self.global_feed_lock:
                                 
-                                if len(my_jobs) == 0:
-                                    break # Lane is officially clear!
-                                await asyncio.sleep(5)
-                            
-                            jid = str(uuid.uuid4())[:8]
-                            playlists = self._parse_vk_playlists(title, models)
-                            
-                            tracker_text = f"`[ ⚡ ] ＲＳＳ ＴＡＳＫ :` `{title[:30]}...`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (VK)`"
-                            try:
-                                tracker = await self.app.send_message(
-                                    self.owner_id,
-                                    tracker_text,
-                                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
-                                )
-                                tracker_id = tracker.id
-                            except Exception:
-                                tracker_id = None
-                            
-                            await self.db.create_job({
-                                "id": jid, 
-                                "url": link, 
-                                "title": title[:128], 
-                                "source": base_url, # <--- FIX: We store the lane ID here now
-                                "quality": "auto",
-                                "strategy": "GENERIC_FALLBACK",
-                                "chat_id": self.owner_id, 
-                                "tracker_id": tracker_id,
-                                "destination": "vk", 
-                                "playlist_name": playlists,
-                                "caption": title
-                            })
-                            await self.pipeline.dl_q.put(jid)
-                            logging.getLogger("stealth_bot").info(f"✨ RSS Injected [{domain}]: {title[:30]}")
-                            
-                            await self._sync_history(link)
+                                # 1. Wait until the entire mainframe is 100% idle
+                                while True:
+                                    active_jobs = await self.db.get_active_jobs()
+                                    if len(active_jobs) == 0:
+                                        break 
+                                    await asyncio.sleep(5)
+                                
+                                # 2. Double-check memory just in case another lane added it
+                                history = self._load_history()
+                                if link in history:
+                                    continue
+                                
+                                # 3. Inject the task safely
+                                jid = str(uuid.uuid4())[:8]
+                                playlists = self._parse_vk_playlists(title, models)
+                                
+                                tracker_text = f"`[ ⚡ ] ＲＳＳ ＴＡＳＫ :` `{title[:30]}...`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (VK)`"
+                                try:
+                                    tracker = await self.app.send_message(
+                                        self.owner_id,
+                                        tracker_text,
+                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
+                                    )
+                                    tracker_id = tracker.id
+                                except Exception:
+                                    tracker_id = None
+                                
+                                await self.db.create_job({
+                                    "id": jid, 
+                                    "url": link, 
+                                    "title": title[:128], 
+                                    "source": base_url, 
+                                    "quality": "auto",
+                                    "strategy": "GENERIC_FALLBACK",
+                                    "chat_id": self.owner_id, 
+                                    "tracker_id": tracker_id,
+                                    "destination": "vk", 
+                                    "playlist_name": playlists,
+                                    "caption": title
+                                })
+                                await self.pipeline.dl_q.put(jid)
+                                logging.getLogger("stealth_bot").info(f"✨ RSS Injected [{domain}]: {title[:30]}")
+                                
+                                # 4. Save history immediately while we still hold the lock
+                                history.add(link)
+                                self._save_history(history)
+                                
+                            # ── THE YIELD ──
+                            # We force this lane to pause for 10 seconds before continuing its loop.
+                            # This guarantees the OTHER lane gets a chance to grab the lock next.
+                            await asyncio.sleep(10)
                 
                 if needs_backfill:
-                    await self._sync_history(marker)
+                    # Acquire lock to write the completion marker safely
+                    async with self.global_feed_lock:
+                        history = self._load_history()
+                        history.add(marker)
+                        self._save_history(history)
                     logging.getLogger("stealth_bot").info(f"✅ Historical Backfill locked in for {base_url}")
                     
             except Exception as e:
@@ -3308,19 +3314,12 @@ class RSSFeeder:
             await asyncio.sleep(self.poll_interval)
 
     async def run_loop(self):
-        logging.getLogger("stealth_bot").info("🛰️ Autonomous RSS Engine initialized (Multi-Track).")
+        logging.getLogger("stealth_bot").info("🛰️ Autonomous RSS Engine initialized (Round-Robin Multi-Track).")
         await asyncio.sleep(10) 
         
-        # Launch an independent background task for EVERY URL in config.py
+        # Launch independent tasks for every URL
         tasks = [asyncio.create_task(self._monitor_feed(url)) for url in self.target_urls]
-        
-        # Wait for all background tasks to run infinitely
         await asyncio.gather(*tasks)
-        self._save_history(history)
-        logging.getLogger("stealth_bot").info(f"✅ Historical Backfill locked in for {base_url}")
-            
-            # Wait for the next poll cycle
-        await asyncio.sleep(self.poll_interval)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CHAPTER 16 — BOOTSTRAP
