@@ -3234,7 +3234,8 @@ async def main():
     ui_accumulator = UIAccumulator(db, dispatcher, pipeline)
     
     # ── INITIALIZE RSS FEEDER ──
-    rss_engine = RSSFeeder(db, pipeline, app, OWNER_ID)
+    # ── INITIALIZE RSS FEEDER ──
+    rss_engine = RSSFeeder(db, pipeline, app, OWNER_ID, RSS_TARGET_URLS)
 
     setup_router(app, db, pipeline, vk_manager)
 
