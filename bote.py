@@ -3066,6 +3066,136 @@ async def terminal_loop(db: JobScheduler, pipeline: PipelineManager):
         sys.stdout.flush()
 
 # ═══════════════════════════════════════════════════════════════════════
+# CHAPTER 15.5 — AUTONOMOUS RSS ENGINE
+# ═══════════════════════════════════════════════════════════════════════
+
+class RSSFeeder:
+    def __init__(self, db: JobScheduler, pipeline: PipelineManager, app: Client, owner_id: int):
+        self.db = db
+        self.pipeline = pipeline
+        self.app = app
+        self.owner_id = owner_id
+        
+        # Add your target URLs here. You can add as many profiles as you want.
+        self.target_urls = [
+            "https://www.fpo.xxx/members/2442590/"
+        ]
+        self.history_file = BASE_DIR / "rss_history.txt"
+        self.poll_interval = 1800  # Check every 30 minutes (1800 seconds)
+
+    def _load_history(self) -> set:
+        if not self.history_file.exists():
+            return set()
+        with open(self.history_file, "r", encoding="utf-8") as f:
+            return set(f.read().splitlines())
+
+    def _save_history(self, history_set: set):
+        with open(self.history_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(history_set))
+
+    def _parse_vk_playlists(self, full_title: str) -> str:
+        """
+        Extracts actor names before the hyphen, splits by '&' or ',', 
+        and removes spaces to generate VK playlist tags.
+        Example: "Naomi Foxxx & Lola Valentine - Video" -> "NaomiFoxxx,LolaValentine"
+        """
+        if "-" not in full_title:
+            return "AutoRSS" # Fallback if no hyphen is present
+            
+        names_part = full_title.split("-", 1)[0].strip()
+        
+        # Split by '&', 'and', or commas
+        raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', names_part, flags=re.IGNORECASE)
+        
+        # Strip spaces from each name and filter out empty strings
+        clean_names = [name.replace(" ", "") for name in raw_names if name.strip()]
+        
+        if not clean_names:
+            return "AutoRSS"
+            
+        return ",".join(clean_names)
+
+    async def _fetch_profile(self, url: str) -> list:
+        try:
+            async with AsyncSession(impersonate="chrome") as session:
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+                resp = await session.get(url, headers=headers, timeout=30)
+                if resp.status_code != 200: return []
+                
+                soup = BeautifulSoup(resp.text, "html.parser")
+                entries = []
+                for a_tag in soup.select("#list_videos_uploaded_videos_items .item > a"):
+                    title = a_tag.get("title", "").strip()
+                    link = a_tag.get("href", "").strip()
+                    if title and link:
+                        entries.append({"title": title, "link": link})
+                return entries
+        except Exception as e:
+            logging.getLogger("stealth_bot").error(f"RSS Fetch Error for {url}: {e}")
+            return []
+
+    async def run_loop(self):
+        logging.getLogger("stealth_bot").info("🛰️ Autonomous RSS Engine initialized.")
+        await asyncio.sleep(10) # Let the mainframe boot up fully first
+        
+        while True:
+            history = self._load_history()
+            new_items_found = 0
+            
+            for url in self.target_urls:
+                entries = await self._fetch_profile(url)
+                
+                # Reverse to process oldest items first
+                for entry in reversed(entries):
+                    link = entry['link']
+                    title = entry['title']
+                    
+                    if link not in history:
+                        new_items_found += 1
+                        history.add(link)
+                        
+                        jid = str(uuid.uuid4())[:8]
+                        playlists = self._parse_vk_playlists(title)
+                        
+                        # Generate a UI Tracker in Telegram
+                        tracker_text = f"`[ ⚡ ] ＲＳＳ ＴＡＳＫ :` `{title[:30]}...`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (VK)`"
+                        try:
+                            tracker = await self.app.send_message(
+                                self.owner_id,
+                                tracker_text,
+                                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
+                            )
+                            tracker_id = tracker.id
+                        except Exception:
+                            tracker_id = None
+                        
+                        # Inject directly into the database and pipeline
+                        await self.db.create_job({
+                            "id": jid, 
+                            "url": link, 
+                            "title": title[:30], # Short title for the dashboard 
+                            "source": "RSS", 
+                            "quality": "auto",
+                            "strategy": LinkClassifier.classify(link), 
+                            "chat_id": self.owner_id, 
+                            "tracker_id": tracker_id,
+                            "destination": "vk", 
+                            "playlist_name": playlists, # e.g. "JennaStarr" or "NaomiFoxxx,LolaValentine"
+                            "caption": title # Full original title as caption
+                        })
+                        await self.pipeline.dl_q.put(jid)
+                        logging.getLogger("stealth_bot").info(f"✨ RSS Injected: {title[:30]} -> Playlists: {playlists}")
+                        
+                        # Short delay between injecting jobs to prevent database locks
+                        await asyncio.sleep(2) 
+            
+            if new_items_found > 0:
+                self._save_history(history)
+            
+            # Wait for the next poll cycle
+            await asyncio.sleep(self.poll_interval)
+
+# ═══════════════════════════════════════════════════════════════════════
 # CHAPTER 16 — BOOTSTRAP
 # ═══════════════════════════════════════════════════════════════════════
 
