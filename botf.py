@@ -3195,11 +3195,15 @@ class RSSFeeder:
         
         while True:
             history = self._load_history()
-            is_first_run = (len(history) == 0)
             
             for base_url in self.target_urls:
-                if is_first_run:
-                    logging.getLogger("stealth_bot").info(f"🕰️ First run detected! Backfilling {base_url} from Page 20 to 1...")
+                # ── CRASH-PROOF BACKFILL CHECK ──
+                # Check for a specific marker rather than an empty file
+                marker = f"__BACKFILL_DONE__{base_url}"
+                needs_backfill = (marker not in history)
+                
+                if needs_backfill:
+                    logging.getLogger("stealth_bot").info(f"🕰️ Backfill required for {base_url}. Scanning Pages 20 to 1...")
                     urls_to_scan = []
                     for p in range(40, 1, -1):
                         separator = "&" if "?" in base_url else "?"
@@ -3223,12 +3227,11 @@ class RSSFeeder:
                         if link not in history:
                             
                             # ── 1. THE SPOON-FEEDER LOCK ──
-                            # Wait here until the mainframe has zero active jobs
                             while True:
                                 active_jobs = await self.db.get_active_jobs()
                                 if len(active_jobs) == 0:
-                                    break # System is idle, break the loop and inject!
-                                await asyncio.sleep(5) # Check again in 5 seconds
+                                    break
+                                await asyncio.sleep(5)
                             
                             jid = str(uuid.uuid4())[:8]
                             playlists = self._parse_vk_playlists(title)
@@ -3261,10 +3264,15 @@ class RSSFeeder:
                             logging.getLogger("stealth_bot").info(f"✨ RSS Injected: {title[:30]} -> Playlists: {playlists}")
                             
                             # ── 2. INSTANT MEMORY SAVE ──
-                            # Save history immediately per-video. If the bot restarts during 
-                            # a long upload, it won't re-process this video.
                             history.add(link)
                             self._save_history(history)
+                
+                # ── 3. LOCK IN BACKFILL COMPLETION ──
+                # Once it successfully scans all pages down to 1 without crashing, place the marker.
+                if needs_backfill:
+                    history.add(marker)
+                    self._save_history(history)
+                    logging.getLogger("stealth_bot").info(f"✅ Historical Backfill locked in for {base_url}")
             
             # Wait for the next poll cycle
             await asyncio.sleep(self.poll_interval)
