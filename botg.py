@@ -3316,7 +3316,7 @@ class RSSFeeder:
         tasks = [asyncio.create_task(self._monitor_feed(url)) for url in self.target_urls]
         
         # Wait for all background tasks to run infinitely
-        await asyncio.gather(*tasks)                    history.add(marker)
+        await asyncio.gather(*tasks)
                     self._save_history(history)
                     logging.getLogger("stealth_bot").info(f"✅ Historical Backfill locked in for {base_url}")
             
