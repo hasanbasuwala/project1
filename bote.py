@@ -1113,7 +1113,7 @@ class DownloaderEngine:
                         "--auto-subtitle-fix", "True"
                     ]
                     
-                    # Increase buffer limit to 5MB to prevent the StreamReader from crashing on heavy ANSI output
+                    # Increase buffer limit to 5MB to prevent the StreamReader from crashing
                     proc = await asyncio.create_subprocess_exec(
                         *cmd, 
                         stdout=asyncio.subprocess.PIPE, 
@@ -1121,10 +1121,27 @@ class DownloaderEngine:
                         limit=1024 * 1024 * 5
                     )
                     
-                    # Read the output so it doesn't block the pipe
-                    while True:
-                        line = await proc.stdout.readline()
-                        if not line: break
+                    # ── NEW PROGRESS PARSER FOR THE UI ──
+                    try:
+                        while True:
+                            line = await proc.stdout.readline()
+                            if not line: break
+                            
+                            line_str = line.decode('utf-8', errors='ignore').strip()
+                            clean_str = re.sub(r"\x1b[^m]*m", "", line_str)
+                            
+                            if "%" in clean_str or "Mbps" in clean_str:
+                                global _live_ui_text
+                                _live_ui_text[jid] = f"[N_m3u8DL-RE] {clean_str[:50]}"
+                                
+                                m_pct = re.search(r"(\d{1,3}\.\d{1,2})%", clean_str)
+                                if m_pct:
+                                    try:
+                                        val = float(m_pct.group(1))
+                                        asyncio.create_task(self.db.update_job(jid, pct=val, stage="downloading | proxy"))
+                                    except Exception: pass
+                    except Exception as e:
+                        self.db.log_trace(jid, f"Output Reader Warning: {e}")
                     
                     await proc.wait()
                     await proxy.stop()
