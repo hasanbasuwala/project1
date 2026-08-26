@@ -3337,7 +3337,7 @@ class RSSFeeder:
                 
                 if needs_backfill:
                     logging.getLogger("stealth_bot").info(f"🕰️ Backfill required for {base_url}. Scanning Pages 20 to 1...")
-                    urls_to_scan = [page_builder(base_url, p) for p in range(20, 1, -1)]
+                    urls_to_scan = [page_builder(base_url, p) for p in range(2, 1, -1)]
                     urls_to_scan.append(base_url)
                 else:
                     urls_to_scan = [base_url]
