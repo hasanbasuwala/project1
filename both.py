@@ -3131,6 +3131,7 @@ import re
 import uuid
 import asyncio
 import logging
+import json
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 class RSSFeeder:
@@ -3141,9 +3142,30 @@ class RSSFeeder:
         self.owner_id = owner_id
         self.target_urls = target_urls
         self.history_file = BASE_DIR / "rss_history.txt"
+        self.state_file = BASE_DIR / "rss_state.json" 
         self.poll_interval = 1800  
-        # This single traffic light guarantees only one lane can inject at a time
         self.global_feed_lock = asyncio.Lock() 
+        
+        self._init_state()
+
+    def _init_state(self):
+        state = self._get_state()
+        changed = False
+        for url in self.target_urls:
+            if url not in state:
+                state[url] = False 
+                changed = True
+        if changed:
+            with open(self.state_file, "w") as f:
+                json.dump(state, f, indent=4)
+
+    def _get_state(self) -> dict:
+        if not self.state_file.exists(): return {}
+        try:
+            with open(self.state_file, "r") as f:
+                return json.load(f)
+        except Exception: 
+            return {}
 
     def _load_history(self) -> set:
         if not self.history_file.exists():
@@ -3160,14 +3182,42 @@ class RSSFeeder:
             clean_names = [name.replace(" ", "") for name in models if name.strip()]
             return ",".join(clean_names)
             
-        if "-" in title:
-            names_part = title.split("-", 1)[0].strip()
-            raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', names_part, flags=re.IGNORECASE)
-            clean_names = [name.replace(" ", "") for name in raw_names if name.strip()]
-            if clean_names:
-                return ",".join(clean_names)
+        parts = re.split(r'\s*[-–—]\s*', title)
+        
+        if len(parts) >= 3:
+            names_part = parts[1].strip()
+        elif len(parts) == 2:
+            names_part = parts[0].strip()
+        else:
+            return "AutoRSS"
+            
+        raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', names_part, flags=re.IGNORECASE)
+        clean_names = [name.replace(" ", "") for name in raw_names if name.strip()]
+        if clean_names:
+            return ",".join(clean_names)
                 
         return "AutoRSS"
+
+    async def _extract_deep_player(self, url: str) -> str:
+        """Visits the video wrapper page and extracts the underlying iframe player link."""
+        try:
+            async with AsyncSession(impersonate="chrome") as session:
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+                resp = await session.get(url, headers=headers, timeout=30)
+                
+                if resp.status_code != 200: 
+                    return url
+                
+                soup = BeautifulSoup(resp.text, "html.parser")
+                iframe = soup.find("iframe", src=re.compile(r"xtremestream\.xyz|player.*?\.php\?data="))
+                
+                if iframe and iframe.get("src"):
+                    return iframe.get("src")
+                    
+                return url
+        except Exception as e:
+            logging.getLogger("stealth_bot").error(f"Deep Extraction Error for {url}: {e}")
+            return url
 
     async def _fetch_profile(self, url: str, domain: str) -> list:
         try:
@@ -3183,11 +3233,9 @@ class RSSFeeder:
                     for item in soup.select("#list_videos_latest_videos_list_items .item"):
                         a_tag = item.select_one("a.thumb_title")
                         if not a_tag: continue
-                        
                         title = a_tag.get("title", "").strip()
                         link = a_tag.get("href", "").strip()
                         models = [tag.text.strip() for tag in item.select(".models .thumb_model span")]
-                        
                         if title and link:
                             entries.append({"title": title, "link": link, "models": models})
                             
@@ -3195,13 +3243,21 @@ class RSSFeeder:
                     for item in soup.select("#list_videos_uploaded_videos_items .item"):
                         a_tag = item.select_one("a")
                         if not a_tag: continue
-                        
                         title = a_tag.get("title", "").strip()
                         link = a_tag.get("href", "").strip()
-                        models = [] 
-                        
                         if title and link:
-                            entries.append({"title": title, "link": link, "models": models})
+                            entries.append({"title": title, "link": link, "models": []})
+
+                elif domain == "perverzija":
+                    for block in soup.find_all("div", class_="col-md-3 col-sm-6 col-xs-6"):
+                        head_tag = block.find(class_="item-head")
+                        if not head_tag: continue
+                        a_tag = head_tag.find("a")
+                        if not a_tag: continue
+                        title = a_tag.get_text(strip=True)
+                        link = a_tag.get("href", "").strip()
+                        if title and link:
+                            entries.append({"title": title, "link": link, "models": []})
                             
                 return entries
         except Exception as e:
@@ -3212,12 +3268,21 @@ class RSSFeeder:
         if "freepornvideos.xxx" in base_url:
             domain = "freepornvideos"
             page_builder = lambda b, p: f"{b.rstrip('/')}/{p}/"
+        elif "tube.perverzija.com" in base_url:
+            domain = "perverzija"
+            page_builder = lambda b, p: f"{b.rstrip('/')}/page/{p}/"
         else: 
             domain = "fpo"
             page_builder = lambda b, p: f"{b}{'&' if '?' in b else '?'}from_videos={p}"
 
         while True:
             try:
+                # ── THE SWITCHBOARD CHECK ──
+                state = self._get_state()
+                if not state.get(base_url, False):
+                    await asyncio.sleep(30)
+                    continue
+
                 history = self._load_history()
                 marker = f"__BACKFILL_DONE__{base_url}"
                 needs_backfill = (marker not in history)
@@ -3242,25 +3307,27 @@ class RSSFeeder:
                         title = entry['title']
                         models = entry['models']
                         
-                        # Only proceed if we haven't seen this link
                         if link not in self._load_history():
                             
                             # ── STRICT GLOBAL TRAFFIC LIGHT ──
                             async with self.global_feed_lock:
                                 
-                                # 1. Wait until the entire mainframe is 100% idle
                                 while True:
                                     active_jobs = await self.db.get_active_jobs()
                                     if len(active_jobs) == 0:
                                         break 
                                     await asyncio.sleep(5)
                                 
-                                # 2. Double-check memory just in case another lane added it
                                 history = self._load_history()
                                 if link in history:
                                     continue
+                                    
+                                # ── JUST-IN-TIME DEEP EXTRACTION ──
+                                target_url = link
+                                if domain == "perverzija":
+                                    logging.getLogger("stealth_bot").info(f"🕵️ Digging for deep iframe link: {title[:30]}")
+                                    target_url = await self._extract_deep_player(link)
                                 
-                                # 3. Inject the task safely
                                 jid = str(uuid.uuid4())[:8]
                                 playlists = self._parse_vk_playlists(title, models)
                                 
@@ -3277,7 +3344,7 @@ class RSSFeeder:
                                 
                                 await self.db.create_job({
                                     "id": jid, 
-                                    "url": link, 
+                                    "url": target_url, 
                                     "title": title[:128], 
                                     "source": base_url, 
                                     "quality": "auto",
@@ -3291,17 +3358,13 @@ class RSSFeeder:
                                 await self.pipeline.dl_q.put(jid)
                                 logging.getLogger("stealth_bot").info(f"✨ RSS Injected [{domain}]: {title[:30]}")
                                 
-                                # 4. Save history immediately while we still hold the lock
+                                # Save the ORIGINAL wrapper link to memory
                                 history.add(link)
                                 self._save_history(history)
                                 
-                            # ── THE YIELD ──
-                            # We force this lane to pause for 10 seconds before continuing its loop.
-                            # This guarantees the OTHER lane gets a chance to grab the lock next.
                             await asyncio.sleep(10)
                 
                 if needs_backfill:
-                    # Acquire lock to write the completion marker safely
                     async with self.global_feed_lock:
                         history = self._load_history()
                         history.add(marker)
@@ -3317,7 +3380,6 @@ class RSSFeeder:
         logging.getLogger("stealth_bot").info("🛰️ Autonomous RSS Engine initialized (Round-Robin Multi-Track).")
         await asyncio.sleep(10) 
         
-        # Launch independent tasks for every URL
         tasks = [asyncio.create_task(self._monitor_feed(url)) for url in self.target_urls]
         await asyncio.gather(*tasks)
 
