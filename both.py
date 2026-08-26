@@ -2706,7 +2706,6 @@ async def _monitor_batch_completion(db: JobScheduler, chat_id: int, app: Client)
             break
 
 async def _process_single_batch(batch_items: list, batch_counter: int, custom_name: str, destination: str, db: JobScheduler, pipeline: PipelineManager, app: Client):
-    """Handles the lifecycle of a single batch independently, showing only one active job card at a time."""
     actual_name = custom_name if custom_name else str(batch_counter)
     batch_source = f"Batch_{actual_name}"
     batch_jids = []
@@ -2753,7 +2752,6 @@ async def _process_single_batch(batch_items: list, batch_counter: int, custom_na
     _pending_batches.task_done()
 
 async def _batch_runner(db: JobScheduler, pipeline: PipelineManager, app: Client):
-    """Dispatches incoming batches (name, items, destination) to independent workers."""
     batch_counter = 0
     while True:
         custom_name, batch_items, destination = await _pending_batches.get()
@@ -2799,6 +2797,32 @@ async def _resume_interrupted_batches(db: JobScheduler, pipeline: PipelineManage
             if base_stage == "encoded":
                 await pipeline.up_q.put(jid)
 
+# ── RSS STATE HELPERS FOR TELEGRAM UI ──
+RSS_STATE_FILE = BASE_DIR / "rss_state.json" 
+
+def get_rss_state():
+    try:
+        with open(RSS_STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception: return {}
+
+def save_rss_state(state):
+    with open(RSS_STATE_FILE, "w") as f:
+        json.dump(state, f, indent=4)
+
+def build_rss_keyboard(state_dict):
+    buttons = []
+    for i, url in enumerate(RSS_TARGET_URLS):
+        is_active = state_dict.get(url, False)
+        status_icon = "🟢 ACTIVE" if is_active else "🔴 PAUSED"
+        try:
+            domain = url.split("/")[2].replace("www.", "")
+        except:
+            domain = f"Feed {i}"
+        buttons.append([InlineKeyboardButton(f"{status_icon} | {domain}", callback_data=f"rss_toggle|{i}")])
+    buttons.append([InlineKeyboardButton("🔄 Refresh Status", callback_data="rss_refresh")])
+    return InlineKeyboardMarkup(buttons)
+
 def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager, vk_manager: VKPlaylistManager):
     global pipeline_ref, vk_manager_ref
     pipeline_ref = pipeline
@@ -2816,6 +2840,13 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager, vk_ma
             pass
         text, kb = await _get_dashboard_components(_dashboard_tab, db, pipeline)
         await safe_edit(app, _dashboard_chat_id, _dashboard_msg_id, text, kb)
+
+    # ── COMMAND: /rss ──
+    @app.on_message(filters.command(["rss"]) & filters.user(OWNER_ID))
+    async def cmd_rss_menu(_, msg: Message):
+        state = get_rss_state()
+        kb = build_rss_keyboard(state)
+        await msg.reply_text("📡 **RSS Engine Control Panel**\nSelect a feed to toggle its background worker:", reply_markup=kb)
 
     @app.on_message(filters.command(["go"]) & filters.user(OWNER_ID))
     async def batch_go(_, msg: Message):
@@ -2839,7 +2870,6 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager, vk_ma
         if not _batch_collection:
             return await msg.reply(TXT.BATCH_EMPTY)
 
-        # Ask VK/Telegram for the whole batch before dispatching.
         await prompt_batch_destination(app, msg.chat.id, _current_batch_name, list(_batch_collection))
         _batch_collection.clear()
         _current_batch_name = None
@@ -2911,7 +2941,7 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager, vk_ma
 
             return
 
-    @app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["start", "dashboard", "go", "end"]))
+    @app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["start", "dashboard", "go", "end", "rss"]))
     async def url_catcher(_, msg: Message):
         if msg.reply_to_message and msg.reply_to_message.text and "RENAME TASK" in msg.reply_to_message.text:
             try:
@@ -2930,9 +2960,6 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager, vk_ma
         if url:
             global _batch_mode, _batch_collection
             if _batch_mode:
-                # Batch collection still just gathers (url, title, chat_id); the
-                # #tag/caption syntax is only parsed for single-link mode. In
-                # batch mode the /go name is the playlist name for everyone.
                 parsed = parse_link_message(msg.text, url)
                 _batch_collection.append((url, parsed["title"], msg.chat.id))
                 await msg.reply(TXT.BATCH_ADDED.format(count=len(_batch_collection)), quote=True)
@@ -2946,6 +2973,28 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager, vk_ma
 
         if cb.data == "noop":
             await cb.answer()
+            return
+
+        # ── RSS TOGGLE HANDLING ──
+        if cb.data.startswith("rss_"):
+            action = cb.data.split("|")[0]
+            state = get_rss_state()
+            
+            if action == "rss_toggle":
+                index = int(cb.data.split("|")[1])
+                try:
+                    target_url = RSS_TARGET_URLS[index]
+                    state[target_url] = not state.get(target_url, False)
+                    save_rss_state(state)
+                except IndexError:
+                    pass
+
+            kb = build_rss_keyboard(state)
+            try:
+                await cb.message.edit_text("📡 **RSS Engine Control Panel**\nSelect a feed to toggle its background worker:", reply_markup=kb)
+                await cb.answer("Status Updated!")
+            except Exception:
+                await cb.answer("No changes made.")
             return
 
         if cb.data.startswith("dest|"):
@@ -3055,7 +3104,6 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager, vk_ma
                 except Exception: pass
             await cb.answer("Process terminated and payload destroyed.", show_alert=True)
             return
-
 # ═══════════════════════════════════════════════════════════════════════
 # CHAPTER 15 — EVENT LOOPS (terminal UI + helpers)
 # ═══════════════════════════════════════════════════════════════════════
