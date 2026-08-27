@@ -756,6 +756,200 @@ class DownloaderEngine:
         except Exception as e:
             self.db.log_trace(jid, f"Perverzija extraction failed: {e}")
             return None, None
+            
+    @staticmethod
+    def _decode_packed_js(packed_script: str) -> str:
+        """Mathematically unpacks obfuscated JavaScript (used by Lulustream)."""
+        match = re.search(r"}\s*\(\s*'(.*?)',\s*(\d+),\s*(\d+),\s*'(.*?)'\.split\('\|'\)", packed_script, re.DOTALL)
+        if not match: return ""
+        p = match.group(1).replace("\\'", "'").replace('\\"', '"').replace('\\\\', '\\')
+        a = int(match.group(2))
+        c = int(match.group(3))
+        k = match.group(4).split('|')
+
+        def replace_func(m):
+            word = m.group(0)
+            try: index = int(word, a)
+            except ValueError: return word
+            if index < c and k[index]: return k[index]
+            return word
+
+        return re.sub(r'\b\w+\b', replace_func, p)
+
+    async def _extract_and_download_direct_mp4(self, url: str, jid: str, dl_dir: Path) -> bool:
+        """Handles FPO and Porneec via native HTTP/2 chunked streaming."""
+        from curl_cffi.requests import AsyncSession
+        import time
+        self.db.log_trace(jid, f"[*] Accessing page natively: {url}")
+
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Upgrade-Insecure-Requests": "1"
+        }
+        impersonations = ["safari15_5", "chrome116", "edge101", "safari_ios", "chrome120"]
+        successful_session, html = None, ""
+
+        for browser in impersonations:
+            self.db.log_trace(jid, f"[*] Attempting WAF bypass with: {browser}...")
+            try:
+                temp_session = AsyncSession(impersonate=browser, headers=headers)
+                temp_res = await temp_session.get(url, timeout=15)
+                if temp_res.status_code == 200:
+                    self.db.log_trace(jid, f"[+] SUCCESS! Connection secured using {browser}")
+                    successful_session = temp_session
+                    html = temp_res.text
+                    break
+            except Exception:
+                pass
+
+        if not successful_session:
+            self.db.log_trace(jid, "[-] All WAF bypass attempts failed.")
+            return False
+
+        mp4_matches = re.findall(r'["\'](https?://[^"\']+\.mp4[^"\']*)["\']', html)
+        if not mp4_matches:
+            self.db.log_trace(jid, "[-] No MP4 link found in the page source.")
+            return False
+
+        video_url = mp4_matches[0]
+        self.db.log_trace(jid, f"[+] Extracted Direct Stream: {video_url}")
+
+        out_file = dl_dir / f"{jid}.mp4"
+        dl_headers = {"Referer": url}
+
+        self.db.log_trace(jid, "[*] Launching native chunked download to bypass CDN resets...")
+        try:
+            res = await successful_session.get(video_url, headers=dl_headers, stream=True, http_version=2)
+            if res.status_code in [200, 206]:
+                total_size = int(res.headers.get("Content-Length", 0))
+                downloaded = 0
+                last_ui_update = time.time()
+
+                with open(out_file, 'wb') as f:
+                    async for chunk in res.aiter_content(chunk_size=1024*1024):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            now = time.time()
+                            if total_size and (now - last_ui_update > 2.0):
+                                pct = (downloaded / total_size) * 100
+                                await self.db.update_job(jid, pct=pct, stage=f"downloading | native | {downloaded//(1024*1024)}MB")
+                                global _live_ui_text
+                                _live_ui_text[jid] = f"[Native] {downloaded//(1024*1024)}MB / {total_size//(1024*1024)}MB ({pct:.1f}%)"
+                                last_ui_update = now
+                self.db.log_trace(jid, f"[+] Download complete! Saved to {out_file.name}.")
+                return True
+            else:
+                self.db.log_trace(jid, f"[-] CDN rejected the download. Status: {res.status_code}")
+                return False
+        except Exception as e:
+            self.db.log_trace(jid, f"[-] Failed to download the video file: {e}")
+            return False
+
+    async def _extract_and_download_lulu(self, url: str, jid: str, dl_dir: Path) -> bool:
+        """Handles Lulustream and Hrnyvid via JS unpacking and fragment compilation."""
+        from curl_cffi.requests import AsyncSession
+        from urllib.parse import urljoin
+        import subprocess
+
+        self.db.log_trace(jid, f"[*] Accessing Lulustream/Hrnyvid page: {url}")
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Upgrade-Insecure-Requests": "1"
+        }
+        impersonations = ["safari15_5", "chrome116", "edge101", "safari_ios", "chrome120"]
+        successful_session, html = None, ""
+
+        for browser in impersonations:
+            self.db.log_trace(jid, f"[*] Attempting WAF bypass with: {browser}...")
+            try:
+                temp_session = AsyncSession(impersonate=browser, headers=headers)
+                temp_res = await temp_session.get(url, timeout=15)
+                if temp_res.status_code == 200:
+                    self.db.log_trace(jid, f"[+] SUCCESS! Connection secured using {browser}")
+                    successful_session = temp_session
+                    html = temp_res.text
+                    break
+            except Exception:
+                pass
+
+        if not successful_session:
+            self.db.log_trace(jid, "[-] All WAF bypass attempts failed.")
+            return False
+
+        packed_match = re.search(r'eval\(function\(p,a,c,k,e,d\).*?split\([^)]+\)\)\)', html)
+        if not packed_match:
+            self.db.log_trace(jid, "[-] Could not find the packed JavaScript.")
+            return False
+
+        self.db.log_trace(jid, "[*] Mathematically unpacking JavaScript...")
+        unpacked_js = self._decode_packed_js(packed_match.group(0))
+
+        m3u8_match = re.search(r'["\'](https?://[^"\']+\.m3u8[^"\']*)["\']', unpacked_js)
+        if not m3u8_match:
+            self.db.log_trace(jid, "[-] No M3U8 link found inside the payload.")
+            return False
+
+        master_url = m3u8_match.group(1)
+        self.db.log_trace(jid, f"[+] Extracted Master Manifest: {master_url}")
+        dl_headers = {"Referer": "https://lulustream.com/"}
+
+        self.db.log_trace(jid, "[*] Fetching Master M3U8...")
+        master_req = await successful_session.get(master_url, headers=dl_headers)
+        if master_req.status_code != 200:
+            self.db.log_trace(jid, f"[-] CDN Blocked Master Manifest. HTTP {master_req.status_code}")
+            return False
+
+        playlists = [line.strip() for line in master_req.text.splitlines() if line.strip() and not line.startswith('#')]
+        if not playlists:
+            self.db.log_trace(jid, "[-] No video streams found in the master manifest.")
+            return False
+
+        video_playlist_url = urljoin(master_url, playlists[-1])
+        self.db.log_trace(jid, "[*] Fetching Video Fragments Manifest...")
+        playlist_req = await successful_session.get(video_playlist_url, headers=dl_headers)
+
+        segments = [line.strip() for line in playlist_req.text.splitlines() if line.strip() and not line.startswith('#')]
+        self.db.log_trace(jid, f"[+] Found {len(segments)} video fragments. Commencing native secure download...")
+
+        raw_ts_file = dl_dir / f"{jid}_raw.ts"
+        out_file = dl_dir / f"{jid}.mp4"
+
+        # Download segments natively (async loop)
+        with open(raw_ts_file, "wb") as f:
+            for i, seg in enumerate(segments):
+                seg_url = urljoin(video_playlist_url, seg)
+                for _ in range(3): # Light retry mechanism for dropped fragments
+                    try:
+                        seg_req = await successful_session.get(seg_url, headers=dl_headers, timeout=20)
+                        if seg_req.status_code == 200:
+                            f.write(seg_req.content)
+                            break
+                    except Exception:
+                        await asyncio.sleep(1)
+                
+                if i % 5 == 0 or i == len(segments) - 1:
+                    pct = ((i + 1) / len(segments)) * 100
+                    await self.db.update_job(jid, pct=pct, stage=f"downloading | fragments | {i+1}/{len(segments)}")
+                    global _live_ui_text
+                    _live_ui_text[jid] = f"[Lulu Native] Fragment {i+1}/{len(segments)} ({pct:.1f}%)"
+
+        self.db.log_trace(jid, f"[+] Stream downloaded successfully! Remuxing via FFmpeg...")
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-v", "warning", "-i", str(raw_ts_file), "-c", "copy", str(out_file),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await proc.communicate()
+        
+        if proc.returncode == 0 and out_file.exists() and out_file.stat().st_size > 1024:
+            self.db.log_trace(jid, f"[+] Remux complete. Final video saved.")
+            raw_ts_file.unlink(missing_ok=True)
+            return True
+        else:
+            self.db.log_trace(jid, f"[-] FFmpeg remux failed: {stderr.decode(errors='ignore')}")
+            return False
 
     async def execute(self, job_data: dict):
         jid, url, strategy, quality = job_data['id'], job_data['url'], job_data['strategy'], job_data['quality']
