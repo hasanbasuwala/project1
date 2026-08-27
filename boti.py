@@ -705,6 +705,57 @@ class DownloaderEngine:
         except Exception as e:
             self.db.log_trace(jid, f"Pre-check warning: Hardened ping encounter ({e}). Passing downstream to engine.")
             return True
+            
+    async def _extract_perverzija_stream(self, main_url: str, jid: str) -> tuple[str | None, str | None]:
+        """Custom dedicated extractor for Perverzija/Xtremestream."""
+        from curl_cffi.requests import AsyncSession
+        import re
+
+        try:
+            async with AsyncSession(impersonate="chrome120") as session:
+                iframe_url = main_url
+                
+                # 1. If it's the main wrapper page, extract the iframe
+                if "perverzija.com" in main_url.lower():
+                    self.db.log_trace(jid, "[*] Fetching main page to locate iframe...")
+                    main_res = await session.get(main_url, timeout=30)
+                    iframe_match = re.search(r'["\'](https?://[^"\']+xtremestream[^"\']+/player/index\.php\?data=[^"\']+)["\']', main_res.text, re.IGNORECASE)
+                    
+                    if iframe_match:
+                        iframe_url = iframe_match.group(1)
+                        self.db.log_trace(jid, f"[+] Found Player URL: {iframe_url}")
+                    else:
+                        self.db.log_trace(jid, "[-] Could not find the player iframe on main page.")
+                        return None, None
+
+                # 2. Fetch the player HTML
+                self.db.log_trace(jid, "[*] Fetching player HTML...")
+                player_res = await session.get(iframe_url, headers={"Referer": main_url if "perverzija" in main_url else iframe_url}, timeout=30)
+                html = player_res.text
+
+                # 3. Extract the JS variables
+                loader_match = re.search(r'm3u8_loader_url\s*=\s*["\'\`]([^"\'\`]+)["\'\`]', html)
+                video_id_match = re.search(r'video_id\s*=\s*["\'\`]([^"\'\`]+)["\'\`]', html)
+
+                if not loader_match or not video_id_match:
+                    self.db.log_trace(jid, "[-] Could not parse variable definitions. Regex failed.")
+                    return None, None
+
+                loader_url = loader_match.group(1)
+                vid = video_id_match.group(1)
+                stream_url = loader_url + vid
+                
+                # 4. Construct final URL
+                if not stream_url.startswith("http"):
+                    base_domain = re.match(r"https?://[^/]+", iframe_url).group(0)
+                    stream_url = base_domain + stream_url
+
+                self.db.log_trace(jid, f"[+] SUCCESS! Constructed Stream URL: {stream_url}")
+                return stream_url, iframe_url
+
+        except Exception as e:
+            self.db.log_trace(jid, f"Perverzija extraction failed: {e}")
+            return None, None
 
     async def execute(self, job_data: dict):
         jid, url, strategy, quality = job_data['id'], job_data['url'], job_data['strategy'], job_data['quality']
