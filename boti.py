@@ -3334,7 +3334,8 @@ class RSSFeeder:
                         a_tag = item.select_one("a.thumb_title")
                         if not a_tag: continue
                         title = a_tag.get("title", "").strip()
-                        link = a_tag.get("href", "").strip()
+                        raw_link = a_tag.get("href", "").strip()
+                        link = urlparse.urljoin(url, raw_link) # <--- GUARANTEES FULL URL
                         models = [tag.text.strip() for tag in item.select(".models .thumb_model span")]
                         if title and link:
                             entries.append({"title": title, "link": link, "models": models})
@@ -3344,7 +3345,8 @@ class RSSFeeder:
                         a_tag = item.select_one("a")
                         if not a_tag: continue
                         title = a_tag.get("title", "").strip()
-                        link = a_tag.get("href", "").strip()
+                        raw_link = a_tag.get("href", "").strip()
+                        link = urlparse.urljoin(url, raw_link) # <--- GUARANTEES FULL URL
                         if title and link:
                             entries.append({"title": title, "link": link, "models": []})
 
@@ -3355,7 +3357,8 @@ class RSSFeeder:
                         a_tag = head_tag.find("a")
                         if not a_tag: continue
                         title = a_tag.get_text(strip=True)
-                        link = a_tag.get("href", "").strip()
+                        raw_link = a_tag.get("href", "").strip()
+                        link = urlparse.urljoin(url, raw_link) # <--- GUARANTEES FULL URL
                         if title and link:
                             entries.append({"title": title, "link": link, "models": []})
                             
