@@ -979,26 +979,35 @@ class DownloaderEngine:
             await self._run_aria(url, jid, dl_dir)
             return
 
-        # ── NEW: PERVERZIJA DEDICATED EXTRACTOR INTERCEPT ──
+        # ── DEDICATED EXTRACTOR: PERVERZIJA / XTREMESTREAM ──
         if "perverzija.com" in url.lower() or "xtremestream" in url.lower():
             self.db.log_trace(jid, "Perverzija/Xtremestream target detected. Running dedicated extractor...")
             stream_url, referer = await self._extract_perverzija_stream(url, jid)
-            
             if stream_url:
-                custom_opts = {
-                    "http_headers": {"Referer": referer},
-                    "concurrent_fragment_downloads": 4
-                }
+                custom_opts = {"http_headers": {"Referer": referer}, "concurrent_fragment_downloads": 4}
                 try:
                     self.db.log_trace(jid, "Executing yt-dlp on extracted M3U8 stream...")
                     await asyncio.to_thread(self._execute_ytdlp, stream_url, jid, dl_dir, custom_opts)
-                    
-                    valid_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".flv", ".php"]]
-                    if valid_files:
-                        self.db.log_trace(jid, "Dedicated extraction and download SUCCESS.")
-                        return  # Exit function early, download is complete!
+                    valid_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".ts"]]
+                    if valid_files: return
                 except Exception as e:
                     self.db.log_trace(jid, f"Dedicated extractor yt-dlp failed: {e}")
+
+        # ── DEDICATED EXTRACTOR: LULUSTREAM / HRNYVID ──
+        if "lulustream" in url.lower() or "hrnyvid" in url.lower():
+            self.db.log_trace(jid, "Lulustream/Hrnyvid target detected. Running native JS unpacker and downloader...")
+            if await self._extract_and_download_lulu(url, jid, dl_dir):
+                return
+            else:
+                self.db.log_trace(jid, "Dedicated extraction failed, falling back to Playwright...")
+
+        # ── DEDICATED EXTRACTOR: PORNEEC / FPO ──
+        if "porneec" in url.lower() or "fpo.xxx" in url.lower():
+            self.db.log_trace(jid, "Porneec/FPO target detected. Running native chunked downloader...")
+            if await self._extract_and_download_direct_mp4(url, jid, dl_dir):
+                return
+            else:
+                self.db.log_trace(jid, "Dedicated extraction failed, falling back to Playwright...")
 
         # ... The rest of the execute function stays the same (Playwright, etc.) ...
         playwright_data = self._load_cached_payload(dl_dir)
