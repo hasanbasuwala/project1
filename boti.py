@@ -3246,27 +3246,6 @@ class RSSFeeder:
                 
         return "AutoRSS"
 
-    async def _extract_deep_player(self, url: str) -> str:
-        """Visits the video wrapper page and extracts the underlying iframe player link."""
-        try:
-            async with AsyncSession(impersonate="chrome") as session:
-                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-                resp = await session.get(url, headers=headers, timeout=30)
-                
-                if resp.status_code != 200: 
-                    return url
-                
-                soup = BeautifulSoup(resp.text, "html.parser")
-                iframe = soup.find("iframe", src=re.compile(r"xtremestream\.xyz|player.*?\.php\?data="))
-                
-                if iframe and iframe.get("src"):
-                    return iframe.get("src")
-                    
-                return url
-        except Exception as e:
-            logging.getLogger("stealth_bot").error(f"Deep Extraction Error for {url}: {e}")
-            return url
-
     async def _fetch_profile(self, url: str, domain: str) -> list:
         try:
             async with AsyncSession(impersonate="chrome") as session:
@@ -3337,7 +3316,7 @@ class RSSFeeder:
                 
                 if needs_backfill:
                     logging.getLogger("stealth_bot").info(f"🕰️ Backfill required for {base_url}. Scanning Pages 20 to 1...")
-                    urls_to_scan = [page_builder(base_url, p) for p in range(2, 1, -1)]
+                    urls_to_scan = [page_builder(base_url, p) for p in range(20, 1, -1)]
                     urls_to_scan.append(base_url)
                 else:
                     urls_to_scan = [base_url]
@@ -3369,12 +3348,6 @@ class RSSFeeder:
                                 history = self._load_history()
                                 if link in history:
                                     continue
-                                    
-                                # ── JUST-IN-TIME DEEP EXTRACTION ──
-                                target_url = link
-                                if domain == "perverzija":
-                                    logging.getLogger("stealth_bot").info(f"🕵️ Digging for deep iframe link: {title[:30]}")
-                                    target_url = await self._extract_deep_player(link)
                                 
                                 jid = str(uuid.uuid4())[:8]
                                 playlists = self._parse_vk_playlists(title, models)
@@ -3392,7 +3365,7 @@ class RSSFeeder:
                                 
                                 await self.db.create_job({
                                     "id": jid, 
-                                    "url": target_url, 
+                                    "url": link,  # <--- PASSING THE ORIGINAL WRAPPER LINK
                                     "title": title[:128], 
                                     "source": base_url, 
                                     "quality": "auto",
@@ -3406,7 +3379,6 @@ class RSSFeeder:
                                 await self.pipeline.dl_q.put(jid)
                                 logging.getLogger("stealth_bot").info(f"✨ RSS Injected [{domain}]: {title[:30]}")
                                 
-                                # Save the ORIGINAL wrapper link to memory
                                 history.add(link)
                                 self._save_history(history)
                                 
