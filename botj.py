@@ -3067,7 +3067,9 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager, vk_ma
             if action == "rss_toggle":
                 index = int(cb.data.split("|")[1])
                 try:
-                    target_url = RSS_TARGET_URLS[index]
+                    feed = RSS_TARGET_URLS[index]
+                    # Handle the dictionary map safely here
+                    target_url = feed["url"] if isinstance(feed, dict) else feed
                     state[target_url] = not state.get(target_url, False)
                     save_rss_state(state)
                 except IndexError:
