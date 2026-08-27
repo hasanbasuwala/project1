@@ -3253,6 +3253,7 @@ import uuid
 import asyncio
 import logging
 import json
+import urllib.parse as urlparse
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 class RSSFeeder:
@@ -3261,7 +3262,15 @@ class RSSFeeder:
         self.pipeline = pipeline
         self.app = app
         self.owner_id = owner_id
-        self.target_urls = target_urls
+        
+        # Normalize incoming target configurations
+        self.target_feeds = []
+        for item in target_urls:
+            if isinstance(item, str):
+                self.target_feeds.append({"url": item, "backfill_pages": 20})
+            else:
+                self.target_feeds.append({"url": item.get("url"), "backfill_pages": item.get("backfill_pages", 20)})
+                
         self.history_file = BASE_DIR / "rss_history.txt"
         self.state_file = BASE_DIR / "rss_state.json" 
         self.poll_interval = 1800  
@@ -3272,7 +3281,8 @@ class RSSFeeder:
     def _init_state(self):
         state = self._get_state()
         changed = False
-        for url in self.target_urls:
+        for feed in self.target_feeds:
+            url = feed["url"]
             if url not in state:
                 state[url] = False 
                 changed = True
@@ -3299,25 +3309,70 @@ class RSSFeeder:
             f.write("\n".join(history_set))
 
     def _parse_vk_playlists(self, title: str, models: list) -> str:
-        if models:
-            clean_names = [name.replace(" ", "") for name in models if name.strip()]
-            return ",".join(clean_names)
-            
+        tags = []
+        
+        # 1. Parse Title for Network and Actors (Perverzija uses: Network - Actor - Title)
         parts = re.split(r'\s*[-–—]\s*', title)
         
         if len(parts) >= 3:
-            names_part = parts[1].strip()
-        elif len(parts) == 2:
-            names_part = parts[0].strip()
-        else:
-            return "AutoRSS"
+            # First part is the Production House/Network
+            network = parts[0].strip().replace(" ", "")
+            if network: tags.append(network)
             
-        raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', names_part, flags=re.IGNORECASE)
-        clean_names = [name.replace(" ", "") for name in raw_names if name.strip()]
-        if clean_names:
-            return ",".join(clean_names)
+            # Second part is the Actor(s)
+            actor_part = parts[1].strip()
+            raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', actor_part, flags=re.IGNORECASE)
+            tags.extend([n.replace(" ", "") for n in raw_names if n.strip()])
+            
+        elif len(parts) == 2:
+            # Fallback for generic Actor - Title
+            actor_part = parts[0].strip()
+            raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', actor_part, flags=re.IGNORECASE)
+            tags.extend([n.replace(" ", "") for n in raw_names if n.strip()])
+
+        # 2. Append explicitly provided models (FreePornVideos explicitly provides these)
+        if models:
+            tags.extend([n.replace(" ", "") for n in models if n.strip()])
+            
+        # 3. Clean duplicates while preserving the visual order
+        clean_tags = list(dict.fromkeys(tags))
+        
+        return ",".join(clean_tags) if clean_tags else "AutoRSS"
+
+    async def _get_last_page(self, url: str, domain: str) -> int:
+        """Dynamically scrapes the target site to find its absolute highest pagination integer."""
+        try:
+            async with AsyncSession(impersonate="chrome") as session:
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+                resp = await session.get(url, headers=headers, timeout=30)
+                if resp.status_code != 200: return 20
                 
-        return "AutoRSS"
+                soup = BeautifulSoup(resp.text, "html.parser")
+                max_page = 1
+                
+                if domain == "freepornvideos":
+                    last_btn = soup.select_one(".pagination .last a")
+                    if last_btn:
+                        m = re.search(r'/(\d+)/?$', last_btn.get("href", ""))
+                        if m: max_page = int(m.group(1))
+                        
+                elif domain == "perverzija":
+                    page_links = soup.select("a.page-numbers")
+                    for link in page_links:
+                        txt = link.get_text(strip=True).replace(',', '')
+                        if txt.isdigit():
+                            max_page = max(max_page, int(txt))
+                            
+                elif domain == "fpo":
+                    page_links = soup.select(".pagination a")
+                    for link in page_links:
+                        m = re.search(r'from_videos=(\d+)', link.get("href", ""))
+                        if m: max_page = max(max_page, int(m.group(1)))
+                        
+                return max_page if max_page > 1 else 20
+        except Exception as e:
+            logging.getLogger("stealth_bot").error(f"Auto-page detection failed for {url}: {e}")
+            return 20
 
     async def _fetch_profile(self, url: str, domain: str) -> list:
         try:
@@ -3335,7 +3390,7 @@ class RSSFeeder:
                         if not a_tag: continue
                         title = a_tag.get("title", "").strip()
                         raw_link = a_tag.get("href", "").strip()
-                        link = urlparse.urljoin(url, raw_link) # <--- GUARANTEES FULL URL
+                        link = urlparse.urljoin(url, raw_link)
                         models = [tag.text.strip() for tag in item.select(".models .thumb_model span")]
                         if title and link:
                             entries.append({"title": title, "link": link, "models": models})
@@ -3346,7 +3401,7 @@ class RSSFeeder:
                         if not a_tag: continue
                         title = a_tag.get("title", "").strip()
                         raw_link = a_tag.get("href", "").strip()
-                        link = urlparse.urljoin(url, raw_link) # <--- GUARANTEES FULL URL
+                        link = urlparse.urljoin(url, raw_link)
                         if title and link:
                             entries.append({"title": title, "link": link, "models": []})
 
@@ -3358,7 +3413,7 @@ class RSSFeeder:
                         if not a_tag: continue
                         title = a_tag.get_text(strip=True)
                         raw_link = a_tag.get("href", "").strip()
-                        link = urlparse.urljoin(url, raw_link) # <--- GUARANTEES FULL URL
+                        link = urlparse.urljoin(url, raw_link)
                         if title and link:
                             entries.append({"title": title, "link": link, "models": []})
                             
@@ -3367,7 +3422,10 @@ class RSSFeeder:
             logging.getLogger("stealth_bot").error(f"RSS Fetch Error for {url}: {e}")
             return []
 
-    async def _monitor_feed(self, base_url: str):
+    async def _monitor_feed(self, feed_config: dict):
+        base_url = feed_config["url"]
+        backfill_setting = feed_config.get("backfill_pages", 20)
+        
         if "freepornvideos.xxx" in base_url:
             domain = "freepornvideos"
             page_builder = lambda b, p: f"{b.rstrip('/')}/{p}/"
@@ -3391,8 +3449,14 @@ class RSSFeeder:
                 needs_backfill = (marker not in history)
                 
                 if needs_backfill:
-                    logging.getLogger("stealth_bot").info(f"🕰️ Backfill required for {base_url}. Scanning Pages 20 to 1...")
-                    urls_to_scan = [page_builder(base_url, p) for p in range(20, 1, -1)]
+                    if str(backfill_setting).lower() == "auto":
+                        logging.getLogger("stealth_bot").info(f"🕵️ Auto-detecting total pages for {base_url}...")
+                        total_pages = await self._get_last_page(base_url, domain)
+                    else:
+                        total_pages = int(backfill_setting)
+                        
+                    logging.getLogger("stealth_bot").info(f"🕰️ Backfill initiated for {base_url}. Scanning {total_pages} pages deep...")
+                    urls_to_scan = [page_builder(base_url, p) for p in range(total_pages, 1, -1)]
                     urls_to_scan.append(base_url)
                 else:
                     urls_to_scan = [base_url]
@@ -3412,9 +3476,7 @@ class RSSFeeder:
                         
                         if link not in self._load_history():
                             
-                            # ── STRICT GLOBAL TRAFFIC LIGHT ──
                             async with self.global_feed_lock:
-                                
                                 while True:
                                     active_jobs = await self.db.get_active_jobs()
                                     if len(active_jobs) == 0:
@@ -3441,7 +3503,7 @@ class RSSFeeder:
                                 
                                 await self.db.create_job({
                                     "id": jid, 
-                                    "url": link,  # <--- PASSING THE ORIGINAL WRAPPER LINK
+                                    "url": link, 
                                     "title": title[:128], 
                                     "source": base_url, 
                                     "quality": "auto",
@@ -3453,7 +3515,7 @@ class RSSFeeder:
                                     "caption": title
                                 })
                                 await self.pipeline.dl_q.put(jid)
-                                logging.getLogger("stealth_bot").info(f"✨ RSS Injected [{domain}]: {title[:30]}")
+                                logging.getLogger("stealth_bot").info(f"✨ RSS Injected [{domain}]: {title[:30]} -> Playlists: {playlists}")
                                 
                                 history.add(link)
                                 self._save_history(history)
@@ -3476,7 +3538,8 @@ class RSSFeeder:
         logging.getLogger("stealth_bot").info("🛰️ Autonomous RSS Engine initialized (Round-Robin Multi-Track).")
         await asyncio.sleep(10) 
         
-        tasks = [asyncio.create_task(self._monitor_feed(url)) for url in self.target_urls]
+        # Launch independent tasks utilizing the dictionary mappings
+        tasks = [asyncio.create_task(self._monitor_feed(feed)) for feed in self.target_feeds]
         await asyncio.gather(*tasks)
 
 # ═══════════════════════════════════════════════════════════════════════
