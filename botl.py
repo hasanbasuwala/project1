@@ -3508,54 +3508,24 @@ class RSSFeeder:
         with open(self.history_file, "w", encoding="utf-8") as f:
             f.write("\n".join(history_set))
 
-    def _parse_metadata(self, raw_title: str, models: list, site_key: str) -> tuple[str, str]:
-        """Domain-aware parser that returns a (Clean Caption, Playlist String) tuple."""
+    def _parse_vk_playlists(self, title: str, models: list) -> str:
         tags = []
-        clean_title = raw_title.strip()
+        parts = re.split(r'\s*[-–—]\s*', title)
         
-        if site_key == "site_porneec":
-            # Extracts [Network] tags from the start of the title, e.g., "[AdultTime] Jesse Pony..."
-            m = re.match(r'^\[(.*?)\]\s*(.*)', clean_title)
-            if m:
-                tags.append(m.group(1).replace(" ", ""))
-                clean_title = m.group(2)
-            
-            # Extracts Actors before the first hyphen
-            parts = re.split(r'\s*[-–—]\s*', clean_title)
-            if len(parts) > 1:
-                raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', parts[0], flags=re.IGNORECASE)
-                # Only append names if they are 1-3 words long to avoid catching long sentences
-                tags.extend([n.replace(" ", "") for n in raw_names if n.strip() and len(n.split()) <= 3])
-                
-        elif site_key == "site_perverzija":
-            # Format is strictly Network - Actor(s) - Title
-            parts = re.split(r'\s*[-–—]\s*', clean_title)
-            if len(parts) >= 3:
-                tags.append(parts[0].strip().replace(" ", "")) 
-                raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', parts[1], flags=re.IGNORECASE)
-                tags.extend([n.replace(" ", "") for n in raw_names if n.strip()])
-            elif len(parts) == 2:
-                raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', parts[0], flags=re.IGNORECASE)
-                tags.extend([n.replace(" ", "") for n in raw_names if n.strip()])
+        if len(parts) >= 3:
+            network = parts[0].strip().replace(" ", "")
+            if network: tags.append(network)
+            actor_part = parts[1].strip()
+            raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', actor_part, flags=re.IGNORECASE)
+            tags.extend([n.replace(" ", "") for n in raw_names if n.strip()])
+        elif len(parts) == 2:
+            actor_part = parts[0].strip()
+            raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', actor_part, flags=re.IGNORECASE)
+            tags.extend([n.replace(" ", "") for n in raw_names if n.strip()])
 
-        elif site_key == "site_hornysimp":
-            # HornySimp uses zero delimiters (e.g., "Brazzers Exxtra Courtney Tillia Yoga Massage...")
-            # We assign it to a site-wide playlist to prevent creating messy, full-sentence playlists.
-            tags.append("HornySimp") 
-            
-        elif site_key == "site_fpv":
-            # FreePornVideos passes clean models directly via the HTML scraper
-            if models: tags.extend([n.replace(" ", "") for n in models if n.strip()])
-
-        # Generic Model Fallback
-        if models and site_key != "site_fpv": 
-            tags.extend([n.replace(" ", "") for n in models if n.strip()])
-            
-        # Deduplicate and finalize
+        if models: tags.extend([n.replace(" ", "") for n in models if n.strip()])
         clean_tags = list(dict.fromkeys(tags))
-        playlist_string = ",".join(clean_tags) if clean_tags else "AutoRSS"
-        
-        return clean_title, playlist_string
+        return ",".join(clean_tags) if clean_tags else "AutoRSS"
 
     async def _get_last_page(self, url: str, rss_type: str) -> int:
         try:
@@ -3719,7 +3689,9 @@ class RSSFeeder:
                                 if link in history: continue
                                 
                                 jid = str(uuid.uuid4())[:8]
-                                playlists = self._parse_vk_playlists(title, models)
+                                # Ask the parser to clean the caption and generate tags based on the site mapping
+                                site_key = feed_config.get("config_key", "default")
+                                clean_caption, playlists = self._parse_metadata(title, models, site_key)
                                 tracker_id = None
                                 
                                 try:
