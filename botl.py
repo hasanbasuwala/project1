@@ -781,75 +781,84 @@ class DownloaderEngine:
         return re.sub(r'\b\w+\b', replace_func, p)
 
     async def _extract_and_download_direct_mp4(self, url: str, jid: str, dl_dir: Path) -> bool:
-        """Handles FPO and Porneec via native HTTP/2 chunked streaming."""
+        """Handles FPO and Porneec via native HTTP/2 chunked streaming with 3-strike WAF retries."""
         from curl_cffi.requests import AsyncSession
         import time
-        self.db.log_trace(jid, f"[*] Accessing page natively: {url}")
-
+        import asyncio
+        
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.5",
             "Upgrade-Insecure-Requests": "1"
         }
         impersonations = ["safari15_5", "chrome116", "edge101", "safari_ios", "chrome120"]
-        successful_session, html = None, ""
 
-        for browser in impersonations:
-            self.db.log_trace(jid, f"[*] Attempting WAF bypass with: {browser}...")
+        # ── 3-STRIKE RETRY LOOP ──
+        for attempt in range(1, 4):
+            self.db.log_trace(jid, f"[*] Direct MP4 Extraction Attempt {attempt}/3: {url}")
+            successful_session, html = None, ""
+
+            for browser in impersonations:
+                try:
+                    temp_session = AsyncSession(impersonate=browser, headers=headers)
+                    temp_res = await temp_session.get(url, timeout=15)
+                    if temp_res.status_code == 200:
+                        self.db.log_trace(jid, f"[+] SUCCESS! Connection secured using {browser}")
+                        successful_session = temp_session
+                        html = temp_res.text
+                        break
+                except Exception:
+                    pass
+
+            if not successful_session:
+                self.db.log_trace(jid, "[-] WAF bypass failed on this attempt.")
+                await asyncio.sleep(3)
+                continue
+
+            mp4_matches = re.findall(r'["\'](https?://[^"\']+\.mp4[^"\']*)["\']', html)
+            if not mp4_matches:
+                self.db.log_trace(jid, "[-] No MP4 link found in the page source.")
+                await asyncio.sleep(3)
+                continue
+
+            video_url = mp4_matches[0]
+            self.db.log_trace(jid, f"[+] Extracted Direct Stream: {video_url}")
+
+            out_file = dl_dir / f"{jid}.mp4"
+            dl_headers = {"Referer": url}
+
+            self.db.log_trace(jid, "[*] Launching native chunked download...")
             try:
-                temp_session = AsyncSession(impersonate=browser, headers=headers)
-                temp_res = await temp_session.get(url, timeout=15)
-                if temp_res.status_code == 200:
-                    self.db.log_trace(jid, f"[+] SUCCESS! Connection secured using {browser}")
-                    successful_session = temp_session
-                    html = temp_res.text
-                    break
-            except Exception:
-                pass
+                res = await successful_session.get(video_url, headers=dl_headers, stream=True, http_version=2, timeout=20)
+                if res.status_code in [200, 206]:
+                    total_size = int(res.headers.get("Content-Length", 0))
+                    downloaded = 0
+                    last_ui_update = time.time()
 
-        if not successful_session:
-            self.db.log_trace(jid, "[-] All WAF bypass attempts failed.")
-            return False
+                    with open(out_file, 'wb') as f:
+                        async for chunk in res.aiter_content(chunk_size=1024*1024):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                now = time.time()
+                                if total_size and (now - last_ui_update > 2.0):
+                                    pct = (downloaded / total_size) * 100
+                                    await self.db.update_job(jid, pct=pct, stage=f"downloading | native | {downloaded//(1024*1024)}MB")
+                                    global _live_ui_text
+                                    _live_ui_text[jid] = f"[Native] {downloaded//(1024*1024)}MB / {total_size//(1024*1024)}MB ({pct:.1f}%)"
+                                    last_ui_update = now
+                    self.db.log_trace(jid, f"[+] Download complete! Saved to {out_file.name}.")
+                    return True
+                else:
+                    self.db.log_trace(jid, f"[-] CDN rejected the download with Status: {res.status_code}. Retrying...")
+                    await asyncio.sleep(3)
+                    
+            except Exception as e:
+                self.db.log_trace(jid, f"[-] Connection dropped during download: {e}. Retrying...")
+                await asyncio.sleep(3)
 
-        mp4_matches = re.findall(r'["\'](https?://[^"\']+\.mp4[^"\']*)["\']', html)
-        if not mp4_matches:
-            self.db.log_trace(jid, "[-] No MP4 link found in the page source.")
-            return False
-
-        video_url = mp4_matches[0]
-        self.db.log_trace(jid, f"[+] Extracted Direct Stream: {video_url}")
-
-        out_file = dl_dir / f"{jid}.mp4"
-        dl_headers = {"Referer": url}
-
-        self.db.log_trace(jid, "[*] Launching native chunked download to bypass CDN resets...")
-        try:
-            res = await successful_session.get(video_url, headers=dl_headers, stream=True, http_version=2)
-            if res.status_code in [200, 206]:
-                total_size = int(res.headers.get("Content-Length", 0))
-                downloaded = 0
-                last_ui_update = time.time()
-
-                with open(out_file, 'wb') as f:
-                    async for chunk in res.aiter_content(chunk_size=1024*1024):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            now = time.time()
-                            if total_size and (now - last_ui_update > 2.0):
-                                pct = (downloaded / total_size) * 100
-                                await self.db.update_job(jid, pct=pct, stage=f"downloading | native | {downloaded//(1024*1024)}MB")
-                                global _live_ui_text
-                                _live_ui_text[jid] = f"[Native] {downloaded//(1024*1024)}MB / {total_size//(1024*1024)}MB ({pct:.1f}%)"
-                                last_ui_update = now
-                self.db.log_trace(jid, f"[+] Download complete! Saved to {out_file.name}.")
-                return True
-            else:
-                self.db.log_trace(jid, f"[-] CDN rejected the download. Status: {res.status_code}")
-                return False
-        except Exception as e:
-            self.db.log_trace(jid, f"[-] Failed to download the video file: {e}")
-            return False
+        self.db.log_trace(jid, "[-] All 3 Direct MP4 extraction attempts failed.")
+        return False
             
     async def _extract_hornysimp_target(self, main_url: str, jid: str) -> str | None:
         from curl_cffi.requests import AsyncSession
