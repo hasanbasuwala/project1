@@ -840,14 +840,14 @@ class DownloaderEngine:
             self.db.log_trace(jid, f"[-] Failed to download the video file: {e}")
             return False
             
-    async def _extract_hornysimp_iframe(self, main_url: str, jid: str) -> str | None:
+    async def _extract_hornysimp_target(self, main_url: str, jid: str) -> str | None:
         from curl_cffi.requests import AsyncSession
         import re
         try:
             async with AsyncSession(impersonate="chrome") as session:
                 res = await session.get(main_url, timeout=30)
-                # Locates the nested hrnyvid or lulustream embed link
-                m = re.search(r'src=["\'](https?://[^"\']+(?:hrnyvid|lulustream)[^"\']+)["\']', res.text, re.IGNORECASE)
+                # Looks for BOTH href= (buttons) and src= (iframes) containing hrnyvid or lulustream
+                m = re.search(r'(?:href|src)=["\'](https?://[^"\']+(?:hrnyvid|lulustream)[^"\']+)["\']', res.text, re.IGNORECASE)
                 if m:
                     return m.group(1)
         except Exception as e:
