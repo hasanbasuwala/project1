@@ -3462,19 +3462,14 @@ import urllib.parse as urlparse
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 class RSSFeeder:
-    def __init__(self, db, pipeline, app, owner_id: int, target_urls: list):
+    def __init__(self, db, pipeline, app, owner_id: int):
         self.db = db
         self.pipeline = pipeline
         self.app = app
         self.owner_id = owner_id
         
-        # Normalize incoming target configurations
-        self.target_feeds = []
-        for item in target_urls:
-            if isinstance(item, str):
-                self.target_feeds.append({"url": item, "backfill_pages": 20})
-            else:
-                self.target_feeds.append({"url": item.get("url"), "backfill_pages": item.get("backfill_pages", 20)})
+        # Ingests purely from config.py
+        self.target_feeds = getattr(config, 'RSS_FEEDS', [])
                 
         self.history_file = BASE_DIR / "rss_history.txt"
         self.state_file = BASE_DIR / "rss_state.json" 
@@ -3487,9 +3482,9 @@ class RSSFeeder:
         state = self._get_state()
         changed = False
         for feed in self.target_feeds:
-            url = feed["url"]
-            if url not in state:
-                state[url] = False 
+            fid = feed.get("id")
+            if fid and fid not in state:
+                state[fid] = False 
                 changed = True
         if changed:
             with open(self.state_file, "w") as f:
@@ -3504,8 +3499,7 @@ class RSSFeeder:
             return {}
 
     def _load_history(self) -> set:
-        if not self.history_file.exists():
-            return set()
+        if not self.history_file.exists(): return set()
         with open(self.history_file, "r", encoding="utf-8") as f:
             return set(f.read().splitlines())
 
@@ -3515,37 +3509,24 @@ class RSSFeeder:
 
     def _parse_vk_playlists(self, title: str, models: list) -> str:
         tags = []
-        
-        # 1. Parse Title for Network and Actors (Perverzija uses: Network - Actor - Title)
         parts = re.split(r'\s*[-–—]\s*', title)
         
         if len(parts) >= 3:
-            # First part is the Production House/Network
             network = parts[0].strip().replace(" ", "")
             if network: tags.append(network)
-            
-            # Second part is the Actor(s)
             actor_part = parts[1].strip()
             raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', actor_part, flags=re.IGNORECASE)
             tags.extend([n.replace(" ", "") for n in raw_names if n.strip()])
-            
         elif len(parts) == 2:
-            # Fallback for generic Actor - Title
             actor_part = parts[0].strip()
             raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', actor_part, flags=re.IGNORECASE)
             tags.extend([n.replace(" ", "") for n in raw_names if n.strip()])
 
-        # 2. Append explicitly provided models (FreePornVideos explicitly provides these)
-        if models:
-            tags.extend([n.replace(" ", "") for n in models if n.strip()])
-            
-        # 3. Clean duplicates while preserving the visual order
+        if models: tags.extend([n.replace(" ", "") for n in models if n.strip()])
         clean_tags = list(dict.fromkeys(tags))
-        
         return ",".join(clean_tags) if clean_tags else "AutoRSS"
 
-    async def _get_last_page(self, url: str, domain: str) -> int:
-        """Dynamically scrapes the target site to find its absolute highest pagination integer."""
+    async def _get_last_page(self, url: str, rss_type: str) -> int:
         try:
             async with AsyncSession(impersonate="chrome") as session:
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -3555,23 +3536,23 @@ class RSSFeeder:
                 soup = BeautifulSoup(resp.text, "html.parser")
                 max_page = 1
                 
-                if domain == "freepornvideos":
+                if rss_type == "fpv_style":
                     last_btn = soup.select_one(".pagination .last a")
                     if last_btn:
                         m = re.search(r'/(\d+)/?$', last_btn.get("href", ""))
                         if m: max_page = int(m.group(1))
                         
-                elif domain == "perverzija":
+                elif rss_type == "wp_grid":
                     page_links = soup.select("a.page-numbers")
                     for link in page_links:
                         txt = link.get_text(strip=True).replace(',', '')
-                        if txt.isdigit():
-                            max_page = max(max_page, int(txt))
+                        if txt.isdigit(): max_page = max(max_page, int(txt))
                             
-                elif domain == "fpo":
-                    page_links = soup.select(".pagination a")
+                elif rss_type in ["fpo_style", "wp_article", "pt_cv"]:
+                    page_links = soup.select(".pagination a, .page-numbers, .pt-cv-pagination a")
                     for link in page_links:
-                        m = re.search(r'from_videos=(\d+)', link.get("href", ""))
+                        href = link.get("href", "")
+                        m = re.search(r'(?:/page/|from_videos=)(\d+)/?', href)
                         if m: max_page = max(max_page, int(m.group(1)))
                         
                 return max_page if max_page > 1 else 20
@@ -3579,7 +3560,7 @@ class RSSFeeder:
             logging.getLogger("stealth_bot").error(f"Auto-page detection failed for {url}: {e}")
             return 20
 
-    async def _fetch_profile(self, url: str, domain: str) -> list:
+    async def _fetch_profile(self, url: str, rss_type: str) -> list:
         try:
             async with AsyncSession(impersonate="chrome") as session:
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -3589,7 +3570,7 @@ class RSSFeeder:
                 soup = BeautifulSoup(resp.text, "html.parser")
                 entries = []
                 
-                if domain == "freepornvideos":
+                if rss_type == "fpv_style":
                     for item in soup.select("#list_videos_latest_videos_list_items .item"):
                         a_tag = item.select_one("a.thumb_title")
                         if not a_tag: continue
@@ -3597,20 +3578,18 @@ class RSSFeeder:
                         raw_link = a_tag.get("href", "").strip()
                         link = urlparse.urljoin(url, raw_link)
                         models = [tag.text.strip() for tag in item.select(".models .thumb_model span")]
-                        if title and link:
-                            entries.append({"title": title, "link": link, "models": models})
+                        if title and link: entries.append({"title": title, "link": link, "models": models})
                             
-                elif domain == "fpo":
+                elif rss_type == "fpo_style":
                     for item in soup.select("#list_videos_uploaded_videos_items .item"):
                         a_tag = item.select_one("a")
                         if not a_tag: continue
                         title = a_tag.get("title", "").strip()
                         raw_link = a_tag.get("href", "").strip()
                         link = urlparse.urljoin(url, raw_link)
-                        if title and link:
-                            entries.append({"title": title, "link": link, "models": []})
+                        if title and link: entries.append({"title": title, "link": link, "models": []})
 
-                elif domain == "perverzija":
+                elif rss_type == "wp_grid":
                     for block in soup.find_all("div", class_="col-md-3 col-sm-6 col-xs-6"):
                         head_tag = block.find(class_="item-head")
                         if not head_tag: continue
@@ -3619,8 +3598,27 @@ class RSSFeeder:
                         title = a_tag.get_text(strip=True)
                         raw_link = a_tag.get("href", "").strip()
                         link = urlparse.urljoin(url, raw_link)
-                        if title and link:
-                            entries.append({"title": title, "link": link, "models": []})
+                        if title and link: entries.append({"title": title, "link": link, "models": []})
+
+                elif rss_type == "wp_article":
+                    for article in soup.find_all("article", class_="video-preview-item"):
+                        a_tag = article.find("a")
+                        if not a_tag: continue
+                        title = a_tag.get("title", "").strip() 
+                        raw_link = a_tag.get("href", "").strip()
+                        link = urlparse.urljoin(url, raw_link)
+                        if title and link: entries.append({"title": title, "link": link, "models": []})
+
+                elif rss_type == "pt_cv":
+                    for block in soup.find_all("div", class_="pt-cv-content-item"):
+                        title_tag = block.find(class_="pt-cv-title")
+                        if not title_tag: continue
+                        a_tag = title_tag.find("a")
+                        if not a_tag: continue
+                        title = a_tag.get_text(strip=True)
+                        raw_link = a_tag.get("href", "").strip()
+                        link = urlparse.urljoin(url, raw_link)
+                        if title and link: entries.append({"title": title, "link": link, "models": []})
                             
                 return entries
         except Exception as e:
@@ -3628,24 +3626,24 @@ class RSSFeeder:
             return []
 
     async def _monitor_feed(self, feed_config: dict):
-        base_url = feed_config["url"]
+        base_url = feed_config.get("url")
+        feed_id = feed_config.get("id")
         backfill_setting = feed_config.get("backfill_pages", 20)
         
-        if "freepornvideos.xxx" in base_url:
-            domain = "freepornvideos"
-            page_builder = lambda b, p: f"{b.rstrip('/')}/{p}/"
-        elif "tube.perverzija.com" in base_url:
-            domain = "perverzija"
-            page_builder = lambda b, p: f"{b.rstrip('/')}/page/{p}/"
-        else: 
-            domain = "fpo"
-            page_builder = lambda b, p: f"{b}{'&' if '?' in b else '?'}from_videos={p}"
+        # Scrape configuration cleanly mapped from config.py
+        site_cfg = config.SITE_CONFIGS.get(feed_config.get("config_key"), {})
+        rss_type = site_cfg.get("rss_type", "default")
+        
+        if rss_type == "fpv_style": page_builder = lambda b, p: f"{b.rstrip('/')}/{p}/"
+        elif rss_type in ["wp_grid", "wp_article", "pt_cv"]: page_builder = lambda b, p: f"{b.rstrip('/')}/page/{p}/"
+        elif rss_type == "fpo_style": page_builder = lambda b, p: f"{b}{'&' if '?' in b else '?'}from_videos={p}"
+        else: page_builder = lambda b, p: f"{b}"
 
         while True:
             try:
-                # ── THE SWITCHBOARD CHECK ──
+                # ── FIXED SWITCHBOARD CHECK (Uses ID) ──
                 state = self._get_state()
-                if not state.get(base_url, False):
+                if not state.get(feed_id, False):
                     await asyncio.sleep(30)
                     continue
 
@@ -3656,7 +3654,7 @@ class RSSFeeder:
                 if needs_backfill:
                     if str(backfill_setting).lower() == "auto":
                         logging.getLogger("stealth_bot").info(f"🕵️ Auto-detecting total pages for {base_url}...")
-                        total_pages = await self._get_last_page(base_url, domain)
+                        total_pages = await self._get_last_page(base_url, rss_type)
                     else:
                         total_pages = int(backfill_setting)
                         
@@ -3668,7 +3666,7 @@ class RSSFeeder:
                 
                 for url in urls_to_scan:
                     logging.getLogger("stealth_bot").info(f"📡 Scanning RSS target: {url}")
-                    entries = await self._fetch_profile(url, domain)
+                    entries = await self._fetch_profile(url, rss_type)
                     
                     if not entries:
                         await asyncio.sleep(2)
@@ -3680,47 +3678,32 @@ class RSSFeeder:
                         models = entry['models']
                         
                         if link not in self._load_history():
-                            
                             async with self.global_feed_lock:
                                 while True:
                                     active_jobs = await self.db.get_active_jobs()
-                                    if len(active_jobs) == 0:
-                                        break 
+                                    if len(active_jobs) == 0: break 
                                     await asyncio.sleep(5)
                                 
                                 history = self._load_history()
-                                if link in history:
-                                    continue
+                                if link in history: continue
                                 
                                 jid = str(uuid.uuid4())[:8]
                                 playlists = self._parse_vk_playlists(title, models)
+                                tracker_id = None
                                 
-                                tracker_text = f"`[ ⚡ ] ＲＳＳ ＴＡＳＫ :` `{title[:30]}...`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (VK)`"
                                 try:
-                                    tracker = await self.app.send_message(
-                                        self.owner_id,
-                                        tracker_text,
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]])
-                                    )
+                                    tracker_text = f"`[ ⚡ ] ＲＳＳ ＴＡＳＫ :` `{title[:30]}...`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (VK)`"
+                                    tracker = await self.app.send_message(self.owner_id, tracker_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]]))
                                     tracker_id = tracker.id
-                                except Exception:
-                                    tracker_id = None
+                                except Exception: pass
                                 
                                 await self.db.create_job({
-                                    "id": jid, 
-                                    "url": link, 
-                                    "title": title[:128], 
-                                    "source": base_url, 
-                                    "quality": "auto",
-                                    "strategy": "GENERIC_FALLBACK",
-                                    "chat_id": self.owner_id, 
-                                    "tracker_id": tracker_id,
-                                    "destination": "vk", 
-                                    "playlist_name": playlists,
-                                    "caption": title
+                                    "id": jid, "url": link, "title": title[:128], "source": base_url, 
+                                    "quality": "auto", "strategy": "GENERIC_FALLBACK", "chat_id": self.owner_id, 
+                                    "tracker_id": tracker_id, "destination": "vk", "playlist_name": playlists, "caption": title
                                 })
                                 await self.pipeline.dl_q.put(jid)
-                                logging.getLogger("stealth_bot").info(f"✨ RSS Injected [{domain}]: {title[:30]} -> Playlists: {playlists}")
+                                logging.getLogger("stealth_bot").info(f"✨ RSS Injected [{feed_id}]: {title[:30]} -> Playlists: {playlists}")
                                 
                                 history.add(link)
                                 self._save_history(history)
@@ -3735,15 +3718,13 @@ class RSSFeeder:
                     logging.getLogger("stealth_bot").info(f"✅ Historical Backfill locked in for {base_url}")
                     
             except Exception as e:
-                logging.getLogger("stealth_bot").error(f"Error in {base_url} lane: {e}")
+                logging.getLogger("stealth_bot").error(f"Error in {feed_id} lane: {e}")
                 
             await asyncio.sleep(self.poll_interval)
 
     async def run_loop(self):
-        logging.getLogger("stealth_bot").info("🛰️ Autonomous RSS Engine initialized (Round-Robin Multi-Track).")
+        logging.getLogger("stealth_bot").info("🛰️ Autonomous RSS Engine initialized (Domain-Free Mode).")
         await asyncio.sleep(10) 
-        
-        # Launch independent tasks utilizing the dictionary mappings
         tasks = [asyncio.create_task(self._monitor_feed(feed)) for feed in self.target_feeds]
         await asyncio.gather(*tasks)
 
