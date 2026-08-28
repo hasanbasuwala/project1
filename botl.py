@@ -3704,6 +3704,11 @@ class RSSFeeder:
                     urls_to_scan = [base_url]
                 
                 for url in urls_to_scan:
+                    # ── LIVE PAUSE CHECK 1: Break out of pagination ──
+                    if not self._get_state().get(feed_id, False):
+                        logging.getLogger("stealth_bot").info(f"⏸️ Scan paused mid-run for {feed_id}.")
+                        break 
+                        
                     logging.getLogger("stealth_bot").info(f"📡 Scanning RSS target: {url}")
                     entries = await self._fetch_profile(url, rss_type)
                     
@@ -3712,6 +3717,10 @@ class RSSFeeder:
                         continue
                         
                     for entry in reversed(entries):
+                        # ── LIVE PAUSE CHECK 2: Break out of entry parsing ──
+                        if not self._get_state().get(feed_id, False):
+                            break 
+                            
                         link = entry['link']
                         title = entry['title']
                         models = entry['models']
@@ -3719,12 +3728,17 @@ class RSSFeeder:
                         if link not in self._load_history():
                             async with self.global_feed_lock:
                                 while True:
+                                    # ── LIVE PAUSE CHECK 3: Break the queue-waiting lock ──
+                                    if not self._get_state().get(feed_id, False):
+                                        break
+                                        
                                     active_jobs = await self.db.get_active_jobs()
                                     if len(active_jobs) == 0: break 
                                     await asyncio.sleep(5)
                                 
-                                history = self._load_history()
-                                if link in history: continue
+                                # Safety catch: if we aborted the wait because of a pause, stop the injection!
+                                if not self._get_state().get(feed_id, False):
+                                    break
                                 
                                 jid = str(uuid.uuid4())[:8]
                                 site_key = feed_config.get("config_key", "default")
@@ -3750,7 +3764,8 @@ class RSSFeeder:
                                 
                             await asyncio.sleep(10)
                 
-                if needs_backfill:
+                # Only write the backfill marker if the loop actually finished without being paused
+                if needs_backfill and self._get_state().get(feed_id, False):
                     async with self.global_feed_lock:
                         history = self._load_history()
                         history.add(marker)
