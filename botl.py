@@ -448,6 +448,11 @@ class VKPlaylistManager:
             clean_desc = (description or "").strip()
             if clean_desc: kwargs['description'] = clean_desc
 
+            # ── 1. NATIVE HOOKING (100% Bulletproof Primary Playlist) ──
+            if album_ids and len(album_ids) > 0:
+                kwargs['album_id'] = album_ids[0]
+                db.log_trace(jid, f"[VK] Hooked Primary Playlist ID {album_ids[0]} directly into VK Save payload.")
+
             try:
                 save_resp = self._vk.video.save(**kwargs)
             except vk_api.exceptions.ApiError as e:
@@ -471,25 +476,29 @@ class VKPlaylistManager:
             if 'video_hash' not in upload_result and 'size' not in upload_result:
                 raise RuntimeError(f"VK File stream rejected: {upload_result}")
 
-            # ── BULLETPROOF POLLING LOOP ──
-            if album_ids and vid_id and own_id:
-                db.log_trace(jid, f"[VK] File transferred. Initiating aggressive playlist assignment polling...")
+            db.log_trace(jid, f"[VK] File successfully ingested by VK servers. Video ID: {vid_id}")
+
+            # ── 2. STATE VERIFICATION (For Secondary Playlists Only) ──
+            if album_ids and len(album_ids) > 1 and vid_id and own_id:
+                db.log_trace(jid, f"[VK] Video requires {len(album_ids)-1} additional playlists. Initiating state verification...")
                 
-                for a_id in album_ids:
-                    success = False
-                    # Hammer the API every 5 seconds for up to 60 seconds
-                    for attempt in range(1, 13):
-                        try:
-                            self._vk.video.addToAlbum(owner_id=own_id, video_id=vid_id, album_id=a_id)
-                            db.log_trace(jid, f"[VK] [+] Successfully mapped video to Playlist ID: {a_id} on attempt {attempt}!")
-                            success = True
+                # Wait for VK to finish processing before mapping secondary albums
+                for check in range(1, 15):
+                    try:
+                        status = self._vk.video.get(owner_id=own_id, videos=f"{own_id}_{vid_id}")
+                        items = status.get("items", [])
+                        if items and items[0].get("processing") != 1:
+                            # Processing flag is gone; safe to map
+                            for extra_id in album_ids[1:]:
+                                self._vk.video.addToAlbum(owner_id=own_id, video_id=vid_id, album_id=extra_id)
+                                db.log_trace(jid, f"[VK] [+] Successfully mapped to Secondary Playlist ID: {extra_id}")
                             break
-                        except Exception as e:
-                            db.log_trace(jid, f"[VK] [!] Attempt {attempt}/12 rejected: VK is still indexing... retrying in 5s.")
-                            time.sleep(5)
-                            
-                    if not success:
-                        db.log_trace(jid, f"[VK] ❌ CRITICAL: Failed to map to Playlist {a_id} after 60 seconds of polling.")
+                        else:
+                            db.log_trace(jid, f"[VK] Video is still encoding. Checking again in 10s (Attempt {check}/15)...")
+                            time.sleep(10)
+                    except Exception as e:
+                        db.log_trace(jid, f"[VK] Verification error: {e}. Retrying...")
+                        time.sleep(10)
 
             return save_resp
 
