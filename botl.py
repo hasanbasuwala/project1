@@ -367,6 +367,9 @@ def parse_link_message(text: str, url: str) -> dict:
 # ═══════════════════════════════════════════════════════════════════════
 # CHAPTER 5 — VK PLAYLIST & UPLOAD MANAGER 
 # ═══════════════════════════════════════════════════════════════════════
+import asyncio
+import vk_api
+from pathlib import Path
 
 class VKPlaylistManager:
     def __init__(self, token: str | None):
@@ -376,7 +379,7 @@ class VKPlaylistManager:
         self._album_cache: dict[str, int] = {}  
         self._cache_loaded = False
 
-    async def _load_album_cache(self, jid: str, db: JobScheduler):
+    async def _load_album_cache(self, jid: str, db):
         if self._cache_loaded or not self._vk:
             return
         try:
@@ -387,7 +390,6 @@ class VKPlaylistManager:
                 if not items: break
                 
                 for item in items:
-                    # Strip all casing and tags for bulletproof cache mapping
                     key = item.get('title', '').replace('#', '').strip().lower()
                     self._album_cache[key] = item['id']
                     
@@ -395,34 +397,43 @@ class VKPlaylistManager:
                 if offset >= albums.get('count', 0): break
                 
             self._cache_loaded = True
+            db.log_trace(jid, f"[VK] Loaded {len(self._album_cache)} playlists into memory cache.")
         except Exception as e:
-            db.log_trace(jid, TXT.VK_PLAYLIST_FAILED.format(err=f"cache load: {e}"))
+            db.log_trace(jid, f"[VK] Error loading playlist cache: {e}")
 
-    async def resolve_playlist(self, raw_name: str, jid: str, db: JobScheduler) -> int | None:
+    async def resolve_playlist(self, raw_name: str, jid: str, db) -> int | None:
         if not self._vk: return None
 
         clean_name = raw_name.replace('#', '').strip()
+        if not clean_name: return None
+        
         key = clean_name.lower()
 
-        db.log_trace(jid, TXT.VK_PLAYLIST_RESOLVING.format(name=clean_name))
+        db.log_trace(jid, f"[VK] Resolving playlist: '{clean_name}'")
         await self._load_album_cache(jid, db)
 
         if key in self._album_cache:
             album_id = self._album_cache[key]
-            db.log_trace(jid, TXT.VK_PLAYLIST_FOUND.format(name=clean_name, album_id=album_id))
+            db.log_trace(jid, f"[VK] Playlist '{clean_name}' found in cache (ID: {album_id}).")
             return album_id
 
         try:
+            db.log_trace(jid, f"[VK] Playlist '{clean_name}' not found. Asking VK to create new album...")
             created = await asyncio.to_thread(self._vk.video.addAlbum, title=clean_name)
             album_id = created.get('album_id')
-            self._album_cache[key] = album_id
-            db.log_trace(jid, TXT.VK_PLAYLIST_CREATED.format(name=clean_name, album_id=album_id))
-            return album_id
+            
+            if album_id:
+                self._album_cache[key] = album_id
+                db.log_trace(jid, f"[VK] Playlist '{clean_name}' successfully created (ID: {album_id}).")
+                return album_id
+            else:
+                db.log_trace(jid, f"[VK] API returned empty album_id for '{clean_name}'. Response: {created}")
+                return None
         except Exception as e:
-            db.log_trace(jid, TXT.VK_PLAYLIST_FAILED.format(err=str(e)[:200]))
+            db.log_trace(jid, f"[VK] Failed to create playlist '{clean_name}': {e}")
             return None
 
-    async def upload_video(self, file_path: Path, title: str, description: str, album_ids: list[int] | None, jid: str, db: JobScheduler) -> dict:
+    async def upload_video(self, file_path: Path, title: str, description: str, album_ids: list[int] | None, jid: str, db) -> dict:
         if not self._session:
             raise RuntimeError("VK upload unavailable: vk_api not installed or VK_TOKEN missing.")
 
@@ -437,9 +448,7 @@ class VKPlaylistManager:
             clean_desc = (description or "").strip()
             if clean_desc: kwargs['description'] = clean_desc
 
-            if album_ids and len(album_ids) > 0:
-                kwargs['album_id'] = album_ids[0]
-
+            # We DO NOT pass album_id here anymore to avoid VK's silent assignment bug.
             try:
                 save_resp = self._vk.video.save(**kwargs)
             except vk_api.exceptions.ApiError as e:
@@ -463,21 +472,23 @@ class VKPlaylistManager:
             if 'video_hash' not in upload_result and 'size' not in upload_result:
                 raise RuntimeError(f"VK File stream rejected: {upload_result}")
 
-            if album_ids and len(album_ids) > 1 and vid_id and own_id:
-                db.log_trace(jid, "[VK] Waiting 3 seconds for VK to process before assigning extra playlists...")
-                time.sleep(3) 
+            # ── EXPLICIT POST-UPLOAD PLAYLIST MAPPING ──
+            if album_ids and vid_id and own_id:
+                db.log_trace(jid, f"[VK] Upload complete. Waiting 4 seconds for VK index before assigning {len(album_ids)} playlist(s)...")
+                time.sleep(4) 
                 
-                for a_id in album_ids[1:]:
+                for a_id in album_ids:
                     try:
                         self._vk.video.addToAlbum(owner_id=own_id, video_id=vid_id, album_id=a_id)
+                        db.log_trace(jid, f"[VK] [+] Successfully mapped video to Playlist ID: {a_id}")
                     except Exception as e:
-                        db.log_trace(jid, f"[VK] Album assignment warning for extra album {a_id}: {e}")
+                        db.log_trace(jid, f"[VK] [-] Failed to map video to Playlist {a_id}: {e}")
 
             return save_resp
 
-        db.log_trace(jid, TXT.VK_UPLOAD_START)
+        db.log_trace(jid, "Initializing VK Upload Sequence...")
         result = await asyncio.to_thread(_do_upload)
-        db.log_trace(jid, TXT.VK_UPLOAD_DONE.format(result="Success"))
+        db.log_trace(jid, "VK Upload Sequence Completed Successfully.")
         return result
         
 # ═══════════════════════════════════════════════════════════════════════
