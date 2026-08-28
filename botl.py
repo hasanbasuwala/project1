@@ -3758,7 +3758,7 @@ async def main():
     
     # ── INITIALIZE RSS FEEDER ──
     # ── INITIALIZE RSS FEEDER ──
-    rss_engine = RSSFeeder(db, pipeline, app, OWNER_ID, RSS_TARGET_URLS)
+    rss_engine = RSSFeeder(db, pipeline, app, OWNER_ID)
 
     setup_router(app, db, pipeline, vk_manager)
 
