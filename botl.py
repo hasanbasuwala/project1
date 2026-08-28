@@ -839,6 +839,20 @@ class DownloaderEngine:
         except Exception as e:
             self.db.log_trace(jid, f"[-] Failed to download the video file: {e}")
             return False
+            
+    async def _extract_hornysimp_iframe(self, main_url: str, jid: str) -> str | None:
+        from curl_cffi.requests import AsyncSession
+        import re
+        try:
+            async with AsyncSession(impersonate="chrome") as session:
+                res = await session.get(main_url, timeout=30)
+                # Locates the nested hrnyvid or lulustream embed link
+                m = re.search(r'src=["\'](https?://[^"\']+(?:hrnyvid|lulustream)[^"\']+)["\']', res.text, re.IGNORECASE)
+                if m:
+                    return m.group(1)
+        except Exception as e:
+            self.db.log_trace(jid, f"HornySimp wrapper extraction failed: {e}")
+        return None
 
     async def _extract_and_download_lulu(self, url: str, jid: str, dl_dir: Path) -> bool:
         """Handles Lulustream and Hrnyvid via JS unpacking and fragment compilation."""
