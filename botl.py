@@ -120,7 +120,7 @@ VK_PASSWORD = getattr(config, "VK_PASSWORD", None)
 VK_TOKEN = getattr(config, "VK_TOKEN", None)
 # --- RSS CONFIGURATION ---
 # Uses getattr so the bot doesn't crash if the variable is missing from config.py
-RSS_TARGET_URLS = getattr(config, "RSS_TARGET_URLS", [])
+from config import RSS_FEEDS, SITE_CONFIGS
 # --------------------------------------
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
