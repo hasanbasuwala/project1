@@ -846,8 +846,9 @@ class DownloaderEngine:
         try:
             async with AsyncSession(impersonate="chrome") as session:
                 res = await session.get(main_url, timeout=30)
-                # Looks for BOTH href= (buttons) and src= (iframes) containing hrnyvid or lulustream
-                m = re.search(r'(?:href|src)=["\'](https?://[^"\']+(?:hrnyvid|lulustream)[^"\']+)["\']', res.text, re.IGNORECASE)
+                # ── FIXED REGEX ──
+                # Allows immediate domain matching and checks data-src for lazy-loaded iframes
+                m = re.search(r'(?:href|src|data-src)=["\'](https?://(?:www\.)?(?:hrnyvid|lulustream)[^"\']+)["\']', res.text, re.IGNORECASE)
                 if m:
                     return m.group(1)
         except Exception as e:
