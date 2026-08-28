@@ -947,62 +947,58 @@ class DownloaderEngine:
     async def execute(self, job_data: dict):
         jid, url, strategy, quality = job_data['id'], job_data['url'], job_data['strategy'], job_data['quality']
 
-        if "vk.ru" in url.lower():
-            url = re.sub(r'vk\.ru', 'vk.com', url, flags=re.IGNORECASE)
-            self.db.log_trace(jid, f"Normalized vk.ru alias to {url}")
+        # ── DOMAIN-AGNOSTIC ROUTER ──
+        # Identifies the engine strategy using config.py mappings instead of hardcoded strings
+        dl_type = "default"
+        for site_key, site_data in config.SITE_CONFIGS.items():
+            if any(d in url.lower() for d in site_data.get("domains", [])):
+                dl_type = site_data.get("dl_type", "default")
+                break
 
-        if any(domain in url.lower() for domain in ["vk.com", "vkvideo.ru"]) and VK_TOKEN:
-            self.db.log_trace(jid, "VK target detected. Querying VK API backend with token...")
-            extracted_player = await asyncio.to_thread(self._extract_vk_api, url, jid)
-            if extracted_player:
-                self.db.log_trace(jid, f"VK API Token bypass successful! Rerouting payload URL to: {extracted_player}")
-                url = extracted_player
-
-        dl_dir = JOBS_DIR / f"JOB_{jid}" / "dl"
-
-        self.db.log_trace(jid, f"Download Orchestrator engaged. Strategy: {strategy}")
+        self.db.log_trace(jid, f"Download Orchestrator engaged. Mainframe Route: {dl_type.upper()}")
 
         if strategy == "TELEGRAM":
             async def tg_prog(c, t):
                 if t: await self.db.update_job(jid, pct=(c * 100 / t))
-            await self.app.download_media(url, file_name=str(dl_dir / f"{jid}.mp4"), progress=tg_prog)
+            await self.app.download_media(url, file_name=str(JOBS_DIR / f"JOB_{jid}" / "dl" / f"{jid}.mp4"), progress=tg_prog)
             return
 
+        dl_dir = JOBS_DIR / f"JOB_{jid}" / "dl"
         if strategy in ["MAGNET", "DIRECT_MP4"]:
             await self._run_aria(url, jid, dl_dir)
             return
 
-        # ── DEDICATED EXTRACTOR: PERVERZIJA / XTREMESTREAM ──
-        if "perverzija.com" in url.lower() or "xtremestream" in url.lower():
-            self.db.log_trace(jid, "Perverzija/Xtremestream target detected. Running dedicated extractor...")
+        # ── MODULAR EXTRACTOR EXECUTION ──
+        if dl_type == "vk_api" and VK_TOKEN:
+            self.db.log_trace(jid, "Target detected. Querying API backend with token...")
+            extracted_player = await asyncio.to_thread(self._extract_vk_api, url, jid)
+            if extracted_player:
+                self.db.log_trace(jid, f"API Token bypass successful! Rerouting payload URL.")
+                url = extracted_player
+                
+        elif dl_type == "perverzija_iframe":
             stream_url, referer = await self._extract_perverzija_stream(url, jid)
             if stream_url:
                 custom_opts = {"http_headers": {"Referer": referer}, "concurrent_fragment_downloads": 4}
                 try:
-                    self.db.log_trace(jid, "Executing yt-dlp on extracted M3U8 stream...")
                     await asyncio.to_thread(self._execute_ytdlp, stream_url, jid, dl_dir, custom_opts)
                     valid_files = [f for f in dl_dir.rglob("*") if f.is_file() and f.suffix.lower() in [".mp4", ".mkv", ".ts"]]
                     if valid_files: return
                 except Exception as e:
                     self.db.log_trace(jid, f"Dedicated extractor yt-dlp failed: {e}")
+                    
+        elif dl_type == "hornysimp_wrapper":
+            lulu_url = await self._extract_hornysimp_target(url, jid)
+            if lulu_url:
+                if await self._extract_and_download_lulu(lulu_url, jid, dl_dir): return
+                
+        elif dl_type == "lulu_unpack":
+            if await self._extract_and_download_lulu(url, jid, dl_dir): return
+            
+        elif dl_type == "direct_mp4":
+            if await self._extract_and_download_direct_mp4(url, jid, dl_dir): return
 
-        # ── DEDICATED EXTRACTOR: LULUSTREAM / HRNYVID ──
-        if "lulustream" in url.lower() or "hrnyvid" in url.lower():
-            self.db.log_trace(jid, "Lulustream/Hrnyvid target detected. Running native JS unpacker and downloader...")
-            if await self._extract_and_download_lulu(url, jid, dl_dir):
-                return
-            else:
-                self.db.log_trace(jid, "Dedicated extraction failed, falling back to Playwright...")
-
-        # ── DEDICATED EXTRACTOR: PORNEEC / FPO ──
-        if "porneec" in url.lower() or "fpo.xxx" in url.lower():
-            self.db.log_trace(jid, "Porneec/FPO target detected. Running native chunked downloader...")
-            if await self._extract_and_download_direct_mp4(url, jid, dl_dir):
-                return
-            else:
-                self.db.log_trace(jid, "Dedicated extraction failed, falling back to Playwright...")
-
-        # ... The rest of the execute function stays the same (Playwright, etc.) ...
+        # ... The rest of the execute function stays the same (Playwright Fallback, etc.) ...
         playwright_data = self._load_cached_payload(dl_dir)
 
         if not playwright_data:
