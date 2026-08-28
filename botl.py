@@ -365,8 +365,7 @@ def parse_link_message(text: str, url: str) -> dict:
     return {"title": title, "playlist_name": playlist_name, "caption": caption}
   
 # ═══════════════════════════════════════════════════════════════════════
-# CHAPTER 5 — VK PLAYLIST & UPLOAD MANAGER (NEW)
-# Playlists are created under the VK_TOKEN owner's own account (no group_id).
+# CHAPTER 5 — VK PLAYLIST & UPLOAD MANAGER 
 # ═══════════════════════════════════════════════════════════════════════
 
 class VKPlaylistManager:
@@ -374,28 +373,35 @@ class VKPlaylistManager:
         self.available = bool(vk_api and token)
         self._session = vk_api.VkApi(token=token) if self.available else None
         self._vk = self._session.get_api() if self._session else None
-        self._album_cache: dict[str, int] = {}  # lowercase playlist name -> album_id
+        self._album_cache: dict[str, int] = {}  
         self._cache_loaded = False
 
     async def _load_album_cache(self, jid: str, db: JobScheduler):
         if self._cache_loaded or not self._vk:
             return
         try:
-            albums = await asyncio.to_thread(self._vk.video.getAlbums, count=200)
-            for item in albums.get('items', []):
-                self._album_cache[item.get('title', '').strip().lower()] = item['id']
+            offset = 0
+            while True:
+                albums = await asyncio.to_thread(self._vk.video.getAlbums, count=100, offset=offset)
+                items = albums.get('items', [])
+                if not items: break
+                
+                for item in items:
+                    # Strip all casing and tags for bulletproof cache mapping
+                    key = item.get('title', '').replace('#', '').strip().lower()
+                    self._album_cache[key] = item['id']
+                    
+                offset += 100
+                if offset >= albums.get('count', 0): break
+                
             self._cache_loaded = True
         except Exception as e:
             db.log_trace(jid, TXT.VK_PLAYLIST_FAILED.format(err=f"cache load: {e}"))
 
     async def resolve_playlist(self, raw_name: str, jid: str, db: JobScheduler) -> int | None:
-        """Case-insensitive lookup of an existing playlist by name; creates it
-        (with the '#' stripped) if no match is found. Returns the album_id,
-        or None if VK isn't configured / the call fails."""
-        if not self._vk:
-            return None
+        if not self._vk: return None
 
-        clean_name = raw_name.lstrip('#').strip()
+        clean_name = raw_name.replace('#', '').strip()
         key = clean_name.lower()
 
         db.log_trace(jid, TXT.VK_PLAYLIST_RESOLVING.format(name=clean_name))
@@ -417,30 +423,24 @@ class VKPlaylistManager:
             return None
 
     async def upload_video(self, file_path: Path, title: str, description: str, album_ids: list[int] | None, jid: str, db: JobScheduler) -> dict:
-        """Bypasses vk_api.VkUpload to manually orchestrate the upload sequence..."""
         if not self._session:
             raise RuntimeError("VK upload unavailable: vk_api not installed or VK_TOKEN missing.")
 
         def _do_upload():
             import requests
-            import time # Added for the processing delay
+            import time 
 
-            # 1. Sanitize metadata and request the upload URL directly
             kwargs = {}
             clean_title = (title or "").strip()
-            if clean_title:
-                kwargs['name'] = clean_title[:200]
+            if clean_title: kwargs['name'] = clean_title[:200]
             
             clean_desc = (description or "").strip()
-            if clean_desc:
-                kwargs['description'] = clean_desc
+            if clean_desc: kwargs['description'] = clean_desc
 
-            # NATIVE FIX: Tell VK to put it in the first playlist automatically!
             if album_ids and len(album_ids) > 0:
                 kwargs['album_id'] = album_ids[0]
 
             try:
-                # Ask VK for the upload server
                 save_resp = self._vk.video.save(**kwargs)
             except vk_api.exceptions.ApiError as e:
                 if e.code == 10:
@@ -456,7 +456,6 @@ class VKPlaylistManager:
             if not upload_url:
                 raise RuntimeError(f"Failed to retrieve upload URL from VK. Response: {save_resp}")
 
-            # 2. Push the payload using standard requests
             db.log_trace(jid, "[VK] Upload URL acquired. Streaming payload to VK servers...")
             with open(file_path, 'rb') as f:
                 upload_result = requests.post(upload_url, files={'video_file': f}).json()
@@ -464,19 +463,13 @@ class VKPlaylistManager:
             if 'video_hash' not in upload_result and 'size' not in upload_result:
                 raise RuntimeError(f"VK File stream rejected: {upload_result}")
 
-            # 3. Post-upload Album Assignment (For ANY EXTRA playlists)
             if album_ids and len(album_ids) > 1 and vid_id and own_id:
                 db.log_trace(jid, "[VK] Waiting 3 seconds for VK to process before assigning extra playlists...")
-                time.sleep(3) # Give VK a moment to finalize the video
+                time.sleep(3) 
                 
-                # Loop through any remaining albums
                 for a_id in album_ids[1:]:
                     try:
-                        self._vk.video.addToAlbum(
-                            owner_id=own_id,
-                            video_id=vid_id,
-                            album_id=a_id
-                        )
+                        self._vk.video.addToAlbum(owner_id=own_id, video_id=vid_id, album_id=a_id)
                     except Exception as e:
                         db.log_trace(jid, f"[VK] Album assignment warning for extra album {a_id}: {e}")
 
