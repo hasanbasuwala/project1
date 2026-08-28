@@ -3630,8 +3630,8 @@ class RSSFeeder:
         feed_id = feed_config.get("id")
         backfill_setting = feed_config.get("backfill_pages", 20)
         
-        # Scrape configuration cleanly mapped from config.py
-        site_cfg = config.SITE_CONFIGS.get(feed_config.get("config_key"), {})
+        # <--- Direct reference
+        site_cfg = SITE_CONFIGS.get(feed_config.get("config_key"), {})
         rss_type = site_cfg.get("rss_type", "default")
         
         if rss_type == "fpv_style": page_builder = lambda b, p: f"{b.rstrip('/')}/{p}/"
