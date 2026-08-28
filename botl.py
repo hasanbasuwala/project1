@@ -962,9 +962,9 @@ class DownloaderEngine:
         jid, url, strategy, quality = job_data['id'], job_data['url'], job_data['strategy'], job_data['quality']
 
         # ── DOMAIN-AGNOSTIC ROUTER ──
-        # Identifies the engine strategy using config.py mappings instead of hardcoded strings
         dl_type = "default"
-        for site_key, site_data in config.SITE_CONFIGS.items():
+        # <--- Direct reference
+        for site_key, site_data in SITE_CONFIGS.items():
             if any(d in url.lower() for d in site_data.get("domains", [])):
                 dl_type = site_data.get("dl_type", "default")
                 break
