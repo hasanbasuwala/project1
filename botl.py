@@ -3469,8 +3469,7 @@ class RSSFeeder:
         self.app = app
         self.owner_id = owner_id
         
-        # Ingests purely from config.py
-        self.target_feeds = getattr(config, 'RSS_FEEDS', [])
+        self.target_feeds = RSS_FEEDS # <--- Direct reference
                 
         self.history_file = BASE_DIR / "rss_history.txt"
         self.state_file = BASE_DIR / "rss_state.json" 
