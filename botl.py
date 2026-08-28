@@ -3091,23 +3091,11 @@ def save_rss_state(state):
 
 def build_rss_keyboard(state_dict):
     buttons = []
-    for i, feed in enumerate(RSS_TARGET_URLS):
-        # Support both the new dict format and old string format
-        if isinstance(feed, dict):
-            url = feed["url"]
-            # Use the custom name if provided, otherwise extract the domain
-            display_name = feed.get("name")
-            if not display_name:
-                try: display_name = url.split("/")[2].replace("www.", "")
-                except: display_name = f"Feed {i}"
-        else:
-            url = feed
-            try: display_name = url.split("/")[2].replace("www.", "")
-            except: display_name = f"Feed {i}"
-            
-        is_active = state_dict.get(url, False)
+    for i, feed in enumerate(RSS_FEEDS):
+        fid = feed.get("id", f"feed_{i}")
+        display_name = feed.get("name", feed.get("url", "Unknown Feed"))
+        is_active = state_dict.get(fid, False)
         status_icon = "🟢" if is_active else "🔴"
-        
         buttons.append([InlineKeyboardButton(f"{status_icon} | {display_name}", callback_data=f"rss_toggle|{i}")])
         
     buttons.append([InlineKeyboardButton("🔄 Refresh Status", callback_data="rss_refresh")])
