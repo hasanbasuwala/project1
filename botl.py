@@ -448,7 +448,6 @@ class VKPlaylistManager:
             clean_desc = (description or "").strip()
             if clean_desc: kwargs['description'] = clean_desc
 
-            # We DO NOT pass album_id here anymore to avoid VK's silent assignment bug.
             try:
                 save_resp = self._vk.video.save(**kwargs)
             except vk_api.exceptions.ApiError as e:
@@ -472,17 +471,25 @@ class VKPlaylistManager:
             if 'video_hash' not in upload_result and 'size' not in upload_result:
                 raise RuntimeError(f"VK File stream rejected: {upload_result}")
 
-            # ── EXPLICIT POST-UPLOAD PLAYLIST MAPPING ──
+            # ── BULLETPROOF POLLING LOOP ──
             if album_ids and vid_id and own_id:
-                db.log_trace(jid, f"[VK] Upload complete. Waiting 4 seconds for VK index before assigning {len(album_ids)} playlist(s)...")
-                time.sleep(4) 
+                db.log_trace(jid, f"[VK] File transferred. Initiating aggressive playlist assignment polling...")
                 
                 for a_id in album_ids:
-                    try:
-                        self._vk.video.addToAlbum(owner_id=own_id, video_id=vid_id, album_id=a_id)
-                        db.log_trace(jid, f"[VK] [+] Successfully mapped video to Playlist ID: {a_id}")
-                    except Exception as e:
-                        db.log_trace(jid, f"[VK] [-] Failed to map video to Playlist {a_id}: {e}")
+                    success = False
+                    # Hammer the API every 5 seconds for up to 60 seconds
+                    for attempt in range(1, 13):
+                        try:
+                            self._vk.video.addToAlbum(owner_id=own_id, video_id=vid_id, album_id=a_id)
+                            db.log_trace(jid, f"[VK] [+] Successfully mapped video to Playlist ID: {a_id} on attempt {attempt}!")
+                            success = True
+                            break
+                        except Exception as e:
+                            db.log_trace(jid, f"[VK] [!] Attempt {attempt}/12 rejected: VK is still indexing... retrying in 5s.")
+                            time.sleep(5)
+                            
+                    if not success:
+                        db.log_trace(jid, f"[VK] ❌ CRITICAL: Failed to map to Playlist {a_id} after 60 seconds of polling.")
 
             return save_resp
 
