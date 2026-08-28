@@ -3703,10 +3703,11 @@ class RSSFeeder:
                                 await self.db.create_job({
                                     "id": jid, "url": link, "title": title[:128], "source": base_url, 
                                     "quality": "auto", "strategy": "GENERIC_FALLBACK", "chat_id": self.owner_id, 
-                                    "tracker_id": tracker_id, "destination": "vk", "playlist_name": playlists, "caption": title
+                                    "tracker_id": tracker_id, "destination": "vk", "playlist_name": playlists, 
+                                    "caption": clean_caption  # <--- Using the cleaned version here
                                 })
                                 await self.pipeline.dl_q.put(jid)
-                                logging.getLogger("stealth_bot").info(f"✨ RSS Injected [{feed_id}]: {title[:30]} -> Playlists: {playlists}")
+                                logging.getLogger("stealth_bot").info(f"✨ RSS Injected [{feed_id}]: {clean_caption[:30]} -> Playlists: {playlists}")
                                 
                                 history.add(link)
                                 self._save_history(history)
