@@ -3473,6 +3473,7 @@ import logging
 import json
 import urllib.parse as urlparse
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from config import RSS_FEEDS, SITE_CONFIGS
 
 class RSSFeeder:
     def __init__(self, db, pipeline, app, owner_id: int):
@@ -3481,7 +3482,7 @@ class RSSFeeder:
         self.app = app
         self.owner_id = owner_id
         
-        self.target_feeds = RSS_FEEDS # <--- Direct reference
+        self.target_feeds = RSS_FEEDS
                 
         self.history_file = BASE_DIR / "rss_history.txt"
         self.state_file = BASE_DIR / "rss_state.json" 
@@ -3519,24 +3520,43 @@ class RSSFeeder:
         with open(self.history_file, "w", encoding="utf-8") as f:
             f.write("\n".join(history_set))
 
-    def _parse_vk_playlists(self, title: str, models: list) -> str:
+    def _parse_metadata(self, raw_title: str, models: list, site_key: str) -> tuple[str, str]:
         tags = []
-        parts = re.split(r'\s*[-–—]\s*', title)
+        clean_title = raw_title.strip()
         
-        if len(parts) >= 3:
-            network = parts[0].strip().replace(" ", "")
-            if network: tags.append(network)
-            actor_part = parts[1].strip()
-            raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', actor_part, flags=re.IGNORECASE)
-            tags.extend([n.replace(" ", "") for n in raw_names if n.strip()])
-        elif len(parts) == 2:
-            actor_part = parts[0].strip()
-            raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', actor_part, flags=re.IGNORECASE)
-            tags.extend([n.replace(" ", "") for n in raw_names if n.strip()])
+        if site_key == "site_porneec":
+            m = re.match(r'^\[(.*?)\]\s*(.*)', clean_title)
+            if m:
+                tags.append(m.group(1).replace(" ", ""))
+                clean_title = m.group(2)
+            parts = re.split(r'\s*[-–—]\s*', clean_title)
+            if len(parts) > 1:
+                raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', parts[0], flags=re.IGNORECASE)
+                tags.extend([n.replace(" ", "") for n in raw_names if n.strip() and len(n.split()) <= 3])
+                
+        elif site_key == "site_perverzija":
+            parts = re.split(r'\s*[-–—]\s*', clean_title)
+            if len(parts) >= 3:
+                tags.append(parts[0].strip().replace(" ", "")) 
+                raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', parts[1], flags=re.IGNORECASE)
+                tags.extend([n.replace(" ", "") for n in raw_names if n.strip()])
+            elif len(parts) == 2:
+                raw_names = re.split(r'\s*&\s*|\s*,\s*|\s+and\s+', parts[0], flags=re.IGNORECASE)
+                tags.extend([n.replace(" ", "") for n in raw_names if n.strip()])
 
-        if models: tags.extend([n.replace(" ", "") for n in models if n.strip()])
+        elif site_key == "site_hornysimp":
+            tags.append("HornySimp") 
+            
+        elif site_key == "site_fpv":
+            if models: tags.extend([n.replace(" ", "") for n in models if n.strip()])
+
+        if models and site_key != "site_fpv": 
+            tags.extend([n.replace(" ", "") for n in models if n.strip()])
+            
         clean_tags = list(dict.fromkeys(tags))
-        return ",".join(clean_tags) if clean_tags else "AutoRSS"
+        playlist_string = ",".join(clean_tags) if clean_tags else "AutoRSS"
+        
+        return clean_title, playlist_string
 
     async def _get_last_page(self, url: str, rss_type: str) -> int:
         try:
@@ -3642,7 +3662,6 @@ class RSSFeeder:
         feed_id = feed_config.get("id")
         backfill_setting = feed_config.get("backfill_pages", 20)
         
-        # <--- Direct reference
         site_cfg = SITE_CONFIGS.get(feed_config.get("config_key"), {})
         rss_type = site_cfg.get("rss_type", "default")
         
@@ -3653,7 +3672,6 @@ class RSSFeeder:
 
         while True:
             try:
-                # ── FIXED SWITCHBOARD CHECK (Uses ID) ──
                 state = self._get_state()
                 if not state.get(feed_id, False):
                     await asyncio.sleep(30)
@@ -3700,13 +3718,12 @@ class RSSFeeder:
                                 if link in history: continue
                                 
                                 jid = str(uuid.uuid4())[:8]
-                                # Ask the parser to clean the caption and generate tags based on the site mapping
                                 site_key = feed_config.get("config_key", "default")
                                 clean_caption, playlists = self._parse_metadata(title, models, site_key)
                                 tracker_id = None
                                 
                                 try:
-                                    tracker_text = f"`[ ⚡ ] ＲＳＳ ＴＡＳＫ :` `{title[:30]}...`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (VK)`"
+                                    tracker_text = f"`[ ⚡ ] ＲＳＳ ＴＡＳＫ :` `{clean_caption[:30]}...`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (VK)`"
                                     tracker = await self.app.send_message(self.owner_id, tracker_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]]))
                                     tracker_id = tracker.id
                                 except Exception: pass
@@ -3714,8 +3731,7 @@ class RSSFeeder:
                                 await self.db.create_job({
                                     "id": jid, "url": link, "title": title[:128], "source": base_url, 
                                     "quality": "auto", "strategy": "GENERIC_FALLBACK", "chat_id": self.owner_id, 
-                                    "tracker_id": tracker_id, "destination": "vk", "playlist_name": playlists, 
-                                    "caption": clean_caption  # <--- Using the cleaned version here
+                                    "tracker_id": tracker_id, "destination": "vk", "playlist_name": playlists, "caption": clean_caption
                                 })
                                 await self.pipeline.dl_q.put(jid)
                                 logging.getLogger("stealth_bot").info(f"✨ RSS Injected [{feed_id}]: {clean_caption[:30]} -> Playlists: {playlists}")
