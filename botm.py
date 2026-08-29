@@ -254,6 +254,7 @@ class JobScheduler:
         self._init_db()
 
     def _init_db(self):
+        """Creates or patches the database tables if they do not exist."""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY, url TEXT, title TEXT, source TEXT, quality TEXT, strategy TEXT,
@@ -264,8 +265,7 @@ class JobScheduler:
                 caption TEXT DEFAULT ''
             )''')
 
-            # Patch existing DBs missing newer columns. SQLite throws if a column
-            # already exists — that's expected and safely ignored.
+            # Patch existing DBs missing newer columns
             for ddl in (
                 'ALTER TABLE jobs ADD COLUMN recovered_at_stage TEXT DEFAULT NULL',
                 "ALTER TABLE jobs ADD COLUMN destination TEXT DEFAULT 'telegram'",
@@ -277,41 +277,58 @@ class JobScheduler:
                 except sqlite3.OperationalError:
                     pass
 
+    def _safe_execute(self, query: str, params: tuple = (), fetchone=False, fetchall=False):
+        """Executes DB operations with automatic self-healing if the DB file is deleted mid-run."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(query, params)
+                if fetchone: return cur.fetchone()
+                if fetchall: return cur.fetchall()
+                conn.commit()
+        except sqlite3.OperationalError as e:
+            if "no such table" in str(e).lower():
+                self._init_db()  # Rebuild the missing tables
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cur = conn.execute(query, params)
+                    if fetchone: return cur.fetchone()
+                    if fetchall: return cur.fetchall()
+                    conn.commit()
+            else:
+                raise e
+
     async def create_job(self, data: dict):
         async with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute('''INSERT INTO jobs (id, url, title, source, quality, strategy, stage, pct, last_ui_pct, retries, chat_id, tracker_id, destination, playlist_name, caption)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                             (data['id'], data['url'], data['title'], data['source'], data.get('quality', 'auto'), data.get('strategy', 'GENERIC'),
-                              Stage.QUEUED.value, 0.0, -10.0, 0, data['chat_id'], data['tracker_id'],
-                              data.get('destination', 'telegram'), data.get('playlist_name'), data.get('caption', '')))
+            self._safe_execute(
+                '''INSERT INTO jobs (id, url, title, source, quality, strategy, stage, pct, last_ui_pct, retries, chat_id, tracker_id, destination, playlist_name, caption)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (data['id'], data['url'], data['title'], data['source'], data.get('quality', 'auto'), data.get('strategy', 'GENERIC'),
+                 Stage.QUEUED.value, 0.0, -10.0, 0, data['chat_id'], data['tracker_id'],
+                 data.get('destination', 'telegram'), data.get('playlist_name'), data.get('caption', ''))
+            )
 
         root = JOBS_DIR / f"JOB_{data['id']}"
         for d in (root, root / "dl", root / "enc", root / "thumb"): d.mkdir(parents=True, exist_ok=True)
 
     async def update_job(self, jid: str, **kwargs):
         async with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
-                for k, v in kwargs.items():
-                    conn.execute(f'UPDATE jobs SET {k} = ? WHERE id = ?', (v, jid))
+            for k, v in kwargs.items():
+                self._safe_execute(f'UPDATE jobs SET {k} = ? WHERE id = ?', (v, jid))
 
     async def get_job(self, jid: str) -> dict:
         async with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                row = conn.execute('SELECT * FROM jobs WHERE id = ?', (jid,)).fetchone()
-                return dict(row) if row else {}
+            row = self._safe_execute('SELECT * FROM jobs WHERE id = ?', (jid,), fetchone=True)
+            return dict(row) if row else {}
 
     async def get_active_jobs(self) -> list[dict]:
         async with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                return [dict(row) for row in conn.execute('SELECT * FROM jobs WHERE stage NOT IN ("completed", "failed", "cancelled")').fetchall()]
+            rows = self._safe_execute('SELECT * FROM jobs WHERE stage NOT IN ("completed", "failed", "cancelled")', fetchall=True)
+            return [dict(row) for row in (rows or [])]
 
     async def delete_job(self, jid: str):
         async with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute('DELETE FROM jobs WHERE id = ?', (jid,))
+            self._safe_execute('DELETE FROM jobs WHERE id = ?', (jid,))
 
     def log_trace(self, jid: str, msg: str):
         # 1. Keep writing to the job's trace.log file
@@ -321,7 +338,7 @@ class JobScheduler:
         except Exception:
             pass
         
-        # 2. ALSO push it to the standard Python logger so it prints in Termux
+        # 2. ALSO push it to the standard Python logger so it prints in the terminal
         logging.getLogger("stealth_bot").info(f"[{jid}] {msg}")
 
 # ═══════════════════════════════════════════════════════════════════════
