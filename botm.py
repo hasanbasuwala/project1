@@ -369,6 +369,7 @@ def parse_link_message(text: str, url: str) -> dict:
 # ═══════════════════════════════════════════════════════════════════════
 import asyncio
 import vk_api
+import time
 from pathlib import Path
 
 class VKPlaylistManager:
@@ -376,62 +377,77 @@ class VKPlaylistManager:
         self.available = bool(vk_api and token)
         self._session = vk_api.VkApi(token=token) if self.available else None
         self._vk = self._session.get_api() if self._session else None
+        
         self._album_cache: dict[str, int] = {}  
-        self._cache_loaded = False
+        self._video_cache: set = set()
+        self._db_loaded = False
+        self._lock = asyncio.Lock()
 
-    async def _load_album_cache(self, jid: str, db):
-        if self._cache_loaded or not self._vk:
-            return
-        try:
-            offset = 0
-            while True:
-                albums = await asyncio.to_thread(self._vk.video.getAlbums, count=100, offset=offset)
-                items = albums.get('items', [])
-                if not items: break
+    async def load_vk_database(self, jid: str, db):
+        """Pulls all albums and video titles from VK into memory for instant deduplication."""
+        if self._db_loaded or not self._vk: return
+        
+        async with self._lock:
+            if self._db_loaded: return
+            try:
+                db.log_trace(jid, "[VK] Initiating full sync with VK Ultimate Database...")
                 
-                for item in items:
-                    key = item.get('title', '').replace('#', '').strip().lower()
-                    self._album_cache[key] = item['id']
-                    
-                offset += 100
-                if offset >= albums.get('count', 0): break
+                # 1. Sync Albums
+                offset = 0
+                while True:
+                    albums = await asyncio.to_thread(self._vk.video.getAlbums, count=100, offset=offset)
+                    items = albums.get('items', [])
+                    if not items: break
+                    for item in items:
+                        key = item.get('title', '').replace('#', '').strip().lower()
+                        self._album_cache[key] = item['id']
+                    offset += 100
+                    if offset >= albums.get('count', 0): break
                 
-            self._cache_loaded = True
-            db.log_trace(jid, f"[VK] Loaded {len(self._album_cache)} playlists into memory cache.")
-        except Exception as e:
-            db.log_trace(jid, f"[VK] Error loading playlist cache: {e}")
+                # 2. Sync All Videos (For Deduplication)
+                offset = 0
+                while True:
+                    videos = await asyncio.to_thread(self._vk.video.get, count=200, offset=offset)
+                    items = videos.get('items', [])
+                    if not items: break
+                    for item in items:
+                        v_title = item.get('title', '').strip().lower()
+                        self._video_cache.add(v_title)
+                    offset += 200
+                    if offset >= videos.get('count', 0): break
+
+                self._db_loaded = True
+                db.log_trace(jid, f"[VK] Sync Complete: {len(self._album_cache)} Playlists, {len(self._video_cache)} Videos loaded.")
+            except Exception as e:
+                db.log_trace(jid, f"[VK] CRITICAL: Ultimate Database sync failed: {e}")
+
+    async def is_duplicate(self, title: str) -> bool:
+        """Checks if a video already exists in the VK library."""
+        if not self._vk or not title: return False
+        clean_title = title.strip().lower()
+        return clean_title in self._video_cache
 
     async def resolve_playlist(self, raw_name: str, jid: str, db) -> int | None:
         if not self._vk: return None
-
         clean_name = raw_name.replace('#', '').strip()
         if not clean_name: return None
         
+        await self.load_vk_database(jid, db)
         key = clean_name.lower()
 
-        db.log_trace(jid, f"[VK] Resolving playlist: '{clean_name}'")
-        await self._load_album_cache(jid, db)
-
         if key in self._album_cache:
-            album_id = self._album_cache[key]
-            db.log_trace(jid, f"[VK] Playlist '{clean_name}' found in cache (ID: {album_id}).")
-            return album_id
+            return self._album_cache[key]
 
         try:
-            db.log_trace(jid, f"[VK] Playlist '{clean_name}' not found. Asking VK to create new album...")
+            db.log_trace(jid, f"[VK] Playlist '{clean_name}' not found. Creating...")
             created = await asyncio.to_thread(self._vk.video.addAlbum, title=clean_name)
             album_id = created.get('album_id')
-            
             if album_id:
                 self._album_cache[key] = album_id
-                db.log_trace(jid, f"[VK] Playlist '{clean_name}' successfully created (ID: {album_id}).")
                 return album_id
-            else:
-                db.log_trace(jid, f"[VK] API returned empty album_id for '{clean_name}'. Response: {created}")
-                return None
         except Exception as e:
             db.log_trace(jid, f"[VK] Failed to create playlist '{clean_name}': {e}")
-            return None
+        return None
 
     async def upload_video(self, file_path: Path, title: str, description: str, album_ids: list[int] | None, jid: str, db) -> dict:
         if not self._session:
@@ -439,72 +455,70 @@ class VKPlaylistManager:
 
         def _do_upload():
             import requests
-            import time 
-
-            kwargs = {}
-            clean_title = (title or "").strip()
-            if clean_title: kwargs['name'] = clean_title[:200]
             
-            clean_desc = (description or "").strip()
-            if clean_desc: kwargs['description'] = clean_desc
-
-            # ── 1. NATIVE HOOKING (100% Bulletproof Primary Playlist) ──
-            if album_ids and len(album_ids) > 0:
-                kwargs['album_id'] = album_ids[0]
-                db.log_trace(jid, f"[VK] Hooked Primary Playlist ID {album_ids[0]} directly into VK Save payload.")
+            clean_title = (title or "").strip()
+            kwargs = {'name': clean_title[:200]} if clean_title else {}
+            if description: kwargs['description'] = description.strip()
 
             try:
                 save_resp = self._vk.video.save(**kwargs)
             except vk_api.exceptions.ApiError as e:
                 if e.code == 10:
-                    db.log_trace(jid, "[VK] API Error 10 on metadata. Retrying with bare-minimum payload...")
                     save_resp = self._vk.video.save() 
-                else:
-                    raise e
+                else: raise e
 
             upload_url = save_resp.get('upload_url')
             vid_id = save_resp.get('video_id')
             own_id = save_resp.get('owner_id')
 
             if not upload_url:
-                raise RuntimeError(f"Failed to retrieve upload URL from VK. Response: {save_resp}")
+                raise RuntimeError("Failed to retrieve upload URL from VK.")
 
-            db.log_trace(jid, "[VK] Upload URL acquired. Streaming payload to VK servers...")
+            db.log_trace(jid, "[VK] Streaming payload to VK servers...")
             with open(file_path, 'rb') as f:
                 upload_result = requests.post(upload_url, files={'video_file': f}).json()
 
             if 'video_hash' not in upload_result and 'size' not in upload_result:
                 raise RuntimeError(f"VK File stream rejected: {upload_result}")
 
-            db.log_trace(jid, f"[VK] File successfully ingested by VK servers. Video ID: {vid_id}")
-
-            # ── 2. STATE VERIFICATION (For Secondary Playlists Only) ──
-            if album_ids and len(album_ids) > 1 and vid_id and own_id:
-                db.log_trace(jid, f"[VK] Video requires {len(album_ids)-1} additional playlists. Initiating state verification...")
+            db.log_trace(jid, "[VK] Payload accepted. Waiting for VK Backend Registration...")
+            
+            # ── STATE-VERIFIED ALLOCATION LOOP ──
+            video_registered = False
+            for attempt in range(1, 16):  
+                try:
+                    check = self._vk.video.get(videos=f"{own_id}_{vid_id}")
+                    if check.get("items"):
+                        video_registered = True
+                        db.log_trace(jid, f"[VK] Backend Registration Confirmed (Attempt {attempt}).")
+                        break
+                except Exception: pass
+                time.sleep(3) # Wait 3s before polling again
                 
-                # Wait for VK to finish processing before mapping secondary albums
-                for check in range(1, 15):
-                    try:
-                        status = self._vk.video.get(owner_id=own_id, videos=f"{own_id}_{vid_id}")
-                        items = status.get("items", [])
-                        if items and items[0].get("processing") != 1:
-                            # Processing flag is gone; safe to map
-                            for extra_id in album_ids[1:]:
-                                self._vk.video.addToAlbum(owner_id=own_id, video_id=vid_id, album_id=extra_id)
-                                db.log_trace(jid, f"[VK] [+] Successfully mapped to Secondary Playlist ID: {extra_id}")
+            if video_registered and album_ids:
+                for a_id in album_ids:
+                    mapped = False
+                    for map_attempt in range(1, 6):
+                        try:
+                            self._vk.video.addToAlbum(owner_id=own_id, video_id=vid_id, album_id=a_id)
+                            db.log_trace(jid, f"[VK] [+] Successfully mapped to Playlist {a_id}")
+                            mapped = True
                             break
-                        else:
-                            db.log_trace(jid, f"[VK] Video is still encoding. Checking again in 10s (Attempt {check}/15)...")
-                            time.sleep(10)
-                    except Exception as e:
-                        db.log_trace(jid, f"[VK] Verification error: {e}. Retrying...")
-                        time.sleep(10)
+                        except Exception as e:
+                            db.log_trace(jid, f"[VK] Map Retry {map_attempt}/5 for Playlist {a_id}: {e}")
+                            time.sleep(2)
+                    if not mapped:
+                        db.log_trace(jid, f"[VK] ❌ CRITICAL: Failed to map Playlist {a_id} entirely.")
+            elif not video_registered:
+                db.log_trace(jid, "[VK] ❌ Timeout: Video never registered in API. Playlists skipped.")
+
+            # Append to local deduplication cache instantly so RSS skips it on the next sweep
+            if clean_title:
+                self._video_cache.add(clean_title.lower())
 
             return save_resp
 
-        db.log_trace(jid, "Initializing VK Upload Sequence...")
         result = await asyncio.to_thread(_do_upload)
-        db.log_trace(jid, "VK Upload Sequence Completed Successfully.")
         return result
         
 # ═══════════════════════════════════════════════════════════════════════
