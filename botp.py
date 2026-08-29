@@ -4210,7 +4210,7 @@ async def main():
     
     # Pass vk_manager directly into the RSS Feeder
     rss_engine = RSSFeeder(db, pipeline, app, OWNER_ID, vk_manager)
-    dump_sorter = DumpSorter(vk_manager, DUMP_ALBUM_ID, DUMP_ALBUM_OWNER_ID, DUMP_SWEEP_INTERVAL)
+    dump_sorter = DumpSorter(vk_manager, DUMP_ALBUM_ID, DUMP_ALBUM_OWNER_ID, DUMP_SWEEP_INTERVAL, sort_uncategorized=False)
     
     # ... [keep the rest of main() the same] ...
 
