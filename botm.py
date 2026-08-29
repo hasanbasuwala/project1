@@ -3776,8 +3776,18 @@ class RSSFeeder:
                                 clean_caption, playlists = self._parse_metadata(title, models, site_key)
                                 tracker_id = None
                                 
+                                # ── ULTIMATE VK DEDUPLICATION CHECK ──
+                                await self.vk_manager.load_vk_database("RSS_SYS", self.db)
+                                if await self.vk_manager.is_duplicate(clean_caption):
+                                    logging.getLogger("stealth_bot").info(f"⏩ SKIP: '{clean_caption[:30]}' already exists in VK Database.")
+                                    history.add(link)
+                                    self._save_history(history)
+                                    continue
+                                # ─────────────────────────────────────
+                                
                                 try:
                                     tracker_text = f"`[ ⚡ ] ＲＳＳ ＴＡＳＫ :` `{clean_caption[:30]}...`\n`[ ⚙️ ] ＳＴＡＴ :` `QUEUED (VK)`"
+                                    # ... [keep the rest of the job queuing logic exactly the same] ...
                                     tracker = await self.app.send_message(self.owner_id, tracker_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCEL", callback_data=f"kill|{jid}")]]))
                                     tracker_id = tracker.id
                                 except Exception: pass
