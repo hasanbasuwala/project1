@@ -3515,15 +3515,16 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import RSS_FEEDS, SITE_CONFIGS
 
 class RSSFeeder:
-    def __init__(self, db, pipeline, app, owner_id: int):
+    def __init__(self, db, pipeline, app, owner_id: int, vk_manager: VKPlaylistManager): # <-- Added vk_manager
         self.db = db
         self.pipeline = pipeline
         self.app = app
         self.owner_id = owner_id
+        self.vk_manager = vk_manager # <-- Saved reference
         
         self.target_feeds = RSS_FEEDS
-                
         self.history_file = BASE_DIR / "rss_history.txt"
+        # ... [keep the rest of __init__ the same] ...
         self.state_file = BASE_DIR / "rss_state.json" 
         self.poll_interval = 1800  
         self.global_feed_lock = asyncio.Lock() 
