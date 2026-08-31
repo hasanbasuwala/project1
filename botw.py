@@ -4157,7 +4157,7 @@ class RSSFeeder:
         current.add(link)
         self._save_history(current)
 
-def _parse_metadata(self, raw_title: str, models: list, site_key: str) -> tuple[str, str]:
+    def _parse_metadata(self, raw_title: str, models: list, site_key: str) -> tuple[str, str]:
         tags = []
         clean_title = raw_title.strip()
         
@@ -4172,7 +4172,6 @@ def _parse_metadata(self, raw_title: str, models: list, site_key: str) -> tuple[
                 tags.extend([n.replace(" ", "") for n in raw_names if n.strip() and len(n.split()) <= 3])
                 
         elif site_key == "site_pornmz":
-            # Strip standard studio/producer prefixes if separated by a dash (e.g., 'TushyRaw - ...')
             if "–" in clean_title or " - " in clean_title:
                 parts = re.split(r'\s*[-–—]\s*', clean_title, maxsplit=1)
                 if len(parts) == 2:
@@ -4197,7 +4196,6 @@ def _parse_metadata(self, raw_title: str, models: list, site_key: str) -> tuple[
         elif site_key == "site_fpv":
             if models: tags.extend([n.replace(" ", "") for n in models if n.strip()])
 
-        # Apply default model tag mapping if not already handled explicitly by a site key
         if models and site_key not in ["site_fpv", "site_pornmz"]: 
             tags.extend([n.replace(" ", "") for n in models if n.strip()])
             
@@ -4288,7 +4286,6 @@ def _parse_metadata(self, raw_title: str, models: list, site_key: str) -> tuple[
                         raw_link = a_tag.get("href", "").strip()
                         link = urlparse.urljoin(url, raw_link)
 
-                        # Extract performer names from classes (e.g. 'actors-cherry-kiss')
                         models = []
                         for cls in article.get("class", []):
                             if cls.startswith("actors-"):
