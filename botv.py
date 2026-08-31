@@ -147,6 +147,7 @@ for d in (JOBS_DIR, DONE_DIR): d.mkdir(parents=True, exist_ok=True)
 
 MAX_DL_WORKERS, MAX_RETRIES = 3, 3
 RSS_DL_WORKERS = getattr(config, "RSS_DL_WORKERS", 1)  # RSS downloads get their own pool, separate from dl_q
+RSS_QUEUE_BUFFER = getattr(config, "RSS_QUEUE_BUFFER", 5)  # cap = RSS_DL_WORKERS * this, before feed scanning pauses
 
 # ──────────────────────────── BATCH CONFIGURATION ─────────────────────
 _batch_mode = False
@@ -4353,6 +4354,26 @@ class RSSFeeder:
                         models = entry['models']
                         
                         if link not in self._load_history():
+                            # ── RSS BACKPRESSURE ──
+                            # Cap how many RSS jobs can be queued/active at once,
+                            # scaled to the current RSS worker pool, so a big
+                            # backfill page doesn't dump hundreds of jobs into
+                            # rss_dl_q in one burst. Waits OUTSIDE the lock so
+                            # other feeds can still create jobs while this one
+                            # is waiting for room.
+                            while True:
+                                if not self._get_state().get(feed_id, False):
+                                    break
+                                active_jobs = await self.db.get_active_jobs()
+                                rss_active = sum(1 for j in active_jobs if j.get('is_rss'))
+                                cap = max(len(self.pipeline.rss_dl_worker_tasks), 1) * RSS_QUEUE_BUFFER
+                                if rss_active < cap:
+                                    break
+                                await asyncio.sleep(5)
+
+                            if not self._get_state().get(feed_id, False):
+                                break
+
                             async with self.global_feed_lock:
                                 # ── LIVE PAUSE CHECK 3 ──
                                 if not self._get_state().get(feed_id, False):
