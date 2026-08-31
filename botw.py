@@ -4206,7 +4206,7 @@ class RSSFeeder:
 
     async def _get_last_page(self, url: str, rss_type: str) -> int:
         try:
-            async with AsyncSession(impersonate="chrome") as session:
+    async with AsyncSession(impersonate="chrome") as session:
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
                 resp = await session.get(url, headers=headers, timeout=30)
                 if resp.status_code != 200: return 20
