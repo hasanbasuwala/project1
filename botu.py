@@ -146,6 +146,7 @@ JOBS_DIR, DONE_DIR = BASE_DIR / "jobs", BASE_DIR / "completed"
 for d in (JOBS_DIR, DONE_DIR): d.mkdir(parents=True, exist_ok=True)
 
 MAX_DL_WORKERS, MAX_RETRIES = 3, 3
+RSS_DL_WORKERS = getattr(config, "RSS_DL_WORKERS", 1)  # RSS downloads get their own pool, separate from dl_q
 
 # ──────────────────────────── BATCH CONFIGURATION ─────────────────────
 _batch_mode = False
@@ -2609,7 +2610,7 @@ class CrashCourier:
 
 class RecoveryManager:
     @staticmethod
-    async def scan_and_requeue(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.Queue, up_q: asyncio.Queue, app: Client):
+    async def scan_and_requeue(db: JobScheduler, dl_q: asyncio.Queue, enc_q: asyncio.Queue, up_q: asyncio.Queue, app: Client, rss_dl_q: asyncio.Queue = None):
         active = await db.get_active_jobs()
         resumed = []
         recovering_batch_jids = []
@@ -2617,12 +2618,16 @@ class RecoveryManager:
         for job in active:
             jid, stage, title = job['id'], job['stage'], job['title'][:25]
             is_batch = str(job.get('source', '')).startswith('Batch_')
+            is_rss = bool(job.get('is_rss')) and rss_dl_q is not None
 
             if stage in [Stage.QUEUED.value, Stage.DOWNLOADING.value] or "download" in stage:
                 await db.update_job(jid, stage=Stage.QUEUED.value, recovered_at_stage=stage)
                 if is_batch:
                     recovering_batch_jids.append(jid)
                     resumed.append(f"  ├ `[BATCH DL HOLD]` `{title}`")
+                elif is_rss:
+                    rss_dl_q.put_nowait(jid)
+                    resumed.append(f"  ├ `[RSS DL]` `{title}`")
                 else:
                     dl_q.put_nowait(jid)
                     resumed.append(f"  ├ `[DL]` `{title}`")
@@ -2658,22 +2663,24 @@ class PipelineManager:
     def __init__(self, app: Client, db: JobScheduler, vk_manager: VKPlaylistManager):
         self.app, self.db = app, db
         self.dl_q, self.enc_q, self.up_q = asyncio.Queue(), asyncio.Queue(), asyncio.Queue()
+        self.rss_dl_q = asyncio.Queue()  # separate download queue, RSS-sourced jobs only
         self.dl_engine, self.enc_engine, self.up_engine = DownloaderEngine(db, app), EncoderEngine(db), UploaderEngine(db, app, vk_manager)
         self.dl_worker_tasks: list[asyncio.Task] = []
+        self.rss_dl_worker_tasks: list[asyncio.Task] = []
 
-    async def _worker_loop(self, queue: asyncio.Queue, engine, start_stage: Stage, success_stage: Stage, next_q: asyncio.Queue = None):
+    async def _worker_loop(self, queue: asyncio.Queue, engine, start_stage: Stage, success_stage: Stage, next_q: asyncio.Queue = None, worker_list: list | None = None):
         while True:
             jid = await queue.get()
 
-            if jid is self._DL_STOP:
-                # Graceful scale-down signal — only ever placed in dl_q, and
-                # only ever reached once this worker has finished whatever it
-                # was doing and drained every real job queued ahead of it.
+            if worker_list is not None and jid is self._DL_STOP:
+                # Graceful scale-down signal — only ever reached once this
+                # worker has finished whatever it was doing and drained every
+                # real job queued ahead of it.
                 queue.task_done()
                 current_task = asyncio.current_task()
-                if current_task in self.dl_worker_tasks:
-                    self.dl_worker_tasks.remove(current_task)
-                logging.getLogger("stealth_bot").info("📉 Download worker stopped gracefully (scaled down).")
+                if current_task in worker_list:
+                    worker_list.remove(current_task)
+                logging.getLogger("stealth_bot").info("📉 Worker stopped gracefully (scaled down).")
                 return
 
             job = await self.db.get_job(jid)
@@ -2698,7 +2705,7 @@ class PipelineManager:
             except Exception as e:
                 retry += 1
                 if retry >= MAX_RETRIES:
-                    is_rss_download = bool(job.get('is_rss')) and queue is self.dl_q
+                    is_rss_download = bool(job.get('is_rss')) and queue in (self.dl_q, self.rss_dl_q)
                     deferred = job.get('rss_deferred_attempts', 0) if is_rss_download else 0
                     if is_rss_download and deferred < 1:
                         # First round of retries exhausted — park it, keep the
@@ -2729,39 +2736,62 @@ class PipelineManager:
             return  # already handled/changed by something else in the meantime
         await self.db.update_job(jid, stage=Stage.QUEUED.value, retries=0)
         self.db.log_trace(jid, "[RSS] Bringing parked download back for a second round of attempts.")
-        await self.dl_q.put(jid)
+        await self.rss_dl_q.put(jid)
 
     def start_workers(self):
         for _ in range(MAX_DL_WORKERS):
-            t = asyncio.create_task(self._worker_loop(self.dl_q, self.dl_engine, Stage.DOWNLOADING, Stage.DOWNLOADED, self.enc_q))
+            t = asyncio.create_task(self._worker_loop(self.dl_q, self.dl_engine, Stage.DOWNLOADING, Stage.DOWNLOADED, self.enc_q, worker_list=self.dl_worker_tasks))
             self.dl_worker_tasks.append(t)
+        for _ in range(RSS_DL_WORKERS):
+            t = asyncio.create_task(self._worker_loop(self.rss_dl_q, self.dl_engine, Stage.DOWNLOADING, Stage.DOWNLOADED, self.enc_q, worker_list=self.rss_dl_worker_tasks))
+            self.rss_dl_worker_tasks.append(t)
         asyncio.create_task(self._worker_loop(self.enc_q, self.enc_engine, Stage.ENCODING, Stage.ENCODED, self.up_q))
         asyncio.create_task(self._worker_loop(self.up_q, self.up_engine, Stage.UPLOADING, Stage.COMPLETED, None))
 
-    async def set_dl_worker_count(self, target: int) -> str:
-        """Scales the download worker pool to `target`. Scaling up spawns new
-        workers immediately. Scaling down never kills an in-flight download —
-        it drops one _DL_STOP sentinel into dl_q per worker to remove; each
-        exits only once it dequeues that sentinel, i.e. after finishing its
+    async def _scale_worker_pool(self, queue: asyncio.Queue, worker_list: list, spawn_fn, target: int) -> str:
+        """Shared scaling logic. Scaling up spawns new workers immediately.
+        Scaling down never kills an in-flight job — it drops one _DL_STOP
+        sentinel into `queue` per worker to remove; each worker only exits
+        once it actually dequeues that sentinel, i.e. after finishing its
         current job and draining every real job queued ahead of the signal."""
         target = max(1, target)
-        current = len(self.dl_worker_tasks)
+        current = len(worker_list)
         if target == current:
-            return f"Already at {current} download worker(s)."
+            return f"Already at {current} worker(s)."
         if target > current:
-            added = target - current
-            for _ in range(added):
-                t = asyncio.create_task(self._worker_loop(self.dl_q, self.dl_engine, Stage.DOWNLOADING, Stage.DOWNLOADED, self.enc_q))
-                self.dl_worker_tasks.append(t)
-            return f"Scaled UP: {current} → {target} download worker(s)."
+            for _ in range(target - current):
+                worker_list.append(spawn_fn())
+            return f"Scaled UP: {current} → {target} worker(s)."
         else:
             removed = current - target
             for _ in range(removed):
-                await self.dl_q.put(self._DL_STOP)
-            return (f"Scaling DOWN: {current} → {target} download worker(s). "
+                await queue.put(self._DL_STOP)
+            return (f"Scaling DOWN: {current} → {target} worker(s). "
                     f"{removed} worker(s) will stop after finishing their current "
                     f"job and draining anything already queued ahead of them — "
                     f"nothing in-flight gets killed.")
+
+    async def set_rss_dl_worker_count(self, target: int) -> str:
+        """Scales the RSS-only download worker pool (rss_dl_q) — independent
+        of the manual/Telegram download pool (dl_q)."""
+        return await self._scale_worker_pool(
+            self.rss_dl_q, self.rss_dl_worker_tasks,
+            lambda: asyncio.create_task(self._worker_loop(
+                self.rss_dl_q, self.dl_engine, Stage.DOWNLOADING, Stage.DOWNLOADED, self.enc_q,
+                worker_list=self.rss_dl_worker_tasks)),
+            target
+        )
+
+    async def set_dl_worker_count(self, target: int) -> str:
+        """Scales the manual/Telegram download worker pool (dl_q) — separate
+        from the RSS-only pool, see set_rss_dl_worker_count."""
+        return await self._scale_worker_pool(
+            self.dl_q, self.dl_worker_tasks,
+            lambda: asyncio.create_task(self._worker_loop(
+                self.dl_q, self.dl_engine, Stage.DOWNLOADING, Stage.DOWNLOADED, self.enc_q,
+                worker_list=self.dl_worker_tasks)),
+            target
+        )
 
 # ═══════════════════════════════════════════════════════════════════════
 # CHAPTER 11 — TELEGRAM DISPATCHER + UI ACCUMULATOR
@@ -3512,26 +3542,26 @@ def setup_router(app: Client, db: JobScheduler, pipeline: PipelineManager, vk_ma
             reply_markup=kb
         )
 
-    # ── COMMAND: /dl [number] ──
+    # ── COMMAND: /dl [number] — controls the RSS-only download worker pool ──
     @app.on_message(filters.command(["dl"]) & filters.user(OWNER_ID))
     async def cmd_dl_workers(_, msg: Message):
         args = msg.text.split(maxsplit=1)
-        current = len(pipeline_ref.dl_worker_tasks) if pipeline_ref else 0
+        current = len(pipeline_ref.rss_dl_worker_tasks) if pipeline_ref else 0
 
         if len(args) < 2 or not args[1].strip().lstrip('-').isdigit():
-            await msg.reply(f"📥 Current download workers: **{current}**\nUsage: `/dl <number>` to scale.")
+            await msg.reply(f"📡 Current RSS download workers: **{current}**\nUsage: `/dl <number>` to scale.")
             return
 
         target = int(args[1].strip())
         if target < 1:
-            await msg.reply("⚠️ Must keep at least 1 download worker.")
+            await msg.reply("⚠️ Must keep at least 1 RSS download worker.")
             return
         if not pipeline_ref:
             await msg.reply("❌ Pipeline not ready yet.")
             return
 
-        result = await pipeline_ref.set_dl_worker_count(target)
-        await msg.reply(f"📥 {result}")
+        result = await pipeline_ref.set_rss_dl_worker_count(target)
+        await msg.reply(f"📡 {result}")
 
     # ── COMMAND: /restartdump [full] ──
     @app.on_message(filters.command(["restartdump"]) & filters.user(OWNER_ID))
@@ -3865,7 +3895,7 @@ async def terminal_loop(db: JobScheduler, pipeline: PipelineManager):
         # \033[H moves cursor to top-left. \033[K clears the old text on that line.
         sys.stdout.write("\033[H")
         sys.stdout.write(f"{C_CYAN}{C_BOLD}=== STEALTH MAINFRAME [LIVE] ==={C_RESET}\033[K\n")
-        sys.stdout.write(f"QUEUES | DL: {pipeline.dl_q.qsize()} | ENC: {pipeline.enc_q.qsize()} | UP: {pipeline.up_q.qsize()}\033[K\n{'─' * 40}\033[K\n")
+        sys.stdout.write(f"QUEUES | DL: {pipeline.dl_q.qsize()} | RSS-DL: {pipeline.rss_dl_q.qsize()} | ENC: {pipeline.enc_q.qsize()} | UP: {pipeline.up_q.qsize()}\033[K\n{'─' * 40}\033[K\n")
 
         jobs = await db.get_active_jobs()
         if not jobs:
@@ -4242,7 +4272,7 @@ class RSSFeeder:
                                     "tracker_id": tracker_id, "destination": "vk", "playlist_name": playlists, "caption": clean_caption
                                 })
                                 await self.db.update_job(jid, is_rss=1)
-                                await self.pipeline.dl_q.put(jid)
+                                await self.pipeline.rss_dl_q.put(jid)
                                 logging.getLogger("stealth_bot").info(f"✨ RSS Injected [{feed_id}]: {clean_caption[:30]} -> Playlists: {playlists}")
                                 
                                 self._mark_processed(link)
@@ -4467,7 +4497,7 @@ async def main():
 
     async with app:
         log.info("Running recovery audits...")
-        recovering_batch_jids = await RecoveryManager.scan_and_requeue(db, pipeline.dl_q, pipeline.enc_q, pipeline.up_q, app)
+        recovering_batch_jids = await RecoveryManager.scan_and_requeue(db, pipeline.dl_q, pipeline.enc_q, pipeline.up_q, app, pipeline.rss_dl_q)
         pipeline.start_workers()
 
         asyncio.create_task(dispatcher.sender_loop())
