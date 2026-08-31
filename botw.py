@@ -990,6 +990,24 @@ class DownloaderEngine:
             self.db.log_trace(jid, f"Pre-check warning: Hardened ping encounter ({e}). Passing downstream to engine.")
             return True
             
+    async def _extract_pornmz_stream(self, main_url: str, jid: str) -> str | None:
+        from curl_cffi.requests import AsyncSession
+        import re
+
+        self.db.log_trace(jid, "[*] Executing dedicated Pornmz fast-extractor...")
+        try:
+            async with AsyncSession(impersonate="chrome120") as session:
+                res = await session.get(main_url, timeout=20)
+                m = re.search(r'(https?://[^"\'\s]+\.m3u8[^"\'\s]*)', res.text)
+                if m:
+                    stream_url = m.group(1).replace("&amp;", "&")
+                    self.db.log_trace(jid, f"[+] SUCCESS! Extracted Direct Stream: {stream_url}")
+                    return stream_url
+                self.db.log_trace(jid, "[-] No .m3u8 found in page source.")
+        except Exception as e:
+            self.db.log_trace(jid, f"[-] Pornmz extraction failed: {e}")
+        return None
+            
     async def _extract_perverzija_stream(self, main_url: str, jid: str) -> tuple[str | None, str | None]:
         """Custom dedicated extractor for Perverzija/Xtremestream."""
         from curl_cffi.requests import AsyncSession
@@ -1290,6 +1308,12 @@ class DownloaderEngine:
             if extracted_player:
                 self.db.log_trace(jid, f"API Token bypass successful! Rerouting payload URL.")
                 url = extracted_player
+                
+        elif dl_type == "pornmz_extract":
+            stream_url = await self._extract_pornmz_stream(url, jid)
+            if stream_url:
+                self.db.log_trace(jid, "Rerouting target payload directly to extracted HLS stream.")
+                url = stream_url
                 
         elif dl_type == "perverzija_iframe":
             stream_url, referer = await self._extract_perverzija_stream(url, jid)
