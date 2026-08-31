@@ -147,7 +147,7 @@ for d in (JOBS_DIR, DONE_DIR): d.mkdir(parents=True, exist_ok=True)
 
 MAX_DL_WORKERS, MAX_RETRIES = 3, 3
 RSS_DL_WORKERS = getattr(config, "RSS_DL_WORKERS", 1)  # RSS downloads get their own pool, separate from dl_q
-RSS_QUEUE_BUFFER = getattr(config, "RSS_QUEUE_BUFFER", 5)  # cap = RSS_DL_WORKERS * this, before feed scanning pauses
+RSS_QUEUE_BUFFER = getattr(config, "RSS_QUEUE_BUFFER", 2)  # cap = RSS_DL_WORKERS * this, before feed scanning pauses
 
 # ──────────────────────────── BATCH CONFIGURATION ─────────────────────
 _batch_mode = False
